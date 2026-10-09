@@ -8,9 +8,7 @@ from config.settings import (
 )
 
 class SpeechToText:
-    """
-    Speech-to-Text implementation using faster-whisper.
-    """
+    """Transcribe audio and discard segments with strong signs of hallucination."""
     def __init__(
         self,
         model_size: str = WHISPER_MODEL_SIZE,
@@ -48,10 +46,26 @@ class SpeechToText:
         if not os.path.exists(audio_file_path):
             raise FileNotFoundError(f"El archivo de audio no existe: {audio_file_path}")
 
-        audio_data, sample_rate = sf.read(audio_file_path, dtype="float32")
-        segments, _ = self.model.transcribe(audio_data, beam_size=5, language="es")
-        
-        text_segments = [segment.text.strip() for segment in segments]
+        audio_data, _sample_rate = sf.read(audio_file_path, dtype="float32")
+        # beam_size=5 equilibra calidad y latencia; las métricas ayudan a descartar ruido.
+        segments, _ = self.model.transcribe(
+            audio_data,
+            beam_size=5,
+            language="es",
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+
+        text_segments = []
+        for segment in segments:
+            text = segment.text.strip()
+            # no_speech_prob alta indica silencio; avg_logprob muy baja indica texto poco confiable.
+            if segment.no_speech_prob > 0.65 or segment.avg_logprob < -1.0:
+                continue
+            # Una sola letra suele ser residuo acústico, pero conservamos respuestas cortas como "sí".
+            if len("".join(character for character in text if character.isalnum())) < 2:
+                continue
+            text_segments.append(text)
         full_text = " ".join(text_segments).strip()
         
         # Clean up any extra internal whitespace/newlines

@@ -1,5 +1,6 @@
 import ollama
 from config.settings import OLLAMA_BASE_URL, OLLAMA_MODEL
+from config.prompts import JARVIS_SYSTEM_PROMPT
 
 class OllamaBrain:
     """
@@ -35,11 +36,7 @@ class OllamaBrain:
         """
         # Definimos una identidad predeterminada alineada con J.A.R.V.I.S: formal, concisa, respetuosa y directa.
         if system_prompt is None:
-            system_prompt = (
-                "Eres J.A.R.V.I.S., un asistente virtual técnico, formal, conciso, respetuoso y directo al grano. "
-                "Tus respuestas deben ser breves, naturales y optimizadas para ser reproducidas por síntesis de voz (TTS). "
-                "Evita introducciones largas o viñetas innecesarias a menos que se te pida explícitamente."
-            )
+            system_prompt = JARVIS_SYSTEM_PROMPT
 
         try:
             # Construimos la estructura de mensajes requerida por la API de Ollama (chat endpoint)

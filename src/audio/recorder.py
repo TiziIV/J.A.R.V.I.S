@@ -1,112 +1,94 @@
 import os
 import tempfile
+from collections import deque
+
 import numpy as np
 import sounddevice as sd
 from scipy.io import wavfile
 
+
 class AudioRecorder:
-    """
-    Clase encargada de capturar audio desde el micrófono utilizando sounddevice.
-    Implementa grabación inteligente con Detección de Actividad de Voz (VAD / Voice Activity Detection)
-    basada en energía (RMS), eliminando la necesidad de grabar por segundos fijos.
-    """
-    
+    """Captura voz desde el micrófono y guarda cada turno como un WAV temporal."""
+
     def __init__(self, sample_rate: int = 16000):
-        """
-        Inicializa el grabador de audio.
-        
-        Args:
-            sample_rate (int): Frecuencia de muestreo en Hz (por defecto 16000 Hz, óptimo para Whisper).
-        """
+        # Whisper espera audio mono a 16 kHz; mantenerlo así evita remuestreos costosos.
         self.sample_rate = sample_rate
 
     def record_until_silence(
         self,
         energy_threshold: float = 0.015,
-        silence_duration: float = 1.3,
-        max_duration: float = 20.0
+        silence_duration: float = 1.8,
+        max_duration: float = 20.0,
+        pre_speech_duration: float = 0.25,
     ) -> str:
-        """
-        Escucha el micrófono de manera inteligente: espera a que el usuario empiece a hablar
-        y corta automáticamente cuando detecta una pausa o silencio continuo.
-        
-        Args:
-            energy_threshold (float): Umbral de energía RMS para diferenciar voz de ruido de fondo.
-            silence_duration (float): Segundos de silencio continuo necesarios para detener la grabación (ej. 1.3s).
-            max_duration (float): Tiempo máximo de seguridad en segundos para evitar grabaciones infinitas (ej. 20s).
-            
-        Returns:
-            str: Ruta absoluta del archivo temporal .wav generado con el audio grabado.
-        """
+        """Graba hasta 1,8 s de silencio y conserva 250 ms previos al inicio detectado."""
         print("[Escuchando al micrófono... Hable cuando guste]")
-        
-        chunk_size = 1024  # Cantidad de muestras por cada bloque de audio leído
-        chunk_duration = chunk_size / self.sample_rate  # Duración de cada chunk en segundos (~0.064s)
-        
-        # Calculamos cuántos chunks consecutivos de silencio equivalen al tiempo límite de pausa
-        required_silence_chunks = int(silence_duration / chunk_duration)
-        max_chunks = int(max_duration / chunk_duration)
-        
-        frames = []              # Lista para acumular todos los bloques de audio capturados
-        speech_started = False   # Bandera para saber si el usuario ya empezó a hablar
-        silence_counter = 0      # Contador de chunks consecutivos con silencio tras haber empezado a hablar
-        chunks_read = 0          # Contador total de bloques leídos (control de timeout)
 
-        # Abrimos un stream de entrada en tiempo real usando sounddevice
-        # - samplerate: 16000 Hz
-        # - channels: 1 (mono, ideal para STT)
-        # - dtype: 'int16' (enteros de 16 bits, estándar para audio PCM)
-        # - blocksize: 1024 muestras por bloque
-        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype='int16', blocksize=chunk_size) as stream:
-            while chunks_read < max_chunks:
-                # Leemos un bloque (chunk) del micrófono y un indicador de desbordamiento (overflow)
-                audio_chunk, overflowed = stream.read(chunk_size)
-                
-                if overflowed:
-                    # Si el búfer se desbordó, mostramos una advertencia leve (no crítico)
-                    print("[!] Advertencia: desbordamiento de búfer de audio detectado.")
+        chunk_size = 1024
+        chunk_duration = chunk_size / self.sample_rate
+        required_silence_chunks = max(1, int(silence_duration / chunk_duration))
+        max_chunks = max(1, int(max_duration / chunk_duration))
+        pre_speech_chunks = max(1, int(pre_speech_duration / chunk_duration))
+        # El búfer circular recupera el comienzo de una palabra aunque el umbral tarde en activarse.
+        pre_speech_frames: deque[np.ndarray] = deque(maxlen=pre_speech_chunks)
+        frames: list[np.ndarray] = []
+        speech_started = False
+        silence_counter = 0
 
-                # Añadimos el bloque actual a nuestra lista acumulativa
-                frames.append(audio_chunk.copy())
-                chunks_read += 1
+        try:
+            # Un bloque de 1024 muestras dura unos 64 ms, suficiente para medir energía con baja latencia.
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=chunk_size,
+            ) as stream:
+                for _ in range(max_chunks):
+                    audio_chunk, overflowed = stream.read(chunk_size)
+                    if overflowed:
+                        print("[!] Se perdió un bloque de audio; continúo la captura.")
 
-                # Calculamos la energía del bloque (RMS / Root Mean Square)
-                # 1. Convertimos los enteros de 16 bits (-32768 a 32767) a flotantes entre -1.0 y 1.0
-                audio_float = audio_chunk.astype(np.float32) / 32768.0
-                # 2. Raíz cuadrada de la media de los cuadrados (RMS)
-                rms = np.sqrt(np.mean(audio_float ** 2))
+                    current_frame = audio_chunk.copy()
+                    audio_float = current_frame.astype(np.float32) / 32768.0
+                    rms = float(np.sqrt(np.mean(audio_float ** 2)))
 
-                # Evaluamos si el usuario está hablando o hay silencio
-                if not speech_started:
-                    # Fase 1: Esperando a que el usuario empiece a hablar
-                    if rms > energy_threshold:
-                        speech_started = True
-                        print("[Voz detectada... grabando activamente]")
-                        silence_counter = 0
-                else:
-                    # Fase 2: El usuario ya empezó a hablar; monitoreamos si hace una pausa
-                    if rms < energy_threshold:
-                        # El bloque actual es silencio
-                        silence_counter += 1
+                    if not speech_started:
+                        pre_speech_frames.append(current_frame)
+                        if rms >= energy_threshold:
+                            speech_started = True
+                            # Añadimos los bloques recientes para no cortar consonantes iniciales.
+                            frames.extend(pre_speech_frames)
+                            print("[Voz detectada... grabando activamente]")
                     else:
-                        # El usuario sigue hablando; reiniciamos el contador de silencio
-                        silence_counter = 0
+                        frames.append(current_frame)
+                        if rms < energy_threshold:
+                            silence_counter += 1
+                        else:
+                            silence_counter = 0
 
-                    # Si el silencio continuo supera el límite requerido, cortamos la grabación
-                    if silence_counter >= required_silence_chunks:
-                        print("[Silencio prolongado detectado. Finalizando grabación]")
-                        break
+                        # El margen ampliado tolera pausas cortas entre palabras y frases.
+                        if silence_counter >= required_silence_chunks:
+                            print("[Silencio prolongado detectado. Finalizando grabación]")
+                            break
+        except Exception as error:
+            # El error del periférico se informa sin ocultar su causa al bucle principal.
+            raise RuntimeError(f"No se pudo capturar audio del micrófono: {error}") from error
 
-        # Convertimos la lista de bloques acumulados en un único arreglo de NumPy
+        if not frames:
+            # Evita que una ausencia completa de voz se convierta en error de concatenación.
+            frames = list(pre_speech_frames)
+        if not frames:
+            frames = [np.zeros((chunk_size, 1), dtype=np.int16)]
+
         audio_data = np.concatenate(frames, axis=0)
-
-        # Creamos un archivo temporal con extensión .wav que no se borre automáticamente al cerrar
-        temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        temp_file.close()
-
-        # Guardamos el audio acumulado en el archivo temporal usando scipy.io.wavfile
-        wavfile.write(temp_file.name, self.sample_rate, audio_data)
-
-        # Retornamos la ruta absoluta del archivo de audio resultante
-        abs_path = os.path.abspath(temp_file.name)
-        return abs_path
+        # El archivo temporal se cierra antes de escribirlo para evitar bloqueos en Windows.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_path = temp_file.name
+        try:
+            wavfile.write(temp_path, self.sample_rate, audio_data)
+        except Exception:
+            # Si falla la escritura, limpiamos el archivo incompleto antes de propagar el error.
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+        return os.path.abspath(temp_path)

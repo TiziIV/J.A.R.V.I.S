@@ -1,5 +1,6 @@
 import os
 import string
+from concurrent.futures import Future
 from src.audio.recorder import AudioRecorder
 from src.audio.stt import SpeechToText
 from src.brain.ollama_client import OllamaBrain
@@ -21,6 +22,7 @@ def main():
     brain = OllamaBrain()                        # Cerebro local principal (Ollama)
     gemini_brain = GeminiBrain()                 # Cerebro de respaldo en la nube (Gemini)
     tts = TextToSpeech(voice="es-AR-TomasNeural")  # Sintetizador de voz neuronal
+    pending_speech: Future[None] | None = None
 
     print("\n[+] Sistema J.A.R.V.I.S. activo y escuchando.")
     print("[i] Diga 'salir', 'adiós', 'chau', 'apágate', etc. para terminar o presione Ctrl + C.\n")
@@ -34,6 +36,10 @@ def main():
             audio_path = None  # Ruta del archivo temporal de audio
             
             try:
+                # Esperamos que termine la voz anterior antes de abrir el micrófono para evitar eco.
+                if pending_speech is not None:
+                    pending_speech.result()
+                    pending_speech = None
                 print("-" * 50)
                 
                 # a) Capturamos audio de manera inteligente con Detección de Actividad de Voz (VAD)
@@ -44,8 +50,10 @@ def main():
                 user_transcript = stt.transcribe(audio_path)
                 
                 # c) Detección de silencio o audio vacío
-                if not user_transcript or not user_transcript.strip():
-                    print("[!] No se detectó voz o hubo silencio. Continuando escucha...")
+                # Ignoramos residuos muy breves, pero permitimos respuestas cortas como "sí" o "no".
+                meaningful_characters = sum(character.isalnum() for character in user_transcript)
+                if not user_transcript or not user_transcript.strip() or meaningful_characters < 2:
+                    print("[!] No se obtuvo una transcripción confiable. Continuando escucha...")
                     continue
 
                 print(f"Usuario: \"{user_transcript}\"")
@@ -60,7 +68,7 @@ def main():
                     farewell_msg = "Entendido señor. Apagando sistemas. Hasta luego."
                     print(f"JARVIS: \"{farewell_msg}\"")
                     # Reproducimos la despedida por voz y rompemos el bucle
-                    tts.speak(farewell_msg)
+                    pending_speech = tts.speak(farewell_msg)
                     break
 
                 # e) Inferencia con Ollama (local) y fallback automático a Gemini (nube)
@@ -87,7 +95,7 @@ def main():
                 
                 print("[Reproduciendo respuesta por voz (TTS)...]")
                 # f) Reproducimos la respuesta generada mediante síntesis de voz neuronal
-                tts.speak(jarvis_response)
+                pending_speech = tts.speak(jarvis_response)
 
             except Exception as iteration_error:
                 print(f"[X] Error en esta iteración del bucle: {iteration_error}")
@@ -106,6 +114,10 @@ def main():
             tts.speak("Apagando sistemas por comando de usuario. Que tenga un excelente día.")
         except Exception:
             pass
+
+    finally:
+        # Cerramos el trabajador TTS de forma ordenada para no dejar audio o archivos pendientes.
+        tts.close()
 
     print("\n=== Sesión de J.A.R.V.I.S. finalizada correctamente ===")
 

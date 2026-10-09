@@ -1,75 +1,68 @@
-import os
 import asyncio
+import os
 import tempfile
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+
 import edge_tts
 from playsound import playsound
 
+
 class TextToSpeech:
-    """
-    Clase encargada de convertir texto a voz (Text-to-Speech) utilizando edge-tts.
-    Genera audio neuronal en español y lo reproduce de forma confiable en Windows.
-    """
-    
+    """Genera voz en segundo plano y permite consultar cuándo terminó la reproducción."""
+
     def __init__(self, voice: str = "es-AR-TomasNeural"):
-        """
-        Inicializa el sintetizador de voz con una voz neuronal predeterminada.
-        
-        Args:
-            voice (str): Identificador de la voz de Microsoft Edge TTS (por defecto 'es-AR-TomasNeural').
-                         También se pueden usar opciones como 'es-ES-AlvaroNeural' o 'es-MX-DaliaNeural'.
-        """
         self.voice = voice
+        # Un único trabajador evita reproducir dos respuestas a la vez.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jarvis-tts")
         print(f"Inicializando TextToSpeech con la voz neuronal '{self.voice}'...")
 
     async def _generate_audio_file(self, text: str, output_path: str) -> None:
-        """
-        Función asíncrona interna para generar el archivo de audio usando edge-tts.
-        
-        Args:
-            text (str): Texto a sintetizar.
-            output_path (str): Ruta donde se guardará el archivo MP3 temporal.
-        """
-        # Creamos comunicador de edge-tts con el texto y la voz seleccionados
+        # edge-tts usa asyncio para descargar el audio sin bloquear este trabajador.
         communicate = edge_tts.Communicate(text, self.voice)
-        # Guardamos el resultado en el archivo temporal especificado
         await communicate.save(output_path)
 
-    def speak(self, text: str) -> None:
-        """
-        Método público sincrónico para convertir texto a voz y reproducirlo inmediatamente.
-        
-        Args:
-            text (str): Texto que el asistente pronunciará en voz alta.
-        """
+    def speak(self, text: str) -> Future[None] | None:
+        """Encola la voz y retorna inmediatamente un Future para seguir su estado."""
         if not text or not text.strip():
             print("Texto vacío, omitiendo síntesis de voz.")
-            return
-
+            return None
         print(f"Sintetizando voz: \"{text}\"")
-        
-        temp_mp3 = None
+        # La red, la generación y el reproductor corren fuera del hilo conversacional.
+        return self._executor.submit(self._speak_blocking, text.strip())
+
+    def _speak_blocking(self, text: str) -> None:
+        temp_path = ""
         try:
-            # Creamos un archivo temporal con extensión .mp3 que se eliminará manualmente después
-            temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-            temp_file.close()
-            temp_mp3 = temp_file.name
-
-            # Ejecutamos la corrutina asíncrona de edge-tts usando asyncio.run
-            # ¿Por qué? Porque edge-tts es puramente asíncrono y necesitamos llamarlo desde un entorno sincrónico.
-            asyncio.run(self._generate_audio_file(text, temp_mp3))
-
-            # Reproducimos el audio usando playsound (compatible con Windows)
-            # ¿Por qué playsound? Es simple, sincrónico y bloquea la ejecución hasta que termina de hablar.
-            playsound(temp_mp3)
-
-        except Exception as e:
-            # Capturamos fallos de red, problemas con edge-tts o errores del reproductor de audio
-            print(f"Error durante la síntesis o reproducción de voz: {e}")
-
+            # El archivo queda cerrado antes de que edge-tts lo escriba, algo necesario en Windows.
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                temp_path = temp_file.name
+            asyncio.run(self._generate_audio_file(text, temp_path))
+            # playsound bloquea solo al trabajador dedicado, no al hilo que administra la conversación.
+            playsound(temp_path)
+        except Exception as error:
+            print(f"Error durante la síntesis o reproducción de voz: {error}")
         finally:
-            # Bloque de limpieza: aseguramos eliminar el archivo temporal MP3 para no acumular basura en disco
-            if temp_mp3 and os.path.exists(temp_mp3):
-                try:
-                    os.remove(temp_mp3)
-                except Exception as cleanup_error:
-                    print(f"No se pudo eliminar el archivo temporal de audio: {cleanup_error}")
+            if temp_path:
+                self._remove_temporary_file(temp_path)
+
+    @staticmethod
+    def _remove_temporary_file(path: str) -> None:
+        # Windows puede mantener el MP3 bloqueado unos instantes después de terminar el reproductor.
+        for attempt in range(5):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    print(f"No se pudo eliminar el audio temporal bloqueado: {path}")
+                else:
+                    time.sleep(0.2 * (attempt + 1))
+            except OSError as error:
+                print(f"No se pudo eliminar el audio temporal: {error}")
+                return
+
+    def close(self) -> None:
+        # Espera al último audio para no cerrar el proceso mientras aún se está reproduciendo.
+        self._executor.shutdown(wait=True)

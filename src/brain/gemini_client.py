@@ -1,6 +1,7 @@
 from google import genai
 from google.genai import types
-from config.settings import GEMINI_API_KEY
+from config.settings import GEMINI_API_KEY, GEMINI_MODEL
+from config.prompts import JARVIS_SYSTEM_PROMPT
 
 class GeminiBrain:
     """
@@ -8,7 +9,7 @@ class GeminiBrain:
     Actúa como respaldo (fallback) robusto cuando el servicio local de Ollama no está disponible o falla.
     """
     
-    def __init__(self, api_key: str = GEMINI_API_KEY, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str = GEMINI_API_KEY, model_name: str = GEMINI_MODEL):
         """
         Inicializa el cliente oficial de Google GenAI con la API Key configurada.
         
@@ -49,11 +50,7 @@ class GeminiBrain:
 
         # Definimos el system prompt con la identidad formal, concisa y directa de J.A.R.V.I.S.
         if system_prompt is None:
-            system_prompt = (
-                "Eres J.A.R.V.I.S., un asistente virtual técnico, formal, conciso, respetuoso y directo al grano. "
-                "Tus respuestas deben ser breves, naturales y optimizadas para ser reproducidas por síntesis de voz (TTS). "
-                "Evita introducciones largas o viñetas innecesarias a menos que se te pida explícitamente."
-            )
+            system_prompt = JARVIS_SYSTEM_PROMPT
 
         try:
             # Configuramos los parámetros de contenido (incluyendo la instrucción de sistema)

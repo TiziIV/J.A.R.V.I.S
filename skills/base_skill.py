@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 class BaseSkill(ABC):
     """
@@ -19,7 +20,7 @@ class BaseSkill(ABC):
         self.description: str = description
 
     @abstractmethod
-    def execute(self, **kwargs) -> any:
+    def execute(self, **kwargs: Any) -> Any:
         """
         Método abstracto que debe ser implementado por cada skill concreta.
         Contiene la lógica de ejecución principal de la tarea.
@@ -28,6 +29,6 @@ class BaseSkill(ABC):
             **kwargs: Argumentos dinámicos necesarios para la ejecución de la skill.
             
         Returns:
-            any: Resultado de la ejecución de la skill.
+            Any: Resultado de la ejecución de la skill concreta.
         """
         pass
