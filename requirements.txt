@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+torchaudio
+faster-whisper
+sounddevice
+numpy
+scipy
+edge-tts
+playsound==1.2.2
+ollama
+google-genai
+python-dotenv
+pydantic

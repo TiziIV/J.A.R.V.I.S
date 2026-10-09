@@ -1,0 +1,35 @@
+# Entorno virtual y dependencias
+venv/
+env/
+ENV/
+*.venv
+
+# Variables de entorno y secretos
+.env
+.env.local
+*.env
+
+# Archivos de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Caché de modelos locales y Hugging Face
+.cache/
+models/
+huggingface/
+
+# Archivos temporales de audio y multimedia
+*.wav
+*.mp3
+*.ogg
+*.flac
+temp/
+tmp/
+
+# Archivos de configuración de editores y SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
