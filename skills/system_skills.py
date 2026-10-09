@@ -59,7 +59,14 @@ class AppLauncherSkill(BaseSkill):
             name="app_launcher",
             description="Abre aplicaciones comunes de Windows como el Bloc de notas, Calculadora o navegador web.",
             parameters={
-                "app_name": "Nombre de la aplicación que se desea abrir (ej. 'bloc de notas', 'calculadora', 'code')."
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Nombre de la aplicación que se desea abrir (ej. 'bloc de notas', 'calculadora', 'code')."
+                    }
+                },
+                "required": ["app_name"]
             }
         )
         
@@ -174,8 +181,18 @@ class WebSearchSkill(BaseSkill):
             name="web_search",
             description="Abre el navegador web para buscar términos en Google o YouTube.",
             parameters={
-                "query": "Término o consulta que se desea buscar en internet.",
-                "platform": "Plataforma de búsqueda: 'google' o 'youtube' (opcional, por defecto 'google')."
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Término o consulta que se desea buscar en internet."
+                    },
+                    "platform": {
+                        "type": "string",
+                        "description": "Plataforma de búsqueda: 'google' o 'youtube' (opcional, por defecto 'google')."
+                    }
+                },
+                "required": ["query"]
             }
         )
 

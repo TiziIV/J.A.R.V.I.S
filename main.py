@@ -6,6 +6,8 @@ from src.audio.recorder import AudioRecorder
 from src.audio.stt import SpeechToText
 from src.brain.ollama_client import OllamaBrain
 from src.brain.gemini_client import GeminiBrain
+from src.brain.intent_router import IntentRouter
+from config.tools_schema import TOOLS_SCHEMA
 from src.audio.tts import TextToSpeech
 from src.tools.skill_manager import SkillManager
 
@@ -45,7 +47,7 @@ def main():
     Script principal de J.A.R.V.I.S. con bucle continuo, normalización léxica avanzada,
     motor de habilidades (SkillManager) y respaldo de cerebros (Ollama + Gemini).
     """
-    print("=== Inicializando Sistema J.A.R.V.I.S. (Fase 4 - System Skills Completas) ===")
+    print("=== Inicializando Sistema J.A.R.V.I.S. (Fase 5 - Function Calling con IntentRouter) ===")
     
     # ---------------------------------------------------------------------------
     # PASO 1: Inicialización única de componentes (evita recargar modelos en VRAM)
@@ -56,6 +58,9 @@ def main():
     gemini_brain = GeminiBrain()                 # Cerebro de respaldo en la nube (Gemini)
     tts = TextToSpeech(voice="es-AR-TomasNeural")  # Sintetizador de voz neuronal
     skill_manager = SkillManager()               # Gestor de habilidades y herramientas locales
+    
+    # Instanciamos el IntentRouter con el LLM principal y el manifiesto de herramientas de SkillManager
+    intent_router = IntentRouter(llm=brain, tools=skill_manager.get_skills_manifest())
     pending_speech: Future[None] | None = None   # Futuro para controlar la asincronía del TTS
 
     print("\n[+] Sistema J.A.R.V.I.S. activo y escuchando.")
@@ -107,114 +112,45 @@ def main():
                     break
 
                 # -----------------------------------------------------------------
-                # PASO 2: Enrutamiento mejorado y flexible para Herramientas (Skills)
-                # Evaluamos las intenciones normalizadas antes de consultar a los LLMs.
+                # PASO 2: Clasificación de Intenciones y Function Calling (IntentRouter)
+                # Reemplaza la detección manual por análisis autónomo de LLM en formato JSON.
                 # -----------------------------------------------------------------
-                handled_by_skill = False
-                skill_response = None
-
-                # 2.1. Detección flexible de consulta de Hora o Fecha (TimeSkill)
-                time_keywords = ["hora", "fecha", "dia"]
-                if any(kw in norm_text for kw in time_keywords):
-                    print("[Intent Detected] Habilidad local: system_time")
-                    skill_response = skill_manager.execute_skill("system_time")
-                    handled_by_skill = True
-
-                # 2.2. Detección de estado del sistema y recursos (SystemInfoSkill)
-                # Si el usuario pregunta por CPU, RAM, memoria o estado del sistema, consultamos el hardware.
-                # Evaluamos por palabras exactas para prevenir falsos positivos (por ejemplo: 'programar' contiene 'ram').
-                elif any(kw in words for kw in ["recursos", "cpu", "ram", "memoria"]) or "estado del sistema" in norm_text:
-                    print("[Intent Detected] Habilidad local: system_info")
-                    skill_response = skill_manager.execute_skill("system_info")
-                    handled_by_skill = True
-
-                # 2.3. Detección de búsqueda en internet o YouTube (WebSearchSkill)
-                # Si el texto contiene la intención de buscar en internet o youtube, extraemos el texto y ejecutamos
-                elif any(kw in norm_text for kw in ["busca", "buscar", "buscame", "googlea", "googlear"]) or ("en youtube" in norm_text) or ("en google" in norm_text):
-                    print("[Intent Detected] Habilidad local: web_search")
-                    
-                    # Determinamos la plataforma (YouTube si se menciona explícitamente, de lo contrario Google)
-                    platform = "youtube" if "youtube" in norm_text else "google"
-                    
-                    # Extraemos el texto de búsqueda eliminando prefijos de comando conocidos
-                    search_prefixes = [
-                        "busca en youtube", "buscar en youtube", "buscame en youtube",
-                        "busca en google", "buscar en google", "buscame en google",
-                        "busca en internet", "buscar en internet", "buscame en internet",
-                        "busca en la web", "buscar en la web", "buscame en la web",
-                        "googlea", "googlear",
-                        "busca", "buscar", "buscame"
-                    ]
-                    
-                    query_text = norm_text
-                    for prefix in search_prefixes:
-                        if prefix in query_text:
-                            query_text = query_text.replace(prefix, "", 1)
-                            break
-                    
-                    # Removemos palabras de cortesía o relleno que no forman parte de la búsqueda real
-                    for filler in ["por favor", "me podes", "me puedes", "podes", "puedes", "en youtube", "en google", "en internet", "sobre"]:
-                        query_text = query_text.replace(filler, "")
-                    
-                    query_text = query_text.strip()
-                    
-                    # Ejecutamos la skill de búsqueda web pasando el término y la plataforma
-                    skill_response = skill_manager.execute_skill("web_search", query=query_text, platform=platform)
-                    handled_by_skill = True
-
-                # 2.4. Detección flexible de lanzamiento de Aplicaciones (AppLauncherSkill)
-                elif any(verb in norm_text for verb in ["abrir", "abri", "ejecutar", "lanzar", "iniciar", "pone", "pon"]):
-                    print("[Intent Detected] Habilidad local: app_launcher")
-                    
-                    # Identificamos con precisión la aplicación solicitada buscando patrones comunes
-                    app_target = ""
-                    if "calculadora" in norm_text or "calc" in norm_text:
-                        app_target = "calculadora"
-                    elif "bloc de notas" in norm_text or "notepad" in norm_text:
-                        app_target = "bloc de notas"
-                    elif "codigo" in norm_text or "code" in norm_text or "visual studio code" in norm_text:
-                        app_target = "code"
-                    elif "navegador" in norm_text or "chrome" in norm_text or "edge" in norm_text:
-                        app_target = "navegador"
-                    else:
-                        # Si no coincide con ninguna conocida, limpiamos verbos y artículos
-                        app_target = norm_text
-                        for verb in ["abrir", "abri", "ejecutar", "lanzar", "iniciar", "pone", "pon"]:
-                            app_target = app_target.replace(verb, "")
-                        for filler in ["por favor", "me", "puedes", "podes", "la", "el", "un", "una"]:
-                            app_target = app_target.replace(filler, "")
-                        app_target = app_target.strip()
-                    
-                    skill_response = skill_manager.execute_skill("app_launcher", app_name=app_target)
-                    handled_by_skill = True
-
-                # Si una skill manejó la petición, respondemos directamente sin pasar por el LLM
-                if handled_by_skill and skill_response:
-                    print(f"JARVIS: \"{skill_response}\"")
-                    pending_speech = tts.speak(skill_response)
-                    continue  # Saltamos al inicio del bucle
-
-                # -----------------------------------------------------------------
-                # PASO 3: Flujo de Conversación General (LLM con Fallback)
-                # Si no es una skill local, consultamos al cerebro Ollama con respaldo en Gemini.
-                # -----------------------------------------------------------------
-                jarvis_response = None
+                print("[Analizando intención con IntentRouter...]")
+                intent_decision = intent_router.analyze_intent(user_transcript)
+                action = intent_decision.get("action", "chat")
                 
-                try:
-                    print("[Consultando al cerebro local (Ollama)...]")
-                    jarvis_response = brain.generate_response(user_transcript)
-                    
-                    if not jarvis_response or "no responde" in jarvis_response.lower() or "error" in jarvis_response.lower():
-                        raise Exception("Ollama local no disponible o respuesta inválida.")
+                jarvis_response = None
 
-                except Exception as ollama_error:
-                    print(f"[!] Fallo en Ollama local ({ollama_error}). Derivando a GeminiBrain (Cloud Fallback)...")
-                    try:
-                        print("[Consultando al cerebro en la nube (Gemini)...]")
-                        jarvis_response = gemini_brain.generate_response(user_transcript)
-                    except Exception as gemini_error:
-                        print(f"[X] Fallo también en GeminiBrain: {gemini_error}")
-                        jarvis_response = "Lo siento señor, ninguno de mis cerebros responde en este momento."
+                # Si la acción es 'call_tool', ejecutamos la herramienta a través de SkillManager
+                if action == "call_tool":
+                    tool_name = intent_decision.get("tool_name", "")
+                    parameters = intent_decision.get("parameters", {})
+                    print(f"[Tool Call Detectado] Ejecutando: '{tool_name}' con parámetros: {parameters}")
+                    
+                    jarvis_response = skill_manager.execute_skill(tool_name, **parameters)
+
+                # Si la acción es 'chat', reproducimos directamente la respuesta generada
+                else:
+                    chat_text = intent_decision.get("response", "")
+                    
+                    # Si el router devolvió el texto crudo del usuario como fallback seguro de parsing,
+                    # consultamos directamente a Ollama con respaldo en Gemini para asegurar respuesta fluida
+                    if not chat_text or chat_text == user_transcript:
+                        print("[IntentRouter derivó a chat directo. Consultando cerebro LLM...]")
+                        try:
+                            chat_text = brain.generate_response(user_transcript)
+                            if not chat_text or "no responde" in chat_text.lower() or "error" in chat_text.lower():
+                                raise Exception("Ollama local no disponible o respuesta inválida.")
+                        except Exception as ollama_error:
+                            print(f"[!] Fallo en Ollama local ({ollama_error}). Derivando a GeminiBrain (Cloud Fallback)...")
+                            try:
+                                print("[Consultando al cerebro en la nube (Gemini)...]")
+                                chat_text = gemini_brain.generate_response(user_transcript)
+                            except Exception as gemini_error:
+                                print(f"[X] Fallo también en GeminiBrain: {gemini_error}")
+                                chat_text = "Lo siento señor, ninguno de mis cerebros responde en este momento."
+
+                    jarvis_response = chat_text
 
                 print(f"JARVIS: \"{jarvis_response}\"")
                 

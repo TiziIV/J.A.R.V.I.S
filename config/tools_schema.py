@@ -53,6 +53,11 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "query": {
                     "type": "string",
                     "description": "Término o pregunta exacta que se desea buscar en la web."
+                },
+                "platform": {
+                    "type": "string",
+                    "description": "Plataforma de búsqueda: 'google' o 'youtube' (opcional, por defecto 'google').",
+                    "default": "google"
                 }
             },
             "required": ["query"]
