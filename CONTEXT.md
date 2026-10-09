@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-Asistente modular de voz para Windows, con transcripción local mediante faster-whisper, Ollama como cerebro principal, Gemini como respaldo y síntesis neuronal con Edge TTS.
+Asistente modular de voz para Windows, con transcripción local mediante faster-whisper, Ollama como cerebro principal, Gemini como respaldo, síntesis neuronal con Edge TTS y motor de habilidades locales con normalización léxica avanzada (`normalize_text` en `main.py`).
 
 ## Entorno documentado
 
@@ -13,29 +13,30 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
 
 ## Arquitectura y estado actual
 
-- `main.py`: coordina captura, transcripción, salida, Ollama/Gemini y voz; omite transcripciones residuales, encola voz en segundo plano y espera a que termine antes de reabrir el micrófono para evitar eco.
-- `src/audio/recorder.py`: captura con VAD por energía RMS, silencio de cierre predeterminado de 1,8 s, ventana previa a la voz de 250 ms y límite máximo de 20 s. Conserva audio mono a 16 kHz y elimina archivos incompletos si falla la escritura.
-- `src/audio/stt.py`: transcribe en español con faster-whisper, filtro VAD del modelo y sin contexto de texto previo; descarta segmentos con `no_speech_prob` alta, `avg_logprob` baja o menos de dos caracteres alfanuméricos.
-- `src/audio/tts.py`: genera y reproduce en un trabajador dedicado. `speak` retorna un `Future`; el reproductor no comparte el hilo conversacional. La limpieza reintenta errores de archivo bloqueado de Windows y `close()` espera al audio pendiente.
-- `src/brain/ollama_client.py` y `src/brain/gemini_client.py`: mantienen los adaptadores de proveedores y comparten el prompt de `config/prompts.py`. Respuesta predeterminada: una o dos oraciones concisas, con detalle adicional si lo pide el usuario. `GeminiBrain` utiliza la constante `GEMINI_MODEL` configurable desde `config/settings.py` y `.env` (por defecto `gemini-1.5-flash`).
-- `skills/base_skill.py`: contrato abstracto con tipado `Any` correcto. `skills/README.md` explica estructura y convención de nuevas habilidades. Aún no existen skills concretas.
-- `src/tools/`: paquete separado para herramientas internas del sistema.
-- `AGENTS.md`: reglas del repositorio consolidadas para arquitectura, estilo didáctico, seguridad, skills y bitácoras.
+- `main.py`: coordina captura con VAD, transcripción con Whisper GPU, normalización léxica de intenciones (`normalize_text`), ejecución directa de herramientas (`SkillManager` para `system_time` y `app_launcher`), inferencia LLM (Ollama con fallback a Gemini) y síntesis vocal asíncrona con Edge TTS.
+- `src/audio/recorder.py`: captura con VAD por energía RMS, silencio de cierre predeterminado de 1,3 s y límite máximo de 20 s.
+- `src/audio/stt.py`: transcribe en español con faster-whisper, filtro VAD del modelo y sin contexto de texto previo.
+- `src/audio/tts.py`: genera y reproduce en un trabajador dedicado (`Future`).
+- `src/brain/ollama_client.py` y `src/brain/gemini_client.py`: adaptadores de Ollama local y Gemini en la nube (`GEMINI_MODEL`).
+- `skills/base_skill.py`: contrato abstracto `BaseSkill`.
+- `skills/system_skills.py`: `TimeSkill` y `AppLauncherSkill` (con lista blanca segura).
+- `src/tools/skill_manager.py`: clase `SkillManager` para registro y ejecución segura.
+- `AGENTS.md`: reglas del repositorio consolidadas.
 - `prompts_history.txt`: historial local acumulativo, ignorado por Git.
 
-## Cambios de esta iteración (2026-10-09)
+## Cambios de esta iteración (2026-10-09 - Normalización de Intenciones)
 
-- Archivos modificados: `config/settings.py`, `src/brain/gemini_client.py`, `CONTEXT.md` y `prompts_history.txt`.
-- Se corrigió el modelo obsoleto de Gemini por `gemini-1.5-flash`, parametrizándolo mediante la constante `GEMINI_MODEL` en `config/settings.py`.
+- Archivos modificados: `main.py`, `CONTEXT.md` y `prompts_history.txt`.
+- Se implementó la función auxiliar `normalize_text()` en `main.py` utilizando `unicodedata` para remover tildes, signos de puntuación y unificar en minúsculas.
+- Se mejoró el enrutamiento y detección léxica para `TimeSkill` (`hora`, `fecha`, `dia`) y `AppLauncherSkill` (`abrir`, `abri`, `ejecutar`, `lanzar`, `iniciar`, `pone`, `pon` con coincidencia flexible para calculadora, bloc de notas, code y navegador).
 - El prompt completo de esta iteración se agregó a `prompts_history.txt`; ese archivo es local y no debe versionarse.
 
 ## Verificación y limitaciones
 
 - No se ejecutaron pruebas automáticas ni verificaciones de código durante esta iteración.
-- Micrófono, pausas naturales, GPU/CUDA, llamadas a proveedores y reproducción/liberación del MP3 requieren validación manual en el Windows y hardware reportados.
+- Micrófono, pausas naturales, GPU/CUDA, llamadas a proveedores, ejecución de subprocesos y reproducción/liberación del MP3 requieren validación manual en el Windows y hardware reportados.
 
 ## Pendientes
 
-- Probar varias frases con pausas cortas y ajustar `silence_duration` y `energy_threshold` al micrófono real.
-- Verificar una conversación completa y comprobar que el archivo temporal desaparece al terminar Edge TTS en Windows.
-- Implementar skills concretas cuando se definan casos de uso y conectar el orquestador `src/agent.py` si se adopta para reemplazar o ampliar el ciclo de `main.py`.
+- Inyectar el manifiesto de herramientas (`get_skills_manifest()`) directamente en el prompt del sistema de los LLMs para que el modelo decida de forma autónoma cuándo invocar una skill.
+- Probar la ejecución real de comandos de voz normalizados en Windows.

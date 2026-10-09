@@ -1,34 +1,34 @@
 from abc import ABC, abstractmethod
-from typing import Any
 
 class BaseSkill(ABC):
     """
-    Clase abstracta base para definir habilidades (skills) modulares en J.A.R.V.I.S.
-    Cada skill representa una capacidad específica que el asistente puede ejecutar
-    (por ejemplo, control del sistema, consultas web, automatización, etc.).
+    Clase abstracta base (contrato) para todas las habilidades (skills) del sistema J.A.R.V.I.S.
+    Cada skill representa una capacidad o herramienta ejecutable (ej. consultar hora, abrir apps).
     """
     
-    def __init__(self, name: str, description: str):
+    def __init__(self, name: str, description: str, parameters: dict = None):
         """
-        Inicializa una skill con su nombre identificativo y descripción funcional.
+        Inicializa los metadatos descriptivos de la skill.
         
         Args:
-            name (str): Nombre único de la skill.
-            description (str): Breve explicación de lo que hace la skill.
+            name (str): Identificador único de la skill (ej. 'system_time', 'app_launcher').
+            description (str): Explicación breve de lo que hace (usada para que el LLM sepa cuándo invocarla).
+            parameters (dict, optional): Esquema de argumentos que requiere la skill (por defecto {}).
         """
         self.name: str = name
         self.description: str = description
+        self.parameters: dict = parameters or {}
 
     @abstractmethod
-    def execute(self, **kwargs: Any) -> Any:
+    def execute(self, **kwargs) -> str:
         """
-        Método abstracto que debe ser implementado por cada skill concreta.
-        Contiene la lógica de ejecución principal de la tarea.
+        Método abstracto que contiene la lógica de ejecución de la skill.
+        Debe ser implementado obligatoriamente por cada skill concreta.
         
         Args:
-            **kwargs: Argumentos dinámicos necesarios para la ejecución de la skill.
+            **kwargs: Argumentos dinámicos necesarios para ejecutar la acción.
             
         Returns:
-            Any: Resultado de la ejecución de la skill concreta.
+            str: Mensaje en lenguaje natural explicando el resultado, optimizado para ser leído por voz (TTS).
         """
         pass
