@@ -33,8 +33,9 @@ def normalize_text(text: str) -> str:
     # 3. Filtramos los caracteres de combinación (tildes/diacríticos)
     without_accents = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
     
-    # 4. Removemos todos los signos de puntuación del sistema (¿, ?, !, ., ,, etc.)
-    clean_text = without_accents.translate(str.maketrans("", "", string.punctuation))
+    # 4. Removemos todos los signos de puntuación del sistema (incluyendo signos en español ¿, ¡)
+    punctuation_to_remove = string.punctuation + "¿¡«»“”"
+    clean_text = without_accents.translate(str.maketrans("", "", punctuation_to_remove))
     
     # 5. Unimos las palabras separadas por múltiples espacios en un único espacio estándar
     return " ".join(clean_text.split())
@@ -44,7 +45,7 @@ def main():
     Script principal de J.A.R.V.I.S. con bucle continuo, normalización léxica avanzada,
     motor de habilidades (SkillManager) y respaldo de cerebros (Ollama + Gemini).
     """
-    print("=== Inicializando Sistema J.A.R.V.I.S. (Fase 4 - Normalización de Intenciones) ===")
+    print("=== Inicializando Sistema J.A.R.V.I.S. (Fase 4 - System Skills Completas) ===")
     
     # ---------------------------------------------------------------------------
     # PASO 1: Inicialización única de componentes (evita recargar modelos en VRAM)
@@ -58,7 +59,7 @@ def main():
     pending_speech: Future[None] | None = None   # Futuro para controlar la asincronía del TTS
 
     print("\n[+] Sistema J.A.R.V.I.S. activo y escuchando.")
-    print("[i] Pruebe decir: '¿Qué hora es?', 'Abrí la calculadora', o 'Abrí el bloc de notas'.\n")
+    print("[i] Pruebe decir: '¿Qué hora es?', 'Estado del sistema', 'Busca en YouTube música...', o 'Abrí la calculadora'.\n")
 
     # Lista de palabras clave para detectar comandos de salida del usuario
     exit_keywords = ["salir", "adios", "chau", "bye", "apagate", "cerrar", "terminar", "hasta luego"]
@@ -93,6 +94,7 @@ def main():
                 
                 # Normalizamos el texto de manera avanzada (sin tildes, sin puntuación, minúsculas)
                 norm_text = normalize_text(user_transcript)
+                words = set(norm_text.split())
 
                 # d) Detección flexible de comandos de salida
                 is_exit_requested = any(keyword in norm_text for keyword in exit_keywords)
@@ -118,7 +120,49 @@ def main():
                     skill_response = skill_manager.execute_skill("system_time")
                     handled_by_skill = True
 
-                # 2.2. Detección flexible de lanzamiento de Aplicaciones (AppLauncherSkill)
+                # 2.2. Detección de estado del sistema y recursos (SystemInfoSkill)
+                # Si el usuario pregunta por CPU, RAM, memoria o estado del sistema, consultamos el hardware.
+                # Evaluamos por palabras exactas para prevenir falsos positivos (por ejemplo: 'programar' contiene 'ram').
+                elif any(kw in words for kw in ["recursos", "cpu", "ram", "memoria"]) or "estado del sistema" in norm_text:
+                    print("[Intent Detected] Habilidad local: system_info")
+                    skill_response = skill_manager.execute_skill("system_info")
+                    handled_by_skill = True
+
+                # 2.3. Detección de búsqueda en internet o YouTube (WebSearchSkill)
+                # Si el texto contiene la intención de buscar en internet o youtube, extraemos el texto y ejecutamos
+                elif any(kw in norm_text for kw in ["busca", "buscar", "buscame", "googlea", "googlear"]) or ("en youtube" in norm_text) or ("en google" in norm_text):
+                    print("[Intent Detected] Habilidad local: web_search")
+                    
+                    # Determinamos la plataforma (YouTube si se menciona explícitamente, de lo contrario Google)
+                    platform = "youtube" if "youtube" in norm_text else "google"
+                    
+                    # Extraemos el texto de búsqueda eliminando prefijos de comando conocidos
+                    search_prefixes = [
+                        "busca en youtube", "buscar en youtube", "buscame en youtube",
+                        "busca en google", "buscar en google", "buscame en google",
+                        "busca en internet", "buscar en internet", "buscame en internet",
+                        "busca en la web", "buscar en la web", "buscame en la web",
+                        "googlea", "googlear",
+                        "busca", "buscar", "buscame"
+                    ]
+                    
+                    query_text = norm_text
+                    for prefix in search_prefixes:
+                        if prefix in query_text:
+                            query_text = query_text.replace(prefix, "", 1)
+                            break
+                    
+                    # Removemos palabras de cortesía o relleno que no forman parte de la búsqueda real
+                    for filler in ["por favor", "me podes", "me puedes", "podes", "puedes", "en youtube", "en google", "en internet", "sobre"]:
+                        query_text = query_text.replace(filler, "")
+                    
+                    query_text = query_text.strip()
+                    
+                    # Ejecutamos la skill de búsqueda web pasando el término y la plataforma
+                    skill_response = skill_manager.execute_skill("web_search", query=query_text, platform=platform)
+                    handled_by_skill = True
+
+                # 2.4. Detección flexible de lanzamiento de Aplicaciones (AppLauncherSkill)
                 elif any(verb in norm_text for verb in ["abrir", "abri", "ejecutar", "lanzar", "iniciar", "pone", "pon"]):
                     print("[Intent Detected] Habilidad local: app_launcher")
                     

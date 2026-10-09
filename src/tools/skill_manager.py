@@ -1,6 +1,6 @@
 import traceback
 from skills.base_skill import BaseSkill
-from skills.system_skills import TimeSkill, AppLauncherSkill
+from skills.system_skills import TimeSkill, AppLauncherSkill, SystemInfoSkill, WebSearchSkill
 
 class SkillManager:
     """
@@ -35,10 +35,12 @@ class SkillManager:
 
     def _register_default_skills(self) -> None:
         """
-        Instancia y registra las habilidades nativas del sistema (TimeSkill, AppLauncherSkill, etc.).
+        Instancia y registra las habilidades nativas del sistema (TimeSkill, AppLauncherSkill, SystemInfoSkill, WebSearchSkill).
         """
         self.register_skill(TimeSkill())
         self.register_skill(AppLauncherSkill())
+        self.register_skill(SystemInfoSkill())
+        self.register_skill(WebSearchSkill())
 
     def get_skills_manifest(self) -> list[dict]:
         """

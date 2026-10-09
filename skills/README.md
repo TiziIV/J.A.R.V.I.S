@@ -5,9 +5,10 @@ Esta carpeta contiene habilidades extensibles que ejecutan acciones solicitadas 
 ## Estructura actual
 
 - `base_skill.py`: contrato abstracto común para habilidades.
+- `system_skills.py`: contiene `TimeSkill`, `AppLauncherSkill`, `SystemInfoSkill` y `WebSearchSkill`.
 - `__init__.py`: exporta el contrato público del paquete.
 
-Todavía no hay habilidades concretas. Mantener el paquete pequeño evita acoplar interfaces antes de que exista un caso de uso real.
+Las habilidades por defecto se registran en `src/tools/skill_manager.py`, que publica su manifiesto para que el enrutador pueda conocer los nombres, descripciones y argumentos aceptados.
 
 ## Añadir una habilidad
 

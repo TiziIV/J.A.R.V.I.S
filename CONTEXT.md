@@ -19,24 +19,36 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
 - `src/audio/tts.py`: genera y reproduce en un trabajador dedicado (`Future`).
 - `src/brain/ollama_client.py` y `src/brain/gemini_client.py`: adaptadores de Ollama local y Gemini en la nube (`GEMINI_MODEL`).
 - `skills/base_skill.py`: contrato abstracto `BaseSkill`.
-- `skills/system_skills.py`: `TimeSkill` y `AppLauncherSkill` (con lista blanca segura).
-- `src/tools/skill_manager.py`: clase `SkillManager` para registro y ejecución segura.
+- `skills/system_skills.py`: `TimeSkill`, `AppLauncherSkill` (con lista blanca segura), `SystemInfoSkill` (monitoreo de CPU y RAM con psutil) y `WebSearchSkill` (búsqueda en Google/YouTube con webbrowser y urllib.parse).
+- `src/tools/skill_manager.py`: clase `SkillManager` para registro y ejecución centralizada de las 4 habilidades del sistema.
 - `AGENTS.md`: reglas del repositorio consolidadas.
 - `prompts_history.txt`: historial local acumulativo, ignorado por Git.
 
-## Cambios de esta iteración (2026-10-09 - Normalización de Intenciones)
+## Cambios de esta iteración (2026-10-09 - Fase 4: SystemInfoSkill y WebSearchSkill)
 
-- Archivos modificados: `main.py`, `CONTEXT.md` y `prompts_history.txt`.
-- Se implementó la función auxiliar `normalize_text()` en `main.py` utilizando `unicodedata` para remover tildes, signos de puntuación y unificar en minúsculas.
-- Se mejoró el enrutamiento y detección léxica para `TimeSkill` (`hora`, `fecha`, `dia`) y `AppLauncherSkill` (`abrir`, `abri`, `ejecutar`, `lanzar`, `iniciar`, `pone`, `pon` con coincidencia flexible para calculadora, bloc de notas, code y navegador).
+- Archivos modificados: `skills/system_skills.py`, `src/tools/skill_manager.py`, `main.py`, `CONTEXT.md` y `prompts_history.txt`.
+- Se implementó `SystemInfoSkill` en `skills/system_skills.py`, utilizando `psutil.cpu_percent(interval=0.5)` y `psutil.virtual_memory()` para calcular el uso de CPU (%) y RAM disponible (GB) con respuesta natural para voz.
+- Se implementó `WebSearchSkill` en `skills/system_skills.py`, utilizando `webbrowser` y `urllib.parse.quote_plus` para abrir búsquedas en Google o YouTube en el navegador predeterminado.
+- Se actualizaron las importaciones y el registro de `_register_default_skills()` en `src/tools/skill_manager.py` para instanciar las dos nuevas habilidades.
+- Se integró la detección de intenciones en `main.py` para recursos del sistema (`recursos`, `cpu`, `ram`, `memoria`, `estado del sistema` con coincidencia de palabras exactas para prevenir falsos positivos) y búsquedas web (`busca`, `buscar`, `buscame`, `googlear`, `en youtube`, `en google` con extracción limpia de términos y selección de plataforma).
+- Se refinó la normalización léxica en `normalize_text()` para limpiar signos de apertura y puntuación en español (`¿`, `¡`).
 - El prompt completo de esta iteración se agregó a `prompts_history.txt`; ese archivo es local y no debe versionarse.
+
+## Cambios de iteraciones anteriores
+
+- **2026-10-09 (Fase 5 - Esquemas de Herramientas y System Prompt)**: Creación de `config/tools_schema.py` con esquemas de herramientas y system prompt para function calling.
+- **2026-10-09 (Normalización de Intenciones)**: Implementación inicial de `normalize_text()` en `main.py` y detección flexible de intenciones.
 
 ## Verificación y limitaciones
 
-- No se ejecutaron pruebas automáticas ni verificaciones de código durante esta iteración.
-- Micrófono, pausas naturales, GPU/CUDA, llamadas a proveedores, ejecución de subprocesos y reproducción/liberación del MP3 requieren validación manual en el Windows y hardware reportados.
+- Se ejecutaron pruebas funcionales unitarias en `venv/Scripts/python.exe`:
+  - `SkillManager` inicializa correctamente las 4 habilidades (`system_time`, `app_launcher`, `system_info`, `web_search`) y genera su manifiesto estructurado.
+  - `SystemInfoSkill` mide CPU y RAM en tiempo real y devuelve el mensaje formateado para TTS (ej: "El procesador está al X% y dispone de Y gigabytes de RAM libres, señor.").
+  - `WebSearchSkill` maneja búsquedas con y sin término, seleccionando la plataforma correspondiente.
+  - Validación de enrutamiento con múltiples frases de prueba (ej: "¿Cuánta memoria RAM y CPU tenemos disponibles?", "Busca en YouTube música para programar", "Busca en Google noticias de hoy") confirmando que la extracción léxica y derivación a skills funcionan sin falsos positivos.
+- Micrófono físico, capturas reales de voz, GPU/CUDA en vivo y reproducción de audio por parlantes requieren validación manual en el entorno del usuario.
 
 ## Pendientes
 
-- Inyectar el manifiesto de herramientas (`get_skills_manifest()`) directamente en el prompt del sistema de los LLMs para que el modelo decida de forma autónoma cuándo invocar una skill.
-- Probar la ejecución real de comandos de voz normalizados en Windows.
+- Probar la interacción por micrófono físico con las nuevas órdenes de voz en Windows.
+- Integrar el enrutador inteligente de intenciones (`IntentRouter`) con los LLMs cuando se complete la Fase 5.
