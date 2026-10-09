@@ -13,14 +13,17 @@ Asistente local modular desarrollado en Python, diseñado para operar con capaci
 - **Aceleración:** CUDA 12.1 funcional con PyTorch y `ctranslate2` / `faster-whisper`.
 - **Configuración de DLLs:** Registro explícito en `config/settings.py` de las DLLs de NVIDIA CUDA (`cublas` y `cudnn`) para garantizar la ejecución en GPU en Windows.
 
-## 4. Módulos Implementados y Probados
+## 4. Módulos Implementados y Probados (Fases 1 y 2)
 - **`AudioRecorder` (`src/audio/recorder.py`):** Captura de audio desde el micrófono a 16kHz (mono, 16-bit PCM) en archivos temporales `.wav` utilizando `sounddevice` y `scipy.io.wavfile`.
-- **`SpeechToText` (`src/audio/stt.py`):** Transcripción de voz a texto basada en `faster-whisper` (modelo `base`) ejecutando en GPU con precisión `float16`, utilizando `soundfile` para la lectura de arreglos numpy. Validación de micrófono exitosa.
-- **Configuración centralizada (`config/settings.py` & `.env`):** Gestión de variables de entorno y constantes (`GEMINI_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `WHISPER_MODEL_SIZE`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`) con registro manual de DLLs CUDA.
-- **Sistema de Skills (`skills/base_skill.py`):** Definición de la clase abstracta `BaseSkill` para la modularización de habilidades con fuertemente tipado (Type Hints) y comentarios didácticos.
+- **`SpeechToText` (`src/audio/stt.py`):** Transcripción de voz a texto basada en `faster-whisper` (modelo `base`) ejecutando en GPU con precisión `float16`, utilizando `soundfile` para la lectura de arreglos numpy.
+- **`OllamaBrain` (`src/brain/ollama_client.py`):** Integración con Ollama y el LLM local (Qwen 2.5 Coder 3B) con prompt de sistema personalizado para definir la identidad de J.A.R.V.I.S (formal, conciso, directo) y manejo robusto de excepciones.
+- **`TextToSpeech` (`src/audio/tts.py`):** Síntesis vocal neuronal en español (`es-AR-TomasNeural`) mediante corrutinas asíncronas con `edge-tts` y reproducción sincrónica en Windows con `playsound`.
+- **Pipeline Unificado (`main.py`):** Orquestación completa del flujo conversacional (Grabación de voz -> STT Whisper GPU -> Inferencia LLM Ollama -> TTS Síntesis de voz -> Limpieza de archivos temporales).
+- **Configuración centralizada (`config/settings.py` & `.env`):** Gestión de variables de entorno y constantes con registro manual de DLLs CUDA.
+- **Sistema de Skills (`skills/base_skill.py`):** Definición de la clase abstracta `BaseSkill` para la modularización de habilidades con tipado estricto y comentarios didácticos.
+- **Bitácora de Prompts (`prompts_history.txt`):** Registro local acumulativo de las instrucciones del usuario para trazabilidad del desarrollo (excluido en `.gitignore`).
 
 ## 5. Próximos Pasos Pendientes
-- **`src/brain/ollama_client.py`:** Integración con Ollama (Qwen 2.5 Coder 3B) para inferencia local.
-- **`src/audio/tts.py`:** Síntesis de voz (Text-to-Speech) utilizando `edge-tts`.
 - **`src/brain/gemini_client.py`:** Cliente y fallback a Google Gemini para tareas complejas.
-- **`src/agent.py`:** Orquestador general del bucle conversacional y gestión de herramientas.
+- **`src/agent.py`:** Orquestador general del bucle conversacional avanzado y gestión de herramientas/skills.
+- **Implementación de Skills concretas:** Desarrollo de habilidades modulares basadas en `BaseSkill`.

@@ -21,3 +21,13 @@ Actúas como un ingeniero de software senior y mentor técnico especializado en 
   * Pruebas ejecutadas y resultados obtenidos.
   * Errores resueltos y configuraciones de entorno añadidas.
   * Tareas pendientes o próximos pasos definidos.
+
+## Registro Local de Prompts del Usuario (prompts_history.txt)
+- Cada vez que el usuario te envíe una instrucción o prompt, debes registrar de forma acumulativa (append) el prompt recibido en un archivo en la raíz llamado 'prompts_history.txt'.
+- Estructura de cada entrada:
+  --------------------------------------------------
+  [Fecha/Paso o Fase]:
+  <Prompt exacto enviado por el usuario>
+  --------------------------------------------------
+- Esto sirve como bitácora personal del proceso de construcción del proyecto.
+- Este archivo NUNCA se versiona en Git (ya está ignorado en .gitignore).
