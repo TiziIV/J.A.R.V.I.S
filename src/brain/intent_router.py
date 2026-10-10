@@ -3,6 +3,7 @@
 import json
 import re
 from typing import Any, Mapping, Protocol, Sequence
+from src.brain.memory import ConversationMemory
 
 
 class LanguageModel(Protocol):
@@ -15,11 +16,17 @@ class LanguageModel(Protocol):
 class IntentRouter:
     """Convierte texto del usuario en una respuesta de chat o una propuesta de herramienta."""
 
-    def __init__(self, llm: LanguageModel, tools: Sequence[object]):
+    def __init__(
+        self,
+        llm: LanguageModel,
+        tools: Sequence[object],
+        memory: ConversationMemory | None = None,
+    ):
         # El enrutador solo decide; el componente que lo llama conserva el control de ejecución.
         self.llm = llm
         self.tools = self._normalize_tools(tools)
         self._tools_by_name = {tool["name"]: tool for tool in self.tools}
+        self.memory = memory
 
     @staticmethod
     def _normalize_tools(tools: Sequence[object]) -> list[dict[str, Any]]:
@@ -77,20 +84,31 @@ class IntentRouter:
     def _build_system_prompt(self) -> str:
         """Incluye el catálogo como datos y define un contrato de salida cerrado."""
         manifest = json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))
+        
+        # Inyectamos el historial conversacional reciente si la memoria está presente
+        history_context = ""
+        if self.memory is not None:
+            history_text = self.memory.get_context_prompt()
+            # Si hay mensajes previos en la memoria, los agregamos como contexto para el modelo
+            if history_text and "sin mensajes" not in history_text:
+                history_context = f"\n\n{history_text}\nUsa este historial previo para resolver referencias contextuales y responder con los datos y preferencias del usuario."
+
         return (
-            "Eres el enrutador de intenciones de J.A.R.V.I.S. Devuelve ÚNICAMENTE un objeto JSON válido sin texto adicional ni markdown.\n"
+            "Eres J.A.R.V.I.S., un asistente virtual. Recuerda los datos personales y preferencias que el usuario te comparta en la conversación (como su nombre, su color favorito, etc.). Si el usuario te pregunta por sus gustos o datos previos, responde usando la información guardada en el historial reciente.\n\n"
+            "Devuelve ÚNICAMENTE un objeto JSON válido sin texto adicional ni markdown.\n"
             "INSTRUCCIONES CLAVE:\n"
             "- Si el usuario pide la hora o fecha actual, usa SIEMPRE 'system_time'.\n"
             "- Si el usuario pide abrir o iniciar una app (calculadora, bloc de notas, etc.), usa SIEMPRE 'app_launcher' con 'app_name'.\n"
             "- Si el usuario pregunta por hardware, CPU o memoria RAM, usa SIEMPRE 'system_info'.\n"
             "- Si el usuario pide buscar en internet o YouTube, usa SIEMPRE 'web_search' con 'query'.\n"
-            "- Si es charla general o saludo, responde en formato chat.\n\n"
+            "- Si es charla general, saludo o preguntas sobre el usuario o la conversación, responde en formato chat usando la información guardada en el historial reciente.\n\n"
             "EJEMPLOS DE FORMATO OBLIGATORIO:\n"
             'Herramienta con argumento: {"action":"call_tool","tool_name":"web_search","parameters":{"query":"música clásica"}}\n'
             'Herramienta de apertura: {"action":"call_tool","tool_name":"app_launcher","parameters":{"app_name":"calculadora"}}\n'
             'Herramienta sin argumento: {"action":"call_tool","tool_name":"system_time","parameters":{}}\n'
             'Chat general: {"action":"chat","response":"Hola señor, ¿en qué puedo ayudarle?"}\n\n'
             f"Catálogo de herramientas disponibles: {manifest}"
+            f"{history_context}"
         )
 
     @staticmethod

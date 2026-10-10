@@ -7,6 +7,7 @@ from src.audio.stt import SpeechToText
 from src.brain.ollama_client import OllamaBrain
 from src.brain.gemini_client import GeminiBrain
 from src.brain.intent_router import IntentRouter
+from src.brain.memory import ConversationMemory
 from config.tools_schema import TOOLS_SCHEMA
 from src.audio.tts import TextToSpeech
 from src.tools.skill_manager import SkillManager
@@ -47,7 +48,7 @@ def main():
     Script principal de J.A.R.V.I.S. con bucle continuo, normalización léxica avanzada,
     motor de habilidades (SkillManager) y respaldo de cerebros (Ollama + Gemini).
     """
-    print("=== Inicializando Sistema J.A.R.V.I.S. (Fase 5 - Function Calling con IntentRouter) ===")
+    print("=== Inicializando Sistema J.A.R.V.I.S. (Fase 6 - Memoria Conversacional Integrada) ===")
     
     # ---------------------------------------------------------------------------
     # PASO 1: Inicialización única de componentes (evita recargar modelos en VRAM)
@@ -59,12 +60,15 @@ def main():
     tts = TextToSpeech(voice="es-AR-TomasNeural")  # Sintetizador de voz neuronal
     skill_manager = SkillManager()               # Gestor de habilidades y herramientas locales
     
-    # Instanciamos el IntentRouter con el LLM principal y el manifiesto de herramientas de SkillManager
-    intent_router = IntentRouter(llm=brain, tools=skill_manager.get_skills_manifest())
+    # Inicializamos la memoria conversacional a corto plazo (máximo 5 turnos completos)
+    memory = ConversationMemory(max_turns=5)
+    
+    # Instanciamos el IntentRouter con el LLM principal, el manifiesto de herramientas y la memoria
+    intent_router = IntentRouter(llm=brain, tools=skill_manager.get_skills_manifest(), memory=memory)
     pending_speech: Future[None] | None = None   # Futuro para controlar la asincronía del TTS
 
     print("\n[+] Sistema J.A.R.V.I.S. activo y escuchando.")
-    print("[i] Pruebe decir: '¿Qué hora es?', 'Estado del sistema', 'Busca en YouTube música...', o 'Abrí la calculadora'.\n")
+    print("[i] Pruebe decir: '¿Qué hora es?', 'Me llamo Juan', '¿Cómo me llamo?', o 'Olvida lo que hablamos'.\n")
 
     # Lista de palabras clave para detectar comandos de salida del usuario
     exit_keywords = ["salir", "adios", "chau", "bye", "apagate", "cerrar", "terminar", "hasta luego"]
@@ -111,9 +115,22 @@ def main():
                     pending_speech = tts.speak(farewell_msg)
                     break
 
+                # e) Detección de comando para olvidar/reiniciar la memoria conversacional
+                clear_memory_triggers = ["olvida lo que hablamos", "reiniciar contexto", "olvidar contexto", "olvida todo", "borrar memoria"]
+                if any(trigger in norm_text for trigger in clear_memory_triggers):
+                    memory.clear()
+                    print(f"[DEBUG Memoria] Turnos almacenados: {len(memory.get_messages_list())}")
+                    reset_msg = "Entendido señor. He reiniciado la memoria de nuestra conversación."
+                    print(f"JARVIS: \"{reset_msg}\"")
+                    pending_speech = tts.speak(reset_msg)
+                    continue
+
+                # Registramos el mensaje del usuario en la memoria a corto plazo antes de procesar
+                memory.add_message(role="user", content=user_transcript)
+
                 # -----------------------------------------------------------------
                 # PASO 2: Clasificación de Intenciones y Function Calling (IntentRouter)
-                # Reemplaza la detección manual por análisis autónomo de LLM en formato JSON.
+                # Reemplaza la detección manual por análisis autónomo de LLM en formato JSON con contexto.
                 # -----------------------------------------------------------------
                 print("[Analizando intención con IntentRouter...]")
                 intent_decision = intent_router.analyze_intent(user_transcript)
@@ -136,21 +153,33 @@ def main():
                     # Si el router devolvió el texto crudo del usuario como fallback seguro de parsing,
                     # consultamos directamente a Ollama con respaldo en Gemini para asegurar respuesta fluida
                     if not chat_text or chat_text == user_transcript:
-                        print("[IntentRouter derivó a chat directo. Consultando cerebro LLM...]")
+                        print("[IntentRouter derivó a chat directo. Consultando cerebro LLM con contexto...]")
                         try:
-                            chat_text = brain.generate_response(user_transcript)
+                            # Inyectamos el historial conversacional y la instrucción calibrada de memoria
+                            context_prompt = memory.get_context_prompt()
+                            system_instruction = (
+                                "Eres J.A.R.V.I.S., un asistente virtual. Recuerda los datos personales y preferencias que el usuario te comparta en la conversación (como su nombre, su color favorito, etc.). Si el usuario te pregunta por sus gustos o datos previos, responde usando la información guardada en el historial reciente.\n\n"
+                                f"{context_prompt}"
+                            ) if "sin mensajes" not in context_prompt else None
+                            chat_text = brain.generate_response(user_transcript, system_prompt=system_instruction)
                             if not chat_text or "no responde" in chat_text.lower() or "error" in chat_text.lower():
                                 raise Exception("Ollama local no disponible o respuesta inválida.")
                         except Exception as ollama_error:
                             print(f"[!] Fallo en Ollama local ({ollama_error}). Derivando a GeminiBrain (Cloud Fallback)...")
                             try:
                                 print("[Consultando al cerebro en la nube (Gemini)...]")
-                                chat_text = gemini_brain.generate_response(user_transcript)
+                                chat_text = gemini_brain.generate_response(user_transcript, system_prompt=system_instruction)
                             except Exception as gemini_error:
                                 print(f"[X] Fallo también en GeminiBrain: {gemini_error}")
                                 chat_text = "Lo siento señor, ninguno de mis cerebros responde en este momento."
 
                     jarvis_response = chat_text
+
+                # Registramos la respuesta final del asistente en la memoria a corto plazo
+                if jarvis_response:
+                    memory.add_message(role="assistant", content=jarvis_response)
+                    # Mensaje de depuración en consola para monitorear el estado y cantidad de turnos en la memoria
+                    print(f"[DEBUG Memoria] Turnos almacenados: {len(memory.get_messages_list())}")
 
                 print(f"JARVIS: \"{jarvis_response}\"")
                 
