@@ -8,7 +8,7 @@ from config.settings import (
 )
 
 class SpeechToText:
-    """Transcribe audio and discard segments with strong signs of hallucination."""
+    """Transcribe audio solo en español y descarta segmentos con señales de alucinación."""
     def __init__(
         self,
         model_size: str = WHISPER_MODEL_SIZE,
@@ -40,18 +40,19 @@ class SpeechToText:
 
     def transcribe(self, audio_file_path: str) -> str:
         """
-        Transcribe the audio file in Spanish using soundfile to load numpy array
-        and returns the cleaned text.
+        Carga el WAV y fuerza a Whisper a transcribir (no traducir) en español.
         """
         if not os.path.exists(audio_file_path):
             raise FileNotFoundError(f"El archivo de audio no existe: {audio_file_path}")
 
         audio_data, _sample_rate = sf.read(audio_file_path, dtype="float32")
-        # beam_size=5 equilibra calidad y latencia; las métricas ayudan a descartar ruido.
+        # Fijamos idioma y tarea para evitar detección automática o traducción al inglés.
+        # beam_size=5 mejora la elección de palabras sin disparar demasiado la latencia.
         segments, _ = self.model.transcribe(
             audio_data,
             beam_size=5,
             language="es",
+            task="transcribe",
             vad_filter=True,
             condition_on_previous_text=False,
         )

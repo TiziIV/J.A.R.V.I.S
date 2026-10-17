@@ -37,3 +37,7 @@ Thumbs.db
 # Historial de prompts del usuario
 prompts_history.txt
 *.log.txt
+*.log
+dist/
+build/
+*.spec

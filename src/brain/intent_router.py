@@ -21,9 +21,11 @@ class IntentRouter:
         llm: LanguageModel,
         tools: Sequence[object],
         memory: ConversationMemory | None = None,
+        fallback_llm: LanguageModel | None = None,
     ):
         # El enrutador solo decide; el componente que lo llama conserva el control de ejecución.
         self.llm = llm
+        self.fallback_llm = fallback_llm
         self.tools = self._normalize_tools(tools)
         self._tools_by_name = {tool["name"]: tool for tool in self.tools}
         self.memory = memory
@@ -71,14 +73,30 @@ class IntentRouter:
             return fallback
 
         system_prompt = self._build_system_prompt()
+        raw_response: str | None = None
         try:
             # Separamos las instrucciones del texto para reducir la posibilidad de mezclar roles.
             raw_response = self.llm.generate_response(user_text, system_prompt=system_prompt)
+            if not raw_response or "no responde" in raw_response.lower() or "error" in raw_response.lower():
+                raise RuntimeError("LLM primario no disponible o devolvió respuesta no válida.")
+        except Exception as primary_error:
+            if self.fallback_llm is not None:
+                print(f"[IntentRouter] Primario falló ({primary_error}). Derivando a fallback...")
+                try:
+                    raw_response = self.fallback_llm.generate_response(user_text, system_prompt=system_prompt)
+                except Exception as fallback_error:
+                    print(f"[IntentRouter] Fallback también falló ({fallback_error}). Retornando chat por defecto.")
+                    return fallback
+            else:
+                print(f"[IntentRouter] Primario falló ({primary_error}) y no hay fallback configurado.")
+                return fallback
+
+        try:
             payload = self._parse_json_response(raw_response)
             return self._validate_payload(payload, fallback)
         except Exception as e:
-            # Ante errores del modelo, JSON inválido o estructura inesperada, mostramos diagnóstico y devolvemos fallback seguro
-            print(f"[IntentRouter] Info/Fallback: {e} | Crudo: '{raw_response if 'raw_response' in locals() else None}'")
+            # Ante errores de parseo de JSON, devolvemos fallback seguro
+            print(f"[IntentRouter] Info/Fallback: {e} | Crudo: '{raw_response}'")
             return fallback
 
     def _build_system_prompt(self) -> str:
@@ -95,6 +113,7 @@ class IntentRouter:
 
         return (
             "Eres J.A.R.V.I.S., un asistente virtual. Recuerda los datos personales y preferencias que el usuario te comparta en la conversación (como su nombre, su color favorito, etc.). Si el usuario te pregunta por sus gustos o datos previos, responde usando la información guardada en el historial reciente.\n\n"
+            "REGLA DE VOZ OBLIGATORIA: Tus respuestas serán leídas en voz alta. Responde SIEMPRE en 1 o 2 oraciones breves como máximo (menos de 200 caracteres). PROHIBIDO usar listas numeradas, viñetas, asteriscos (**), comillas invertidas (`) o bloques de código.\n\n"
             "Devuelve ÚNICAMENTE un objeto JSON válido sin texto adicional ni markdown.\n"
             "INSTRUCCIONES CLAVE:\n"
             "- Si el usuario pide la hora o fecha actual, usa SIEMPRE 'system_time'.\n"
@@ -239,3 +258,31 @@ class IntentRouter:
                 return {key for key in required if isinstance(key, str)}
             return set()
         return declared_keys
+
+
+def generate_with_fallback(
+    prompt: str,
+    primary_llm: LanguageModel,
+    fallback_llm: LanguageModel,
+    system_prompt: str | None = None,
+) -> str:
+    """
+    Intenta generar respuesta con el LLM primario (Ollama). Si este falla o no responde,
+    deriva instantáneamente al LLM secundario (Gemini) sin arrojar excepciones fatales
+    en el hilo principal.
+    """
+    try:
+        response = primary_llm.generate_response(prompt, system_prompt=system_prompt)
+        if not response or "no responde" in response.lower() or "error" in response.lower():
+            raise RuntimeError("LLM primario no disponible o devolvió mensaje de error.")
+        return response
+    except Exception as primary_error:
+        print(f"[LLM Routing] Fallo en primario ({primary_error}). Derivando a fallback...")
+        try:
+            fallback_response = fallback_llm.generate_response(prompt, system_prompt=system_prompt)
+            if not fallback_response or not fallback_response.strip():
+                return "Lo siento señor, el sistema de respaldo no devolvió contenido."
+            return fallback_response
+        except Exception as fallback_error:
+            print(f"[LLM Routing] Fallo también en fallback ({fallback_error}).")
+            return "Lo siento señor, ninguno de mis cerebros responde en este momento."

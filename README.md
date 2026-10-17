@@ -12,11 +12,11 @@ Asistente virtual modular de voz para Windows, diseñado con una arquitectura **
 
 2. **Cerebro Híbrido (LLM Providers):**
    - **Cerebro Local (Primario):** Ollama ejecutando modelos optimizados (ej. `Qwen 2.5 Coder 3B` o Llama) configurado mediante variables de entorno.
-   - **Cerebro en la Nube (Respaldo):** Google Gemini (`gemini-1.5-flash` / `gemini-3.8-flash`) para garantizar disponibilidad ante fallos locales.
+   - **Cerebro en la Nube (Respaldo):** Google Gemini (`gemini-3.8-flash`, con `gemini-3.5-flash-lite` como alternativa ante un modelo no disponible) para garantizar disponibilidad ante fallos locales.
 
 3. **Salida de Voz (TTS - Text-to-Speech):**
-   - Síntesis neuronal de alta calidad y naturalidad en español usando `edge-tts`.
-   - Ejecución asíncrona en un hilo dedicado con gestión robusta de archivos temporales y resiliencia ante bloqueos de archivos en Windows.
+   - Síntesis local offline en Windows mediante `System.Speech`/PowerShell, con selección de voz española cuando está instalada.
+   - Ejecución en un hilo dedicado con límite de tiempo y errores controlados para mantener fluido el ciclo conversacional.
 
 4. **Motor de Habilidades (Skills Engine):**
    - Arquitectura modular basada en contratos abstractos (`BaseSkill`).
@@ -52,8 +52,9 @@ jarvis-core/
 ├── src/
 │   ├── audio/
 │   │   ├── recorder.py    # Captura de micrófono con VAD (RMS)
+│   │   ├── wake_word.py   # Detección local de palabra de activación
 │   │   ├── stt.py         # Transcripción local con faster-whisper (CUDA)
-│   │   └── tts.py         # Síntesis y reproducción con edge-tts
+│   │   └── tts.py         # Síntesis offline con System.Speech de Windows
 │   ├── brain/
 │   │   ├── ollama_client.py # Adaptador para Ollama local
 │   │   ├── gemini_client.py # Adaptador para Gemini cloud

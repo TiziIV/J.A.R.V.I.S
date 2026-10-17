@@ -3,11 +3,15 @@ torch
 torchaudio
 faster-whisper
 sounddevice
+openwakeword
 numpy
 scipy
-edge-tts
-playsound==1.2.2
 ollama
 google-genai
 python-dotenv
 pydantic
+pystray
+Pillow
+pyinstaller
+edge-tts
+pygame
