@@ -211,3 +211,101 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
   - Todas las interfaces y lógica funcional se mantuvieron intactas al 100%.
 
 
+## Cambios de esta iteración (2026-10-27 — Arquitectura Multi-Brain, Consola Primero y Voz Opcional)
+
+### 1. Arquitectura Multi-Brain y Separación de Responsabilidades
+- **`config/settings.py`:** Centraliza la configuración de motores locales y cloud (`OLLAMA_MODEL_CENSORED`, `OLLAMA_MODEL_UNCENSORED`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_FALLBACK_MODEL`, `DEFAULT_BRAIN_MODE`, `DEFAULT_INPUT_MODE`, `VOICE_MAX_TOKENS`, `TEXT_MAX_TOKENS`, `CLOUD_TIMEOUT`) con validación segura (`_env_choice`, `_env_int`, `_env_float`, `_env_bool`) y registro de advertencias en `CONFIG_WARNINGS`.
+- **`config/prompts.py`:** Conserva intacto `JARVIS_SYSTEM_PROMPT` (modo voz, conciso y libre de Markdown) y añade `JARVIS_TEXT_SYSTEM_PROMPT` y `get_system_prompt(voice_mode)` para explicaciones detalladas y código formateado en consola.
+- **`src/brain/exceptions.py`:** Clasificación estructurada de errores (`BrainError`, `BrainErrorKind`: `UNCONFIGURED`, `AUTH`, `QUOTA`, `MODEL_NOT_FOUND`, `DAEMON_OFFLINE`, `TIMEOUT`, `NETWORK`, `SERVER`, `INVALID_REQUEST`, `PARTIAL_STREAM`, `EMPTY_RESPONSE`) y sanitización de claves API (`redact_secrets`).
+- **`src/brain/ollama_client.py` (`OllamaBrain`):** Soporta `model_override`, `context_prompt`, `num_predict`, `last_used_model`, `generate_stream` / `generate_response_stream` y fallback único de `OLLAMA_UNCENSORED` a `OLLAMA_MODEL_CENSORED` ante modelo inexistente (HTTP 404), mostrando el comando manual `ollama pull <modelo>` sin descargar automáticamente ni reintentar streams parciales.
+- **`src/brain/gemini_client.py` (`GeminiBrain`):** Soporta `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, `last_used_model`, límite de tokens adaptable entre voz y texto, y reintento único por modelo solo ante HTTP 404.
+- **`src/brain/claude_client.py` (`ClaudeBrain`):** Cliente HTTP ligero mediante `urllib.request` contra `https://api.anthropic.com/v1/messages` (`anthropic-version: 2023-06-01`), con timeout configurable de 15 s y clasificación de errores HTTP.
+- **`src/brain/openai_client.py` (`OpenAIBrain`):** Cliente HTTP ligero mediante `urllib.request` contra `https://api.openai.com/v1/chat/completions` (compatible también con `/v1/responses`), con verificación contextual de HTTP 404 (`model_not_found` / `param == "model"`) antes de intentar `OPENAI_FALLBACK_MODEL` (`gpt-4o`) una sola vez.
+- **`src/brain/deliberation.py` (`AutoDeliberator`):** Deliberación automática determinista para el modo `AUTO` según intención, complejidad estructural y controles de seguridad. Prioriza `OLLAMA` estándar para saludos, consultas breves y preguntas educativas de ciberseguridad («¿Qué es el hacking ético?»), reserva `OLLAMA_UNCENSORED` únicamente para solicitudes explícitas de estilo menos restrictivo en contexto seguro, y selecciona el proveedor cloud configurado para arquitectura de software, depuración multi-módulo o análisis profundo.
+- **`src/brain/brain_manager.py` (`BrainManager`):** Gestiona `global_mode`, selección puntual One-Shot (sin alterar `global_mode`), `set_mode_by_choice` con alias tolerantes a tildes/mayúsculas/puntuación, selector interactivo con la pregunta exacta `¿Qué motor de inteligencia desea utilizar, señor?`, prioridad de habilidades locales y cadena acotada de fallbacks sin ciclos.
+- **`src/brain/intent_router.py` (`IntentRouter.detect_local_skill`):** Detección determinista prioritaria para las 9 habilidades locales de Windows (`TimeSkill`, `AppLauncherSkill`, `SystemInfoSkill`, `WebSearchSkill`, `StarkProtocolSkill`, `VolumeControlSkill`, `MediaControlSkill`, `ClipboardSkill`, `SystemPowerSkill`) antes de consultar cualquier LLM, permitiendo operación 100 % offline.
+- **`main.py`:** Arranque predeterminado en consola de texto (`python main.py`) sin cargar `faster-whisper`, `SpeechToText`, `AudioRecorder`, `WakeWordDetector` ni inicializar recursos CUDA de STT. Soporta `--tts` (consola + TTS) y `--voice` (manos libres completo, con prioridad sobre `--tts`), carga diferida de voz con `/voz`, prompt dinámico `Tu [Modo: AUTO] > ` y diagnósticos únicos `[Cerebro: ...]` / `[Skill Local: ...]`.
+
+### 2. Modos Disponibles y Selección
+- Modos admitidos: `AUTO`, `OLLAMA`, `OLLAMA_UNCENSORED`, `GEMINI`, `CLAUDE`, `GPT`, `CODEX`.
+- Selección global en consola: `/modo` (abre el selector interactivo con la pregunta exacta `¿Qué motor de inteligencia desea utilizar, señor?`) o `/modo <nombre_o_alias>` (ej. `/modo ollama`, `/modo sin censura`, `/modo gemini`, `/modo claude`, `/modo gpt`, `/modo codex`, `/modo auto`).
+- Selección puntual One-Shot (solo afecta a esa consulta y conserva `global_mode`): `Con GPT: <consulta>`, `Usando Claude <consulta>`, `Responde con Gemini <consulta>`, `Usá Codex para revisar este archivo`, `Usá Codex para implementar esta función`.
+
+### 3. Variables de Entorno y Configuración de Proveedores (`.env`)
+- `DEFAULT_BRAIN_MODE=AUTO` (`AUTO`, `OLLAMA`, `OLLAMA_UNCENSORED`, `GEMINI`, `CLAUDE`, `GPT`, `CODEX`)
+- `DEFAULT_INPUT_MODE=TEXT` (`TEXT`, `TTS`, `VOICE`)
+- `OLLAMA_BASE_URL=http://localhost:11434`
+- `OLLAMA_MODEL=qwen2.5-coder:3b`
+- `OLLAMA_MODEL_UNCENSORED=huihui_ai/qwen2.5-abliterated:3b` (para instalar manualmente un modelo faltante: `ollama pull huihui_ai/qwen2.5-abliterated:3b`)
+- `GEMINI_API_KEY=<clave>` | `GEMINI_MODEL=gemini-2.0-flash` | `GEMINI_FALLBACK_MODEL=gemini-2.0-flash`
+- `ANTHROPIC_API_KEY=<clave_opcional>` | `CLAUDE_MODEL=claude-sonnet-4-6`
+- `OPENAI_API_KEY=<clave_opcional>` | `OPENAI_MODEL=gpt-5.4` | `OPENAI_FALLBACK_MODEL=gpt-4o`
+- `CODEX_ENABLED=1` | `CODEX_TIMEOUT=120.0` | `CODEX_WORKSPACE_DIR=<ruta_dentro_del_proyecto>` | `CODEX_ALLOW_AUTO=1` | `CODEX_SANDBOX=workspace-write` (`read-only` o `workspace-write`) | `CODEX_MODEL=` (opcional)
+
+### 4. Modos de Inicio y Comandos de Prueba
+- Consola texto (sin micrófono ni Whisper): `.\venv\Scripts\python.exe main.py`
+- Consola texto con voz TTS: `.\venv\Scripts\python.exe main.py --tts`
+- Manos libres completo: `.\venv\Scripts\python.exe main.py --voice`
+- Suite específica Multi-Brain: `.\venv\Scripts\python.exe -m unittest tests.test_brain_deliberation -v` → **29 pruebas ejecutadas, 0 fallos, 0 errores (OK)** en 1.2s.
+- Suite específica Codex CLI y Git Guard: `.\venv\Scripts\python.exe -m unittest tests.test_codex_integration -v` → **18 pruebas ejecutadas, 0 fallos, 0 errores (OK)** en 0.03s.
+- Suite completa: `.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **339 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)** en 8.151s.
+- Tiempo de inicio medido en modo texto (`main.py` con carga diferida): **0.1124 s** (< 0.3 s), con 0 módulos de captura/reconocimiento de voz (`faster_whisper`, `openwakeword`, `sounddevice`, `src.audio.stt`, `src.audio.recorder`, `src.audio.wake_word`) cargados en memoria.
+- Limitaciones y verificaciones en vivo:
+  - Se configuró `GEMINI_API_KEY` en `.env` (excluido de Git y sin exponer secretos) y se verificó conexión real contra Google Gemini API (`GeminiBrain.generate_response`). Para cuentas nuevas donde `gemini-2.0-flash` y `gemini-1.5-flash` devuelven `404 NOT_FOUND`, `GeminiBrain` hace fallback automático a `gemini-3-flash-preview` (y `gemini-3.1-flash-lite-preview` como respaldo adicional), fijando el modelo activo en `self.model_name` y `self.last_used_model` para no reintentar en los turnos siguientes.
+  - Se instaló `@openai/codex` (`codex-cli 0.164.0`) y se verificó en vivo `CodexBrain.is_installed() == True`, `CodexBrain.check_auth_status()` (`authenticated=True, method='chatgpt'`) y `CodexBrain.run_readonly_task(...)` con `codex exec --json --sandbox read-only` (incluyendo cierre de `stdin=subprocess.DEVNULL` y normalización de saltos de línea para el wrapper `codex.cmd` de Windows).
+  - En esta sesión el daemon local de Ollama no estaba encendido (`URLError`) y no hay claves `ANTHROPIC_API_KEY` ni `OPENAI_API_KEY` en `.env`, por lo que las llamadas a Ollama, Claude y GPT se validaron mediante respuestas y errores HTTP simulados offline (`unittest.mock`).
+
+---
+
+## Integración Oficial de OpenAI Codex CLI (`src/brain/codex_client.py` y `src/utils/git_guard.py`)
+
+### 1. ¿Qué es Codex CLI y qué función cumple en J.A.R.V.I.S.?
+- **OpenAI Codex CLI** (`codex`) es el agente oficial de programación en línea de comandos de OpenAI.
+- En J.A.R.V.I.S. actúa como el motor especializado `CODEX` dentro de `BrainManager`, independiente del cliente HTTP `OpenAIBrain` (`GPT`).
+- Se invoca de forma no interactiva mediante `codex exec --json --sandbox <modo>` usando `subprocess.run(..., shell=False)`.
+
+### 2. Requisitos Previos, Instalación Oficial y Autenticación en Windows
+- **Requisito previo:** contar con Node.js / npm instalado en Windows (actualmente Node/npm está presente en `C:\Program Files\nodejs\npm.cmd`) y una cuenta de ChatGPT compatible (Plus, Pro, Team, Enterprise/Edu) o configuración oficial de Codex CLI.
+- **Instalación oficial manual en Windows (PowerShell / CMD):**
+  ```powershell
+  npm install -g @openai/codex
+  ```
+  *(Documentación oficial: https://developers.openai.com/codex/cli/ y https://developers.openai.com/codex/cli/reference/)*
+- **Autenticación mediante cuenta de ChatGPT (en versiones de la CLI que lo admitan):**
+  ```powershell
+  codex login
+  ```
+- **Comprobación del estado de autenticación (en versiones que lo admitan):**
+  ```powershell
+  codex login status
+  ```
+- **Diferencias entre acceso mediante ChatGPT y API:**
+  - El motor `CODEX` (`src/brain/codex_client.py`) utiliza la sesión local de **OpenAI Codex CLI** iniciada por el usuario con `codex login` (cuenta de ChatGPT), por lo que **no exige `OPENAI_API_KEY` en `.env`**.
+  - El motor `GPT` (`src/brain/openai_client.py`) consume directamente el endpoint HTTPS `https://api.openai.com/v1/chat/completions` y sí requiere `OPENAI_API_KEY` con facturación de plataforma API.
+  - J.A.R.V.I.S. nunca solicita contraseñas, no automatiza inicios de sesión interactivos ni lee archivos privados de credenciales.
+
+### 3. Dos Tipos de Tarea y Permisos del Sandbox
+1. **Tipo A — Consulta, explicación, revisión y análisis (`run_readonly_task`):**
+   - Se activa ante pedidos de revisión, explicación, diagnóstico o búsqueda de errores (ej. *«Usá Codex para revisar este archivo»*).
+   - Ejecuta `codex exec --json --sandbox read-only`.
+   - No permite modificar archivos del proyecto, crear commits ni hacer push.
+2. **Tipo B — Programación y modificación autorizada del proyecto (`run_coding_task`):**
+   - Se activa únicamente cuando la solicitud autoriza de forma explícita crear, implementar, corregir o refactorizar código en el proyecto (ej. *«Usá Codex para implementar esta función»*, *«Usá Codex para crear una prueba»*).
+   - Valida que el directorio de trabajo (`CODEX_WORKSPACE_DIR`) esté dentro de la raíz del proyecto (`BASE_DIR`).
+   - Ejecuta `codex exec --json --sandbox workspace-write`.
+   - **Prohibiciones estrictas:** jamás utiliza `--yolo`, `--dangerously-bypass-approvals-and-sandbox` ni `danger-full-access`.
+   -Si una solicitud mezcla revisión con una posible edición ambigua, `CodexBrain` no modifica archivos y solicita confirmación explícita al usuario.
+   - **Separación de controles:** autorizar la edición de archivos (Tipo B) **nunca** ejecuta `git commit` ni `git push` automáticamente; tras la ejecución se inspecciona el estado de Git y se preservan los cambios preexistentes mediante `GitSafetyGuard` (`src/utils/git_guard.py`).
+
+### 4. Comportamiento en Selección Manual, One-Shot y Modo `AUTO`
+- **Selección manual:** con `/modo codex` o eligiendo `Codex` ante la pregunta `¿Qué motor de inteligencia desea utilizar, señor?`.
+- **One-Shot puntual:** frases como `Usá Codex para revisar este archivo` o `Con Codex: corrige este error` ejecutan esa única consulta en `CODEX` sin cambiar `global_mode`.
+- **Modo `AUTO`:** solo delega tareas claras de programación/depuración de repositorio a `CODEX` cuando `CODEX_ENABLED=1`, `CODEX_ALLOW_AUTO=1`, el binario está instalado y `codex login status` confirma sesión activa; si falta cualquiera de esos requisitos o si ocurre un fallo recuperable, cae automáticamente a `GEMINI` -> `OLLAMA`.
+
+### 5. Limitaciones de Uso y Errores Frecuentes
+- **Codex CLI no instalado:** J.A.R.V.I.S. informa cómo instalarlo desde https://developers.openai.com/codex/cli/ sin instalar paquetes automáticamente.
+- **Sesión no iniciada (`Not logged in`):** J.A.R.V.I.S. solicita ejecutar manualmente `codex login` en la terminal del usuario.
+- **Timeout (`CODEX_TIMEOUT`):** si una tarea supera el plazo configurado (120 s por defecto), el proceso se cancela de forma controlada sin bloquear ni cerrar J.A.R.V.I.S.
+- **Directorio fuera del proyecto:** `validate_workspace()` bloquea cualquier ruta externa a `BASE_DIR`.
+
+

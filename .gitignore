@@ -6,8 +6,12 @@ ENV/
 
 # Variables de entorno y secretos
 .env
+.env.*
 .env.local
 *.env
+!.env.example
+!.env.template
+!.env.sample
 
 # Archivos de caché de Python
 __pycache__/
