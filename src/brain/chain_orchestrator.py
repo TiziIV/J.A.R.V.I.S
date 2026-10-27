@@ -16,6 +16,7 @@ import json
 import re
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -24,10 +25,13 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from config import settings
 from skills.file_editor_skill import (
+    _INI_SECTION_RE,
+    _XML_XXE_RE,
     BackupRecord,
-    FileEditorError,
     FileEditorSkill,
-    PathAuthorizationError,
+    RollbackManager,
+    _decode_bytes_strict,
+    _split_line_ending,
     compute_sha256_file,
 )
 
@@ -425,7 +429,7 @@ class PolicyEngine:
     ) -> Path:
         """
         Valida una operación individual y devuelve la ruta canónica autorizada del archivo objetivo.
-        Lanza `PolicyValidationError` o `PathAuthorizationError` ante cualquier violación.
+        Lanza `PolicyValidationError` o `PermissionError` ante cualquier violación.
         """
         if not isinstance(op, ChangeOperation):
             raise PolicyValidationError("La operación proporcionada no es una instancia de ChangeOperation.")
@@ -498,9 +502,9 @@ class PolicyEngine:
 
         # Coherencia entre formato y tipo de operación
         if op.operation_type == "update_key":
-            if fmt not in ("ini", "cfg", "conf"):
+            if fmt not in ("ini", "cfg", "conf", "txt"):
                 raise PolicyValidationError(
-                    f"La operación '{op.id}' usa 'update_key' pero el formato es '{fmt}' (se requiere ini/cfg/conf)."
+                    f"La operación '{op.id}' usa 'update_key' pero el formato es '{fmt}' (se requiere ini/cfg/conf/txt)."
                 )
             if not op.key or not op.key.strip():
                 raise PolicyValidationError(
@@ -542,7 +546,7 @@ class PolicyEngine:
 
         # Verificar que el hash esperado del archivo coincida con el archivo en disco si está definido
         actual_hash = compute_sha256_file(canonical_path)
-        if op.expected_file_hash and op.expected_file_hash != actual_hash:
+        if op.expected_file_hash and op.expected_file_hash.lower() != actual_hash.lower():
             raise PolicyValidationError(
                 f"Conflicto de hash en '{canonical_path.name}' para la operación '{op.id}': "
                 f"se esperaba '{op.expected_file_hash[:12]}...' pero el archivo actual tiene '{actual_hash[:12]}...'."
@@ -655,6 +659,7 @@ class ChainOrchestrator:
     ) -> None:
         self.file_editor: FileEditorSkill = file_editor or FileEditorSkill()
         self.policy_engine: PolicyEngine = PolicyEngine(self.file_editor)
+        self.rollback_manager: RollbackManager = RollbackManager(self.file_editor)
         self.brain_manager = brain_manager
         self.skill_manager = skill_manager
         self.provider_timeout_sec = float(provider_timeout_sec)
@@ -714,12 +719,14 @@ class ChainOrchestrator:
         if reason and new_state in (ChainState.REJECTED, ChainState.FAILED, ChainState.CANCELLED):
             record.error_message = reason
 
-        self.file_editor.audit_logger.log_event(
-            execution_id=execution_id,
-            operation="state_transition",
-            file_path="<orchestrator>",
-            status=new_state.value,
-            message=f"{current.value} -> {new_state.value}" + (f" ({reason})" if reason else ""),
+        self.file_editor.audit_logger.record(
+            "state_transition",
+            execution_id,
+            {
+                "from_state": current.value,
+                "to_state": new_state.value,
+                "reason": reason,
+            },
         )
         return new_state
 
@@ -742,7 +749,7 @@ class ChainOrchestrator:
 
         hw: dict[str, Any] = {
             "platform": "Windows",
-            "cpu_Validation": "detected",
+            "cpu_detection": "detected",
         }
         try:
             import psutil
@@ -754,7 +761,6 @@ class ChainOrchestrator:
         except Exception:
             hw["ram_total_gb"] = 16.0
 
-        # Si el SkillManager tiene SystemInfoSkill registrada, podemos consultar su resumen
         if self.skill_manager is not None and hasattr(self.skill_manager, "skills"):
             sys_skill = self.skill_manager.skills.get("system_info")
             if sys_skill is not None:
@@ -763,7 +769,6 @@ class ChainOrchestrator:
                 except Exception:
                     pass
 
-        # Extraer mención explícita de GPU/VRAM si figura en el pedido del usuario
         goal_lower = (user_goal or "").lower()
         vram_match = re.search(r"(\d+)\s*gb", goal_lower)
         if "1660" in goal_lower:
@@ -783,19 +788,11 @@ class ChainOrchestrator:
         file_hash = compute_sha256_file(canonical)
         ext = canonical.suffix.lower().lstrip(".")
         raw_bytes = canonical.read_bytes()
-        text, encoding, _ = self.file_editor._decode_preserving_bom(raw_bytes)
+        text, encoding, _ = _decode_bytes_strict(raw_bytes)
 
         parsed_keys: dict[tuple[Optional[str], str], str] = {}
-        if ext in ("ini", "cfg", "conf"):
-            parsed_ini = self.file_editor._parse_ini_preserve_structure(text)
-            for entry in parsed_ini["entries"]:
-                sec = entry["section"]
-                k = entry["key"]
-                if (sec, k) not in parsed_keys:
-                    parsed_keys[(sec, k)] = entry["value"]
-                else:
-                    # Marcar clave duplicada dentro de la misma sección
-                    parsed_keys[(sec, k)] = "__AMBIGUOUS_DUPLICATE__"
+        if ext in ("ini", "cfg", "conf", "txt"):
+            self._extract_ini_keys(text, parsed_keys)
         elif ext == "json":
             data = json.loads(text)
             if isinstance(data, dict):
@@ -810,6 +807,40 @@ class ChainOrchestrator:
             "raw_text": text,
         }
 
+    @staticmethod
+    def _extract_ini_keys(
+        text: str,
+        out: dict[tuple[Optional[str], str], str],
+    ) -> None:
+        """Extrae pares `(section, key) -> value` preservando detección de duplicados."""
+        current_sec: Optional[str] = None
+        kv_re = re.compile(
+            r"^(?P<indent>\s*)(?P<key>[^\[;#=:\s][^;#=:\r\n]*?)(?P<sep>\s*[=:]\s*)(?P<rest>.*)$"
+        )
+        for raw_line in text.splitlines(keepends=True):
+            body, _ = _split_line_ending(raw_line)
+            stripped = body.strip()
+            if not stripped or stripped.startswith((";", "#")):
+                continue
+            sec_m = _INI_SECTION_RE.match(body)
+            if sec_m:
+                current_sec = sec_m.group("section").strip()
+                continue
+            kv_m = kv_re.match(body)
+            if kv_m:
+                k = kv_m.group("key").strip()
+                rest = kv_m.group("rest")
+                val_part = rest
+                for idx, ch in enumerate(rest):
+                    if ch in (";", "#") and (idx == 0 or rest[idx - 1].isspace()):
+                        val_part = rest[:idx]
+                        break
+                pair = (current_sec, k)
+                if pair not in out:
+                    out[pair] = val_part.strip()
+                else:
+                    out[pair] = "__AMBIGUOUS_DUPLICATE__"
+
     def _flatten_json_keys(
         self,
         node: dict[str, Any],
@@ -821,7 +852,9 @@ class ChainOrchestrator:
             if isinstance(v, dict):
                 self._flatten_json_keys(v, dotted, out)
             else:
-                out[(None, dotted)] = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+                out[(None, dotted)] = (
+                    json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+                )
 
     # ------------------------------------------------------------------
     # Fase 3: Investigación y clasificación de recomendaciones
@@ -881,7 +914,6 @@ class ChainOrchestrator:
                 self._investigation_cache[cache_key] = list(raw_candidates)
 
         if not raw_candidates:
-            # Heurísticas locales seguras basadas en las claves presentes en el archivo real
             raw_candidates = self._build_local_heuristic_candidates(
                 config_snapshot=config_snapshot,
                 hardware_context=hardware_context,
@@ -904,9 +936,7 @@ class ChainOrchestrator:
         hardware_context: Mapping[str, Any],
         provider_callable: Optional[Callable[[str], str]] = None,
     ) -> tuple[list[dict[str, Any]], str]:
-        """
-        Invoca al proveedor configurado controlando disponibilidad, tiempo de espera y longitud.
-        """
+        """Invoca al proveedor configurado controlando disponibilidad, tiempo de espera y longitud."""
         prompt = (
             f"Objetivo: {user_goal}\n"
             f"Aplicación: {application_name}\n"
@@ -963,8 +993,8 @@ class ChainOrchestrator:
         hardware_context: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         """
-        Genera recomendaciones conservadoras para GPUs de gama media (~6 GB VRAM)
-        únicamente sobre claves que realmente existen en el archivo inspeccionado.
+        Genera recomendaciones conservadoras para GPUs de ~6 GB VRAM únicamente
+        sobre claves que existen realmente en el archivo inspeccionado.
         """
         existing_keys: dict[tuple[Optional[str], str], str] = config_snapshot.get("keys", {})
         vram_gb = int(hardware_context.get("vram_gb", 6) or 6)
@@ -1051,7 +1081,6 @@ class ChainOrchestrator:
             if risk not in VALID_RISK_LEVELS:
                 risk = "MEDIUM"
 
-            # Reglas de rechazo inmediato por seguridad
             if (
                 not key
                 or "\x00" in prop_val
@@ -1072,7 +1101,6 @@ class ChainOrchestrator:
                 )
                 continue
 
-            # Verificar si la clave existe realmente en el archivo inspeccionado
             if (sec, key) not in existing_keys:
                 results.append(
                     InvestigationRecommendation(
@@ -1152,7 +1180,11 @@ class ChainOrchestrator:
         existing_keys: dict[tuple[Optional[str], str], str] = config_snapshot.get("keys", {})
 
         operations: list[ChangeOperation] = []
-        op_type = "update_json_key" if fmt == "json" else ("update_xml_node" if fmt == "xml" else "update_key")
+        op_type = (
+            "update_json_key"
+            if fmt == "json"
+            else ("update_xml_node" if fmt == "xml" else "update_key")
+        )
 
         for idx, rec in enumerate(recommendations, start=1):
             if rec.evidence not in APPROVABLE_EVIDENCE_LEVELS:
@@ -1196,7 +1228,7 @@ class ChainOrchestrator:
         self.transition_state(execution_id, ChainState.VALIDATING)
         try:
             self.policy_engine.validate_plan(plan)
-        except (PolicyValidationError, PathAuthorizationError) as exc:
+        except (PolicyValidationError, PermissionError) as exc:
             self.transition_state(execution_id, ChainState.REJECTED, reason=str(exc))
             raise
 
@@ -1209,9 +1241,7 @@ class ChainOrchestrator:
     def simulate_plan(self, plan: ChangePlan) -> dict[str, Any]:
         """
         Fase 6: Valida el plan en modo de solo lectura, genera la vista previa detallada
-        (archivo, sección/clave, valor original, valor propuesto, justificación, riesgo,
-        evidencia, backup previsto, verificación y reversión) y transiciona a `AWAITING_APPROVAL`.
-        No modifica ningún archivo en disco.
+        y transiciona a `AWAITING_APPROVAL`. No modifica ningún archivo en disco.
         """
         record = self.get_execution(plan.execution_id)
         if record.state == ChainState.PLANNING:
@@ -1219,7 +1249,7 @@ class ChainOrchestrator:
 
         try:
             self.policy_engine.validate_plan(plan)
-        except (PolicyValidationError, PathAuthorizationError) as exc:
+        except (PolicyValidationError, PermissionError) as exc:
             self.transition_state(plan.execution_id, ChainState.REJECTED, reason=str(exc))
             raise
 
@@ -1237,10 +1267,10 @@ class ChainOrchestrator:
                     "risk_level": op.risk_level,
                     "evidence": op.evidence,
                     "backup_strategy": (
-                        f"Copia byte a byte en '{self.file_editor.backup_dir}' con verificación SHA-256"
+                        f"Copia byte a byte en '{self.file_editor.backup_dir or Path(op.file_path).parent}' con verificación SHA-256"
                     ),
                     "verification_method": op.verification_method,
-                    "rollback_method": "RollbackManager.rollback_backup con verificación de hash original",
+                    "rollback_method": "FileEditorSkill.rollback / RollbackManager con verificación de hash original",
                 }
             )
 
@@ -1282,15 +1312,12 @@ class ChainOrchestrator:
     ) -> dict[str, Any]:
         """
         Fases 7, 8, 9 y 10:
-        - Fase 7: Verifica que `user_approved=True`, que el estado sea `AWAITING_APPROVAL`,
-          y que `approval_hash` coincida exactamente con `plan.approval_hash()` y con el
-          hash registrado durante la simulación. Si el plan fue alterado o expiró, aborta.
-        - Fase 8: Aplica las operaciones aprobadas mediante `FileEditorSkill`. Si ocurre
-          un fallo parcial en múltiples operaciones, detiene las operaciones dependientes/restantes
-          y revierte automáticamente los cambios ya aplicados.
-        - Fase 9: Relee cada archivo modificado, comprueba los valores aplicados, la validez
-          sintáctica y el hash SHA-256 post-escritura.
-        - Fase 10: Devuelve un informe real y verificable sin afirmar mejoras de FPS no medidas.
+        - Fase 7: Verifica `user_approved=True`, estado `AWAITING_APPROVAL` y coincidencia
+          exacta de `approval_hash == plan.approval_hash()`.
+        - Fase 8: Aplica cada operación aprobada mediante `FileEditorSkill.modify_ini_or_text`.
+          Ante fallo parcial detiene las operaciones restantes y ejecuta rollback inverso.
+        - Fase 9: Relee cada archivo modificado, comprueba valores, sintaxis y hash SHA-256.
+        - Fase 10: Devuelve informe real sin inventar mejoras de FPS no medidas.
         """
         record = self.get_execution(plan.execution_id)
 
@@ -1330,10 +1357,9 @@ class ChainOrchestrator:
                 "La aprobación expiró porque el plan fue modificado después de la simulación."
             )
 
-        # Revalidar políticas y hashes de archivos antes de escribir un solo byte
         try:
             self.policy_engine.validate_plan(plan)
-        except (PolicyValidationError, PathAuthorizationError) as exc:
+        except (PolicyValidationError, PermissionError) as exc:
             self.transition_state(plan.execution_id, ChainState.REJECTED, reason=str(exc))
             raise ApprovalBindingError(
                 f"La validación previa a la ejecución detectó un cambio o violación: {exc}"
@@ -1375,29 +1401,25 @@ class ChainOrchestrator:
                     execution_id=plan.execution_id,
                     expected_file_hash=expected_hash,
                 )
-                current_file_hashes[canonical_str] = res["new_hash"]
-                backup_rec = BackupRecord(
-                    backup_id=Path(res["backup_path"]).stem,
-                    original_path=res["file_path"],
-                    backup_path=res["backup_path"],
-                    original_sha256=res["original_hash"],
-                    backup_sha256=res["original_hash"],
-                    size_bytes=Path(res["backup_path"]).stat().st_size,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    execution_id=plan.execution_id,
-                )
-                record.applied_backups.append(backup_rec)
+                if res.get("status") != "success":
+                    err_detail = "; ".join(res.get("errors") or ["Fallo al aplicar operación"])
+                    raise RuntimeError(err_detail)
+
+                current_file_hashes[canonical_str] = str(res["final_hash"])
+                bkp_rec = self.file_editor.backup_manager.get_record_by_backup(str(res["backup_path"]))
+                if bkp_rec is not None:
+                    record.applied_backups.append(bkp_rec)
+
                 applied_ops.append(
                     {
                         "operation_id": op.id,
                         "file_path": res["file_path"],
                         "backup_path": res["backup_path"],
                         "original_hash": res["original_hash"],
-                        "new_hash": res["new_hash"],
+                        "new_hash": res["final_hash"],
                     }
                 )
         except Exception as exc:
-            # Fallo parcial: detener operaciones dependientes y revertir en orden inverso
             rollback_notes = self._rollback_applied_records(
                 record.applied_backups, execution_id=plan.execution_id
             )
@@ -1406,7 +1428,7 @@ class ChainOrchestrator:
                 ChainState.ROLLED_BACK if rollback_notes["all_restored"] else ChainState.FAILED,
                 reason=f"Fallo durante la aplicación ({exc}); rollback ejecutado.",
             )
-            raise FileEditorError(
+            raise RuntimeError(
                 f"Fallo parcial al ejecutar el plan '{plan.plan_id}': {exc}. "
                 f"Se detuvieron las operaciones restantes y se restauraron {rollback_notes['restored_count']} backups."
             ) from exc
@@ -1428,7 +1450,7 @@ class ChainOrchestrator:
                 ChainState.ROLLED_BACK if rollback_notes["all_restored"] else ChainState.FAILED,
                 reason=f"Verificación post-escritura fallida ({exc}); rollback ejecutado.",
             )
-            raise FileEditorError(
+            raise RuntimeError(
                 f"La verificación post-escritura falló: {exc}. Los archivos fueron restaurados."
             ) from exc
 
@@ -1454,45 +1476,36 @@ class ChainOrchestrator:
         execution_id: str,
         expected_file_hash: Optional[str],
     ) -> dict[str, Any]:
-        """Ejecuta una `ChangeOperation` individual a través de `FileEditorSkill`."""
-        if op.operation_type == "update_key":
-            return self.file_editor.update_ini_key(
+        """Ejecuta una `ChangeOperation` individual a través de `FileEditorSkill.modify_ini_or_text`."""
+        if op.operation_type == "replace_content":
+            return self.file_editor.modify_ini_or_text(
                 op.file_path,
-                section=op.section,
-                key=op.key or "",
-                new_value=op.proposed_value,
-                expected_current_value=op.expected_current_value,
-                expected_file_hash=expected_file_hash,
+                replacement_content=op.proposed_value,
                 execution_id=execution_id,
+                expected_file_hash=expected_file_hash,
             )
+
         if op.operation_type == "update_json_key":
             try:
                 parsed_val = json.loads(op.proposed_value)
             except Exception:
                 parsed_val = op.proposed_value
-            return self.file_editor.update_json_key(
+            return self.file_editor.modify_ini_or_text(
                 op.file_path,
-                key_path=op.key or "",
-                new_value=parsed_val,
-                expected_file_hash=expected_file_hash,
+                key_values={op.key or "": parsed_val},
                 execution_id=execution_id,
+                expected_file_hash=expected_file_hash,
             )
-        if op.operation_type == "update_xml_node":
-            return self.file_editor.update_xml_node(
+
+        if op.operation_type in ("update_key", "update_xml_node"):
+            return self.file_editor.modify_ini_or_text(
                 op.file_path,
-                xpath=op.key or "",
-                new_text=op.proposed_value,
-                expected_file_hash=expected_file_hash,
+                key_values={op.key or "": op.proposed_value},
+                section=op.section,
                 execution_id=execution_id,
-            )
-        if op.operation_type == "replace_content":
-            return self.file_editor.replace_full_content(
-                op.file_path,
-                new_content=op.proposed_value,
-                explicit_full_replace=True,
                 expected_file_hash=expected_file_hash,
-                execution_id=execution_id,
             )
+
         raise PolicyValidationError(f"Tipo de operación no soportado: '{op.operation_type}'.")
 
     def _verify_applied_operations(
@@ -1511,22 +1524,18 @@ class ChainOrchestrator:
             actual_hash = compute_sha256_file(canonical)
             expected_hash = expected_final_hashes.get(str(canonical))
             if expected_hash and actual_hash != expected_hash:
-                raise FileEditorError(
+                raise RuntimeError(
                     f"El hash post-escritura de '{canonical.name}' no coincide con el esperado."
                 )
 
             raw_bytes = canonical.read_bytes()
-            text, _, _ = self.file_editor._decode_preserving_bom(raw_bytes)
+            text, _, _ = _decode_bytes_strict(raw_bytes)
 
             if op.operation_type == "update_key":
-                parsed_ini = self.file_editor._parse_ini_preserve_structure(text)
-                matches = [
-                    e
-                    for e in parsed_ini["entries"]
-                    if e["section"] == op.section and e["key"] == op.key
-                ]
-                if len(matches) != 1 or matches[0]["value"] != str(op.proposed_value):
-                    raise FileEditorError(
+                extracted: dict[tuple[Optional[str], str], str] = {}
+                self._extract_ini_keys(text, extracted)
+                if extracted.get((op.section, op.key or "")) != str(op.proposed_value):
+                    raise RuntimeError(
                         f"Verificación fallida en '{canonical.name}': [{op.section}] {op.key} "
                         f"no tiene el valor esperado '{op.proposed_value}'."
                     )
@@ -1541,19 +1550,21 @@ class ChainOrchestrator:
                 except Exception:
                     expected_val = op.proposed_value
                 if curr != expected_val:
-                    raise FileEditorError(
+                    raise RuntimeError(
                         f"Verificación JSON fallida en '{canonical.name}' para '{op.key}'."
                     )
             elif op.operation_type == "update_xml_node":
-                root = self.file_editor._parse_xml_safely(text)
+                if _XML_XXE_RE.search(text):
+                    raise RuntimeError("XXE detectado en verificación post-escritura.")
+                root = ET.fromstring(text)
                 target = root if op.key in (".", root.tag) else root.find(op.key or "")
                 if target is None or (target.text or "") != str(op.proposed_value):
-                    raise FileEditorError(
+                    raise RuntimeError(
                         f"Verificación XML fallida en '{canonical.name}' para '{op.key}'."
                     )
             elif op.operation_type == "replace_content":
                 if text != op.proposed_value:
-                    raise FileEditorError(
+                    raise RuntimeError(
                         f"Verificación de contenido completo fallida en '{canonical.name}'."
                     )
 
@@ -1576,18 +1587,17 @@ class ChainOrchestrator:
         """Restaura en orden inverso todos los backups aplicados durante una ejecución."""
         restored = 0
         errors: list[str] = []
-        # Restaurar en orden inverso (LIFO) para que el primer backup deje el estado original exacto
         for bkp in reversed(list(backups)):
-            try:
-                self.file_editor.rollback(
-                    bkp.original_path,
-                    bkp.backup_path,
-                    execution_id=execution_id,
-                    force=True,
-                )
+            ok = self.file_editor.rollback(
+                backup_path=bkp.backup_path,
+                target_path=bkp.target_path,
+                expected_current_hash=None,
+                execution_id=f"{execution_id}_rollback",
+            )
+            if ok:
                 restored += 1
-            except Exception as exc:
-                errors.append(str(exc))
+            else:
+                errors.extend(self.file_editor.last_operation_result.get("errors") or ["Fallo de rollback"])
         return {
             "restored_count": restored,
             "all_restored": len(errors) == 0 and restored == len(backups),
@@ -1601,43 +1611,34 @@ class ChainOrchestrator:
         force: bool = False,
     ) -> dict[str, Any]:
         """
-        Restaura los archivos modificados en una ejecución utilizando el primer backup
-        de cada archivo para devolverlo exactamente a su SHA-256 original, verificando
-        conflictos si el archivo fue editado externamente después de la ejecución.
+        Restaura los archivos modificados en una ejecución utilizando sus backups registrados
+        en orden inverso (LIFO) para devolver cada archivo exactamente a su SHA-256 original,
+        detectando conflictos si el archivo fue editado externamente después de la ejecución.
         """
         record = self.get_execution(execution_id)
         if not record.applied_backups:
-            raise FileEditorError(
+            raise RuntimeError(
                 f"La ejecución '{execution_id}' no registra backups aplicados para restaurar."
             )
 
-        # Agrupar por archivo: el último hash escrito debe coincidir con el archivo actual si force=False
-        latest_backup_by_file: dict[str, BackupRecord] = {}
-        earliest_backup_by_file: dict[str, BackupRecord] = {}
-        for bkp in record.applied_backups:
-            latest_backup_by_file[bkp.original_path] = bkp
-            if bkp.original_path not in earliest_backup_by_file:
-                earliest_backup_by_file[bkp.original_path] = bkp
-
-        # Verificar si el archivo fue alterado externamente después de las operaciones del plan
-        if not force and record.verification_results:
-            last_verified_hash_by_file = {
-                v["file_path"]: v["sha256"] for v in record.verification_results
-            }
-        else:
-            last_verified_hash_by_file = {}
-
-        restored_files: list[dict[str, Any]] = []
-        for file_path, first_bkp in earliest_backup_by_file.items():
-            expected_current_hash = last_verified_hash_by_file.get(file_path)
-            res = self.file_editor.rollback(
-                file_path,
-                first_bkp.backup_path,
-                expected_current_modified_hash=expected_current_hash,
-                force=force,
-                execution_id=execution_id,
+        restored_files: list[str] = []
+        for bkp in reversed(record.applied_backups):
+            # Recargar registro actualizado desde BackupManager por si post_edit_sha256 fue actualizado
+            latest_rec = self.file_editor.backup_manager.get_record_by_backup(bkp.backup_path) or bkp
+            expected_curr = None if force else latest_rec.post_edit_sha256
+            ok = self.file_editor.rollback(
+                backup_path=latest_rec.backup_path,
+                target_path=latest_rec.target_path,
+                expected_current_hash=expected_curr,
+                execution_id=f"{execution_id}_rollback",
             )
-            restored_files.append(res)
+            if not ok:
+                errs = "; ".join(
+                    self.file_editor.last_operation_result.get("errors")
+                    or ["Conflicto o fallo durante rollback"]
+                )
+                raise RuntimeError(errs)
+            restored_files.append(latest_rec.target_path)
 
         self.transition_state(execution_id, ChainState.ROLLED_BACK)
         return {

@@ -308,4 +308,59 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
 - **Timeout (`CODEX_TIMEOUT`):** si una tarea supera el plazo configurado (120 s por defecto), el proceso se cancela de forma controlada sin bloquear ni cerrar J.A.R.V.I.S.
 - **Directorio fuera del proyecto:** `validate_workspace()` bloquea cualquier ruta externa a `BASE_DIR`.
 
+---
+
+## Cambios de esta iteración (2026-10-27 — Prompt Maestro V2.0: ChainOrchestrator + FileEditorSkill + Windows Safe Execution)
+
+### 1. Arquitectura de `FileEditorSkill` (`skills/file_editor_skill.py`) y `SkillManager`
+- **`FileEditorSkill` (`name="file_editor"`):** Habilidad registrada en `src/tools/skill_manager.py` (10 habilidades activas en total) y mapeada en `src/brain/intent_router.py` (`SKILL_CLASS_BY_TOOL_NAME["file_editor"] = "FileEditorSkill"`), manteniendo intacto el Fast-Path de Windows y el inicio instantáneo en modo texto.
+- **Validación defensiva de rutas en Windows (`validate_authorized_path`):**
+  - Raíces permitidas configuradas en `config/settings.py` (`AUTHORIZED_FILE_ROOTS`: workspace del proyecto y subcarpetas de configuración de usuario como `Documents\My Games`, `Saved Games`, `%LOCALAPPDATA%` y `%APPDATA%`).
+  - Prohibición absoluta de directorios del sistema (`FORBIDDEN_SYSTEM_PREFIXES`: `C:\Windows`, `System32`, `Program Files`, etc.), rutas UNC (`\\server\share`), nombres de dispositivos reservados de Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`), variables de entorno sin expandir (`%...%`) y segmentos de path traversal (`..`).
+  - Detección de enlaces simbólicos, junctions NTFS y reparse points (`os.lstat` + `FILE_ATTRIBUTE_REPARSE_POINT`) tanto en el archivo objetivo como en cada directorio ancestro.
+- **Descubrimiento acotado multi-juego (`discover_config_file` / `discover_config_files_detailed`):**
+  - Busca archivos de configuración por nombre de juego/aplicación y archivo objetivo con límite de profundidad (`FILE_EDITOR_MAX_DISCOVERY_DEPTH = 4`) y cantidad máxima de archivos (`FILE_EDITOR_MAX_DISCOVERY_FILES = 600`).
+  - Si existen múltiples instalaciones candidatas, reporta estado `"ambiguous"` y exige selección explícita sin elegir arbitrariamente.
+- **Backups verificables (`BackupManager`, `BackupRecord`, `create_backup`):**
+  - Antes de cualquier modificación se crea una copia byte a byte `<archivo>.<YYYYMMDD_HHMMSS_ffffff>.bak` usando apertura exclusiva (`"xb"`, nunca sobrescribe un `.bak` existente) con `flush()` + `os.fsync()`.
+  - Se recalcula y verifica el hash SHA-256 del original y del backup antes de continuar. Los archivos `*.bak` y `backups/` están excluidos en `.gitignore` y bloqueados por `GitSafetyGuard`.
+- **Edición conservadora por formato (`modify_ini_or_text`):**
+  - **INI / CFG / CONF / TXT:** Parser propio línea por línea (sin `configparser`) que preserva mayúsculas/minúsculas exactas de claves y secciones, comentarios de línea completa e inline (`;` y `#`), líneas vacías, indentación, orden de secciones, saltos de línea (`CRLF` o `LF`), BOM (`UTF-8-SIG`, `UTF-16-LE/BE`) y archivos sin encabezado de sección. Detecta y aborta ante claves duplicadas o coincidencias ambiguas sin corromper el archivo.
+  - **JSON:** Validación sintáctica antes y después de actualizar rutas anidadas (`graphics.shadows`), conservando tipos de datos y saltos de línea.
+  - **XML:** Actualización segura de nodos y atributos bloqueando estrictamente declaraciones `<!DOCTYPE` y `<!ENTITY` para prevenir ataques XXE.
+  - **Reemplazo completo explícito:** Solo permitido cuando se pasa `replacement_content` sin `key_values` (parámetros mutuamente excluyentes).
+- **Escritura atómica en Windows con reintentos (`_atomic_write_bytes_with_retries`):**
+  - Escribe en un archivo temporal único en el mismo directorio del archivo objetivo, ejecuta `flush()` + `os.fsync()`, valida formato y SHA-256, comprueba que el archivo original no haya cambiado concurrentemente (anti-TOCTOU) y ejecuta `os.replace` con hasta 3 reintentos (`FILE_EDITOR_MAX_RETRIES = 3`, backoff base `100 ms`) ante bloqueos transitorios de Windows (`PermissionError`, `WinError 32`).
+- **Auditoría y Rollback (`AuditLogger`, `RollbackManager`, `rollback`):**
+  - `AuditLogger` registra cada operación en `logs/file_editor_audit.jsonl` redactando cualquier posible secreto mediante `redact_secrets`.
+  - `rollback` y `RollbackManager.rollback_execution` verifican el SHA-256 del backup, detectan si el archivo fue modificado externamente con posterioridad a la ejecución original, crean un backup preventivo pre-rollback y restauran atómicamente el estado original exacto.
+
+### 2. Arquitectura de `ChainOrchestrator` (`src/brain/chain_orchestrator.py`)
+- **Esquemas `ChangeOperation` y `ChangePlan`:**
+  - `ChangeOperation` y `ChangePlan` validan tipos y rechazan cualquier campo desconocido en `from_dict`.
+  - `ChangePlan.canonical_json()` y `ChangePlan.approval_hash()` generan un hash SHA-256 determinista sobre el contenido inmutable del plan, las rutas canónicas, los hashes originales de cada archivo y los valores propuestos.
+- **Motor de políticas local (`PolicyEngine`):**
+  - Valida cada operación e impide que cualquier proveedor externo (Codex, Gemini, OpenAI, Claude u Ollama) eluda las raíces autorizadas, incluya recomendaciones `UNSUPPORTED` o `REJECTED`, omita `verification_method`, desactive `reversible` o `requires_approval`, o proponga operaciones contradictorias.
+- **Máquina de estados y flujo en 10 fases:**
+  - Estados controlados por `ALLOWED_STATE_TRANSITIONS`: `RECEIVED -> INVESTIGATING -> PLANNING -> VALIDATING -> AWAITING_APPROVAL -> APPLYING -> VERIFYING -> COMPLETED` y estados terminales/alternativos `REJECTED`, `CANCELLED`, `FAILED`, `ROLLED_BACK`.
+  - Cubre diagnóstico local de hardware en solo lectura (`detect_hardware_context`) e inspección de configuración (`inspect_target_config`), investigación con caché y control de timeout/errores de proveedor (`investigate_optimizations`), clasificación de evidencia (`VERIFIED`, `PLAUSIBLE`, `UNSUPPORTED`, `REJECTED`), simulación dry-run (`simulate_plan`), ejecución vinculada a `approval_hash` (`execute_approved_plan`), verificación post-escritura y rollback automático o manual (`rollback_execution`).
+
+### 3. Gobernanza Autónoma de Git y Tags (`git-release-manager`)
+- Se creó la skill de agente `.agents/skills/git-release-manager/SKILL.md` y se documentó en `AGENTS.md` la política de commits atómicos auditados con `GitSafetyGuard` y tags anotados cada 3 fases:
+  - `v3.0.0`: Arquitectura Multi-Brain y modo Consola Primero.
+  - `v4.0.0`: Integración oficial de OpenAI Codex CLI y `GitSafetyGuard`.
+  - `v4.1.0` (Fases A–C): Gobernanza Git, skill `git-release-manager` y constantes de seguridad en `config/settings.py`.
+  - `v4.2.0` (Fases D–F): `FileEditorSkill`, parser INI conservador, escritura atómica e integración en `SkillManager`.
+  - `v4.3.0` (Fases G–I): `ChainOrchestrator`, `ChangePlan`, `PolicyEngine` y flujo multi-juego con aprobación criptográfica.
+  - `v5.0.0` (Fases J–L): Suite exhaustiva `tests/test_file_editor_and_chain.py` (40 escenarios) y documentación final.
+
+### 4. Verificaciones Ejecutadas
+- Compilación estática:
+  `.\venv\Scripts\python.exe -m py_compile skills/file_editor_skill.py src/brain/chain_orchestrator.py tests/test_file_editor_and_chain.py` → **Código de salida 0 (OK)**.
+- Suite específica de `FileEditorSkill` y `ChainOrchestrator`:
+  `.\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain -v` → **40 pruebas ejecutadas, 0 fallos, 0 errores (OK)** en 0.964s.
+- Suite completa del repositorio:
+  `.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **379 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)** en 8.948s.
+
+
 

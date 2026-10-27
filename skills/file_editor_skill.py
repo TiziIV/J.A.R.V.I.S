@@ -85,6 +85,11 @@ def compute_sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def compute_sha256_file(file_path: Path | str) -> str:
+    """Calcula el resumen criptográfico SHA-256 hexadecimal leyendo los bytes de un archivo."""
+    return compute_sha256_bytes(Path(file_path).read_bytes())
+
+
 def generate_execution_id() -> str:
     """Genera un identificador único y trazable para cada operación o lote de edición."""
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
