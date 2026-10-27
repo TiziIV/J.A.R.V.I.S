@@ -2,14 +2,30 @@
 
 import json
 import re
+import string
+import unicodedata
 from typing import Any, Mapping, Protocol, Sequence
 from config.prompts import JARVIS_SYSTEM_PROMPT
 from src.brain.memory import ConversationMemory
 
-# Mensajes degradados que devuelven OllamaBrain/GeminiBrain cuando no pueden responder.
+# Mapa entre el identificador interno de cada herramienta y el nombre de su clase Skill.
+# Permite emitir diagnósticos consistentes como `[Skill Local: TimeSkill]`.
+SKILL_CLASS_BY_TOOL_NAME: dict[str, str] = {
+    "system_time": "TimeSkill",
+    "app_launcher": "AppLauncherSkill",
+    "system_info": "SystemInfoSkill",
+    "web_search": "WebSearchSkill",
+    "activate_protocol": "StarkProtocolSkill",
+    "volume_control": "VolumeControlSkill",
+    "media_control": "MediaControlSkill",
+    "clipboard_manager": "ClipboardSkill",
+    "system_power": "SystemPowerSkill",
+}
+
+# Mensajes degradados que devuelven los cerebros locales o cloud cuando no pueden responder.
 # ¿Por qué se filtran? Si el modelo local Ollama falla por falta de VRAM o timeout,
 # devuelve un mensaje de error amigable. El router debe detectar que fue un fallo técnico
-# para activar el fallback a Gemini, en lugar de creer que el LLM quiso hablarle de eso al usuario.
+# para activar el fallback, en lugar de creer que el LLM quiso hablarle de eso al usuario.
 # Se comparan solo contra texto plano (sin JSON) para no confundir una respuesta legítima.
 _PROVIDER_ERROR_MARKERS: tuple[str, ...] = (
     "no responde",
@@ -19,6 +35,18 @@ _PROVIDER_ERROR_MARKERS: tuple[str, ...] = (
     "gemini devolvió una respuesta vacía",
     "no aceptaron la solicitud",
     "no pudo generar una respuesta",
+    "claude no está configurado",
+    "claude devolvió una respuesta vacía",
+    "no pude conectar con claude",
+    "gpt no está configurado",
+    "gpt devolvió una respuesta vacía",
+    "no pude conectar con openai",
+    "no está instalado en ollama",
+    "tardó demasiado en responder",
+    "superó el tiempo de espera",
+    "agotó la cuota",
+    "límite de uso",
+    "clave de api",
 )
 
 
@@ -61,6 +89,196 @@ class IntentRouter:
         self.tools = self._normalize_tools(tools)
         self._tools_by_name = {tool["name"]: tool for tool in self.tools}
         self.memory = memory
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normaliza texto en minúsculas sin acentos ni signos de puntuación para reglas locales."""
+        if not text:
+            return ""
+        nfkd = unicodedata.normalize("NFKD", text.lower())
+        no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+        clean = no_accents.translate(str.maketrans("", "", string.punctuation + "¿¡«»“”"))
+        return " ".join(clean.split())
+
+    def detect_local_skill(self, user_text: str) -> dict[str, Any] | None:
+        """
+        Detecta de forma determinista y sin llamadas a LLM si la orden del usuario corresponde
+        directamente a una de las habilidades locales de Windows registradas en el manifiesto.
+
+        ¿Por qué existe este método?
+        1. Evita llamadas cloud o locales innecesarias para órdenes inequívocas como "¿qué hora es?",
+           "sube el volumen" o "abre la calculadora".
+        2. Garantiza que las habilidades locales funcionen al 100% incluso si Ollama está apagado
+           y no hay claves API configuradas.
+        3. Si una orden local es incompleta/ambigua (ej. "abre una aplicación" sin decir cuál),
+           devuelve una solicitud de aclaración breve (`action == "clarify"`).
+        """
+        if not isinstance(user_text, str) or not user_text.strip():
+            return None
+
+        raw = user_text.strip()
+        norm = self._normalize_text(raw)
+        if not norm:
+            return None
+
+        def _make_tool_call(tool_name: str, parameters: dict[str, Any]) -> dict[str, Any] | None:
+            if tool_name not in self._tools_by_name:
+                return None
+            return {
+                "action": "call_tool",
+                "tool_name": tool_name,
+                "parameters": parameters,
+                "skill_class": SKILL_CLASS_BY_TOOL_NAME.get(tool_name, tool_name),
+            }
+
+        # 1. StarkProtocolSkill ('activate_protocol')
+        if "activate_protocol" in self._tools_by_name:
+            if any(p in norm for p in ("protocolo de trabajo", "protocolo trabajo", "modo programacion", "modo desarrollo")):
+                return _make_tool_call("activate_protocol", {"protocol": "trabajo"})
+            if any(p in norm for p in ("protocolo diagnostico", "protocolo de diagnostico", "reporte de estado")):
+                return _make_tool_call("activate_protocol", {"protocol": "diagnostico"})
+            if any(p in norm for p in ("protocolo silencio", "protocolo de silencio", "modo sigilo")):
+                return _make_tool_call("activate_protocol", {"protocol": "silencio"})
+
+        # 2. TimeSkill ('system_time')
+        if "system_time" in self._tools_by_name:
+            time_phrases = (
+                "que hora es",
+                "que hora tienes",
+                "dime la hora",
+                "decime la hora",
+                "hora actual",
+                "que fecha es hoy",
+                "que dia es hoy",
+                "dime la fecha",
+                "fecha y hora",
+            )
+            if any(p in norm for p in time_phrases) or norm in ("hora", "fecha", "la hora"):
+                return _make_tool_call("system_time", {})
+
+        # 3. SystemInfoSkill ('system_info')
+        if "system_info" in self._tools_by_name:
+            sys_phrases = (
+                "estado del sistema",
+                "uso de cpu",
+                "uso del procesador",
+                "cuanta ram",
+                "memoria ram libre",
+                "estado de la ram",
+                "como esta el procesador",
+                "estado del hardware",
+            )
+            if any(p in norm for p in sys_phrases):
+                return _make_tool_call("system_info", {})
+
+        # 4. VolumeControlSkill ('volume_control')
+        if "volume_control" in self._tools_by_name:
+            if re.search(r"\b(sube|subir|aumenta|aumentar)\b.*\b(volumen|audio)\b", norm):
+                return _make_tool_call("volume_control", {"action": "subir"})
+            if re.search(r"\b(baja|bajar|reduce|reducir|disminuye)\b.*\b(volumen|audio)\b", norm):
+                return _make_tool_call("volume_control", {"action": "bajar"})
+            if re.search(r"\b(silencia|silenciar|mutea|mutear)\b.*\b(volumen|audio|sonido)\b", norm):
+                return _make_tool_call("volume_control", {"action": "silenciar"})
+
+        # 5. MediaControlSkill ('media_control')
+        if "media_control" in self._tools_by_name:
+            if re.search(r"\b(pausa|pausar)\b.*\b(musica|cancion|reproduccion)\b", norm):
+                return _make_tool_call("media_control", {"action": "pausar"})
+            if re.search(r"\b(reproduce|reproducir|reanuda|reanudar)\b.*\b(musica|cancion|reproduccion)\b", norm):
+                return _make_tool_call("media_control", {"action": "reproducir"})
+            if re.search(r"\b(siguiente|proxima|adelanta)\b.*\b(cancion|pista)\b", norm):
+                return _make_tool_call("media_control", {"action": "siguiente"})
+            if re.search(r"\b(anterior|previa)\b.*\b(cancion|pista)\b|\bcancion anterior\b", norm):
+                return _make_tool_call("media_control", {"action": "anterior"})
+
+        # 6. ClipboardSkill ('clipboard_manager')
+        if "clipboard_manager" in self._tools_by_name:
+            if re.search(r"\b(lee|leer|mostrar|muestra|que hay en)\b.*\bportapapeles\b", norm):
+                return _make_tool_call("clipboard_manager", {"action": "leer"})
+            copy_match = re.search(
+                r"(?:copia|copiar|guarda|guardar)\s+(?:en\s+el|al)?\s*portapapeles\s*[:,-]?\s*(.*)",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if copy_match:
+                text_to_copy = copy_match.group(1).strip().strip('"').strip("'")
+                if not text_to_copy:
+                    return {
+                        "action": "clarify",
+                        "response": "Por favor indique qué texto desea copiar al portapapeles, señor.",
+                        "skill_class": "ClipboardSkill",
+                    }
+                return _make_tool_call("clipboard_manager", {"action": "copiar", "text": text_to_copy})
+
+        # 7. SystemPowerSkill ('system_power') — conserva controles de seguridad:
+        # solo admite bloquear pantalla o cancelar apagado, nunca apagar/reiniciar sin control.
+        if "system_power" in self._tools_by_name:
+            if re.search(r"\b(bloquea|bloquear)\b.*\b(pantalla|equipo|pc|computadora|sesion)\b", norm):
+                return _make_tool_call("system_power", {"action": "bloquear"})
+            if re.search(r"\b(cancela|cancelar|aborta|abortar)\b.*\bapagado\b", norm):
+                return _make_tool_call("system_power", {"action": "cancelar_apagado"})
+
+        # 8. WebSearchSkill ('web_search')
+        if "web_search" in self._tools_by_name:
+            yt_match = re.search(
+                r"\b(?:busca|buscar|buscame)\s+(?:en\s+youtube\s+)(.+?)(?:\s+en\s+youtube)?$",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if not yt_match:
+                yt_match = re.search(
+                    r"\b(?:busca|buscar|buscame)\s+(.+?)\s+en\s+youtube\s*$",
+                    raw,
+                    flags=re.IGNORECASE,
+                )
+            if yt_match:
+                query = yt_match.group(1).strip().strip('"').strip("'")
+                if query:
+                    return _make_tool_call("web_search", {"query": query, "platform": "youtube"})
+
+            web_match = re.search(
+                r"\b(?:busca|buscar|buscame)\s+(?:en\s+(?:google|internet|la\s+web)\s+)(.+)$",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if not web_match:
+                web_match = re.search(
+                    r"\b(?:busca|buscar|buscame)\s+(.+?)\s+en\s+(?:google|internet|la\s+web)\s*$",
+                    raw,
+                    flags=re.IGNORECASE,
+                )
+            if web_match:
+                query = web_match.group(1).strip().strip('"').strip("'")
+                if query:
+                    return _make_tool_call("web_search", {"query": query})
+
+            if norm in ("busca en google", "buscar en google", "busca en internet", "busca en youtube", "buscar en youtube"):
+                return {
+                    "action": "clarify",
+                    "response": "Por favor especifique qué término desea buscar en el navegador, señor.",
+                    "skill_class": "WebSearchSkill",
+                }
+
+        # 9. AppLauncherSkill ('app_launcher')
+        if "app_launcher" in self._tools_by_name:
+            if norm in ("abre", "abrir", "abre una aplicacion", "abrir aplicacion", "abre un programa"):
+                return {
+                    "action": "clarify",
+                    "response": "Por favor especifique qué aplicación desea abrir, señor.",
+                    "skill_class": "AppLauncherSkill",
+                }
+            app_match = re.match(
+                r"^(?:jarvis\s+)?(?:por\s+favor\s+)?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar)\s+(?:el\s+|la\s+)?(.+?)(?:\s+por\s+favor)?$",
+                norm,
+            )
+            if app_match:
+                candidate_app = app_match.group(1).strip()
+                # Evitamos capturar frases que son de otra categoría (ej. "inicia protocolo de trabajo" ya se filtró arriba)
+                ignored_targets = ("sesion", "conversacion", "selector", "modo")
+                if candidate_app and not any(candidate_app.startswith(t) for t in ignored_targets):
+                    return _make_tool_call("app_launcher", {"app_name": candidate_app})
+
+        return None
 
     @staticmethod
     def _normalize_tools(tools: Sequence[object]) -> list[dict[str, Any]]:
