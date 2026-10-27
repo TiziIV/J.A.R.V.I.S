@@ -275,6 +275,77 @@ CODEX_SANDBOX: str = _env_sandbox("CODEX_SANDBOX", "workspace-write")
 # Modelo opcional para `codex exec` (vacío = usar el modelo predeterminado de la sesión ChatGPT/CLI).
 CODEX_MODEL: str = os.getenv("CODEX_MODEL", "").strip()
 
+# ==============================================================================
+# FILE EDITOR SKILL Y CHAIN ORCHESTRATOR — RUTAS AUTORIZADAS Y LÍMITES SEGUROS
+# ==============================================================================
+# Prefijos de sistema estrictamente prohibidos en cualquier fase (nunca pueden añadirse como raíz).
+FORBIDDEN_SYSTEM_PREFIXES: tuple[str, ...] = (
+    r"c:\windows",
+    r"c:\windows\system32",
+    r"c:\windows\syswow64",
+    r"c:\program files\windowsapps",
+    r"c:\programdata\microsoft\windows",
+)
+
+
+def _build_authorized_file_roots() -> tuple[str, ...]:
+    """
+    Construye y valida las raíces autorizadas donde `FileEditorSkill` puede descubrir o editar
+    archivos de configuración. Expande variables de entorno únicamente sobre estas plantillas
+    configuradas y descarta rutas inexistentes, UNC o ubicaciones privilegiadas del sistema.
+    """
+    templates: list[str] = [
+        str(BASE_DIR),
+        r"%USERPROFILE%\Documents",
+        r"%USERPROFILE%\Saved Games",
+        r"%LOCALAPPDATA%",
+        r"%APPDATA%",
+    ]
+    extra_raw = os.getenv("JARVIS_EXTRA_AUTHORIZED_ROOTS", "").strip()
+    if extra_raw:
+        for item in extra_raw.split(os.pathsep):
+            if item.strip():
+                templates.append(item.strip())
+
+    resolved_roots: list[str] = []
+    for tpl in templates:
+        expanded = os.path.expandvars(tpl).strip()
+        if not expanded or "%" in expanded or expanded.startswith("\\\\"):
+            continue
+        try:
+            candidate = Path(expanded).resolve()
+            norm_lower = str(candidate).lower().rstrip("\\/")
+            if any(
+                norm_lower == forbidden or norm_lower.startswith(forbidden + "\\")
+                for forbidden in FORBIDDEN_SYSTEM_PREFIXES
+            ):
+                continue
+            if candidate.exists() and candidate.is_dir():
+                canonical_str = str(candidate)
+                if canonical_str not in resolved_roots:
+                    resolved_roots.append(canonical_str)
+        except (OSError, ValueError):
+            continue
+    return tuple(resolved_roots)
+
+
+# Tupla inmutable de raíces autorizadas para lectura/edición controlada de configuraciones.
+AUTHORIZED_FILE_ROOTS: tuple[str, ...] = _build_authorized_file_roots()
+
+# Directorio local (ignorado por Git en `data/`) para almacenar metadatos de auditoría y backups centrales opcionales.
+BACKUP_STORAGE_DIR: Path = BASE_DIR / "data" / "backups"
+AUDIT_LOG_FILE: Path = BASE_DIR / "data" / "file_editor_audit.jsonl"
+
+# Límites de seguridad y reintentos ante bloqueos transitorios de Windows (WinError 32 / PermissionError).
+FILE_EDITOR_MAX_RETRIES: int = _env_int("FILE_EDITOR_MAX_RETRIES", 3, minimum=1)
+FILE_EDITOR_RETRY_BASE_MS: int = _env_int("FILE_EDITOR_RETRY_BASE_MS", 100, minimum=10)
+FILE_EDITOR_MAX_DISCOVERY_DEPTH: int = _env_int("FILE_EDITOR_MAX_DISCOVERY_DEPTH", 4, minimum=1)
+FILE_EDITOR_MAX_DISCOVERY_FILES: int = _env_int("FILE_EDITOR_MAX_DISCOVERY_FILES", 400, minimum=10)
+FILE_EDITOR_MAX_FILE_BYTES: int = _env_int("FILE_EDITOR_MAX_FILE_BYTES", 2 * 1024 * 1024, minimum=1024)
+
+# Versión de política de validación aplicada por `PolicyEngine` y `ChainOrchestrator`.
+CHAIN_POLICY_VERSION: str = "2.0.0"
+
 # Si una variable inválida generó advertencias, se informan una vez al importar (sin secretos).
 for _warning in CONFIG_WARNINGS:
     print(f"[Config] Aviso: {_warning}", file=sys.stderr)

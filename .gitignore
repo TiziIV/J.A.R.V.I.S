@@ -38,10 +38,12 @@ tmp/
 .DS_Store
 Thumbs.db
 
-# Historial de prompts del usuario
+# Historial de prompts del usuario y backups locales
 prompts_history.txt
 *.log.txt
 *.log
+*.bak
+backups/
 dist/
 build/
 *.spec

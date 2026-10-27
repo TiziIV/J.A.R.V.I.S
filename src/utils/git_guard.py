@@ -63,6 +63,7 @@ SENSITIVE_EXTENSIONS: tuple[str, ...] = (
     ".log.txt",
     ".wav",
     ".mp3",
+    ".bak",
 )
 
 # Patrones para detectar valores reales de claves API o tokens dentro de un diff de Git.
@@ -544,3 +545,52 @@ class GitSafetyGuard:
             False,
             f"El push a origin/main fue rechazado sin aplicar '--force': {err}",
         )
+
+    def create_annotated_tag(
+        self,
+        tag_name: str,
+        message: str,
+        *,
+        target_commit: Optional[str] = None,
+        user_authorized: bool = False,
+    ) -> tuple[bool, str]:
+        """
+        Crea un tag anotado de Git (`git tag -a <tag_name> -m <message> [target_commit]`)
+        validando el formato del nombre y sin sobrescribir tags existentes (`-f` prohibido).
+        """
+        if not user_authorized:
+            return False, "Creación de tag detenida: se requiere autorización."
+
+        clean_tag = (tag_name or "").strip()
+        clean_msg = (message or "").strip()
+        if not clean_tag or not re.match(r"^v?[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?$", clean_tag):
+            return False, f"Nombre de tag inválido: '{tag_name}'. Use formato semántico (ej. v4.1.0)."
+        if not clean_msg:
+            return False, "El mensaje del tag anotado no puede estar vacío."
+
+        args: list[str] = ["tag", "-a", clean_tag, "-m", clean_msg]
+        if target_commit and target_commit.strip():
+            args.append(target_commit.strip())
+
+        proc = self._run_git(args)
+        if proc.returncode != 0:
+            err = redact_secrets((proc.stderr or proc.stdout or "").strip())
+            return False, f"No se pudo crear el tag '{clean_tag}': {err}"
+        return True, f"Tag '{clean_tag}' creado correctamente."
+
+    def push_tags(
+        self,
+        *,
+        user_authorized: bool = False,
+        tag_name: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """Publica un tag específico o todos los tags anotados en `origin` sin usar `--force`."""
+        if not user_authorized:
+            return False, "Push de tags detenido: se requiere autorización."
+
+        args = ["push", "origin", tag_name.strip()] if (tag_name and tag_name.strip()) else ["push", "origin", "--tags"]
+        proc = self._run_git(args)
+        if proc.returncode == 0:
+            return True, "Tags publicados en origin correctamente."
+        err = redact_secrets((proc.stderr or proc.stdout or "").strip())
+        return False, f"Error al publicar tags en origin: {err}"

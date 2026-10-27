@@ -59,3 +59,10 @@ Estas reglas aplican a todo el repositorio. Antes de editar, revisa este archivo
 - Ejecuta comprobaciones proporcionadas por el proyecto o verificaciones estáticas pequeñas cuando estén disponibles y sean relevantes.
 - Para cambios de audio, informa que el hardware físico requiere prueba manual si no se pudo probar micrófono o reproducción en esta sesión.
 - Revisa el diff final para detectar cambios ajenos, secretos o archivos temporales.
+
+## Gestión autónoma de Git, Commits y Tags (cada 3 fases)
+
+- Utiliza `.agents/skills/git-release-manager/SKILL.md` y `src/utils/git_guard.py` (`GitSafetyGuard`) para llevar los commits, tags y push del proyecto.
+- Antes de cada commit, audita obligatoriamente que ningún archivo sensible (`.env`, `prompts_history.txt`, `data/`, `*.log`, `*.bak`) ni secreto aparezca en el árbol preparado.
+- Prepara archivos específicos (`git add -- <archivos>`) y nunca uses `git add .` ni `git push --force`.
+- En desarrollos por etapas, realiza commits verificados y crea un tag anotado (`vX.Y.Z`) cada 3 fases completadas, sincronizando con `origin/main`.
