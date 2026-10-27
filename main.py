@@ -1,303 +1,250 @@
-from src.utils.logger import logger
+"""
+Módulo Principal de J.A.R.V.I.S.
+Controla el ciclo de vida del asistente mediante una arquitectura de dos niveles:
+- Nivel 1 (Modo Reposo / Standby): Detección local en CPU de palabra de activación ("Hey Jarvis").
+- Nivel 2 (Sesión Activa Continua): Bucle fluido sin límite de mensajes mientras el usuario responda,
+  con retorno a reposo ante inactividad (7s) o comando explícito de descanso.
+"""
+
+from __future__ import annotations
+
 import os
-import string
 import time
-import unicodedata
 from concurrent.futures import Future
-from src.audio.recorder import AudioRecorder
-from src.audio.stt import SpeechToText
-from src.audio.wake_word import WakeWordDetector
-from src.brain.ollama_client import OllamaBrain
-from src.brain.gemini_client import GeminiBrain
-from src.brain.intent_router import IntentRouter, generate_with_fallback
-from src.brain.memory import ConversationMemory
-from config.tools_schema import TOOLS_SCHEMA
+
+from config.prompts import JARVIS_SYSTEM_PROMPT
+from config.settings import (
+    SESSION_IDLE_TIMEOUT,
+    SESSION_POST_SPEECH_PAUSE,
+    SESSION_SILENCE_DURATION,
+    SFX_ENABLED,
+)
 from config.wake_config import (
+    WAKE_CHUNK_SIZE,
+    WAKE_SAMPLE_RATE,
     WAKE_WORD_MODEL,
     WAKE_WORD_THRESHOLD,
-    WAKE_SAMPLE_RATE,
-    WAKE_CHUNK_SIZE,
 )
+from src.audio.recorder import AudioRecorder
+from src.audio.sfx import SoundFX
+from src.audio.stt import SpeechToText
 from src.audio.tts import TextToSpeech
+from src.audio.wake_word import WakeWordDetector
+from src.brain.gemini_client import GeminiBrain
+from src.brain.intent_router import IntentRouter
+from src.brain.memory import ConversationMemory
+from src.brain.ollama_client import OllamaBrain
+from src.session import ActiveSession, SessionEnd, normalize_text
 from src.tools.skill_manager import SkillManager
 from src.ui.tray import JarvisTray
+from src.utils.logger import logger
 
-def normalize_text(text: str) -> str:
-    """
-    Función auxiliar para normalizar el texto transcrito por Whisper.
-    ¿Por qué se hace? Convierte a minúsculas, elimina tildes (acentos) y remueve signos de puntuación
-    para que la detección de comandos e intenciones sea robusta y tolerante a variaciones de voz.
-    
-    Args:
-        text (str): Texto crudo proveniente del STT.
-        
-    Returns:
-        str: Texto limpio y normalizado.
-    """
-    if not text:
-        return ""
-    
-    # 1. Convertimos todo el texto a minúsculas
-    text = text.lower()
-    
-    # 2. Descomponemos caracteres Unicode para separar las tildes de las letras base (NFKD)
-    nfkd_form = unicodedata.normalize('NFKD', text)
-    
-    # 3. Filtramos los caracteres de combinación (tildes/diacríticos)
-    without_accents = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
-    
-    # 4. Removemos todos los signos de puntuación del sistema (incluyendo signos en español ¿, ¡)
-    punctuation_to_remove = string.punctuation + "¿¡«»“”"
-    clean_text = without_accents.translate(str.maketrans("", "", punctuation_to_remove))
-    
-    # 5. Unimos las palabras separadas por múltiples espacios en un único espacio estándar
-    return " ".join(clean_text.split())
 
-def main():
+def main() -> None:
     """
-    Script principal de J.A.R.V.I.S. con bucle de activación manos libres de dos estados:
-    - Estado 1 (Pasivo/Reposo): Detección local en CPU de palabra de activación ("Hey Jarvis").
-    - Estado 2 (Activo/Procesamiento): VAD inteligente -> Whisper GPU -> IntentRouter/Skills -> TTS.
+    Punto de entrada principal de J.A.R.V.I.S.
     """
     logger.info("=== Inicializando Sistema J.A.R.V.I.S. ===")
-    
+
     # ---------------------------------------------------------------------------
-    # PASO 1: Inicialización única de componentes (evita recargar modelos en VRAM)
+    # PASO 1: Inicialización única de componentes persistentes
     # ---------------------------------------------------------------------------
-    # Instanciamos el detector de Wake Word con el umbral configurado (openWakeWord en CPU)
     wake_detector = WakeWordDetector(threshold=WAKE_WORD_THRESHOLD)
-    recorder = AudioRecorder(sample_rate=16000)    # Grabador con VAD inteligente (16 kHz mono)
-    stt = SpeechToText()                           # Transcriptor faster-whisper en GPU
-    brain = OllamaBrain()                          # Cerebro local principal (Ollama)
-    gemini_brain = GeminiBrain()                   # Cerebro de respaldo en la nube (Gemini)
-    tts = TextToSpeech()                             # Síntesis local offline con System.Speech
-    skill_manager = SkillManager()                 # Gestor de habilidades y herramientas locales
-    
-    # Inicializamos la memoria conversacional con ventana deslizante de 8 turnos (16 mensajes)
+    recorder = AudioRecorder(sample_rate=16000)
+    stt = SpeechToText()
+    brain = OllamaBrain()
+    gemini_brain = GeminiBrain()
+    tts = TextToSpeech()
+    skill_manager = SkillManager()
+    sfx = SoundFX(enabled=SFX_ENABLED)
     memory = ConversationMemory(max_turns=8)
 
-    # Inicializamos la bandeja del sistema (System Tray) con callbacks para acciones rápidas
+    # System Tray reactivo con callback de limpieza de memoria
     def on_tray_clear_memory():
         memory.clear()
         logger.info("[Tray] Memoria conversacional reseteada por el usuario.")
 
-    tray = JarvisTray(
-        on_clear_memory=on_tray_clear_memory,
-    )
+    tray = JarvisTray(on_clear_memory=on_tray_clear_memory)
     try:
         tray.start()
     except Exception as tray_error:
         logger.warning(f"No se pudo iniciar el System Tray: {tray_error}")
-    
-    # Instanciamos el IntentRouter con el LLM principal, el manifiesto de herramientas, memoria y fallback en la nube
+
     intent_router = IntentRouter(
         llm=brain,
         tools=skill_manager.get_skills_manifest(),
         memory=memory,
         fallback_llm=gemini_brain,
     )
-    pending_speech: Future[None] | None = None     # Futuro para controlar la asincronía del TTS
 
-    logger.info("Sistema J.A.R.V.I.S. activo y en modo escucha pasiva.")
-    logger.info("Diga 'Hey Jarvis' para activar.")
-    logger.info("Comandos de prueba: '¿Qué hora es?', 'Abre la calculadora', 'Estado del sistema', o 'Olvida lo que hablamos'.")
+    logger.info("Sistema J.A.R.V.I.S. en línea y en espera pasiva.")
+    logger.info("Diga 'Hey Jarvis' una sola vez para iniciar una conversación continua.")
+    logger.info("Protocolos disponibles: 'Protocolo de trabajo', 'Protocolo diagnóstico', 'Protocolo silencio'.")
 
-    # Lista de palabras clave para detectar comandos de salida del usuario
-    exit_keywords = ["salir", "adios", "chau", "bye", "apagate", "cerrar", "terminar", "hasta luego"]
+    def speak_blocking(text: str) -> None:
+        """
+        Locución por voz garantizada y síncrona con control anti-eco estricto.
+        
+        ¿Por qué bloqueante?
+        Si la locución corriera en segundo plano mientras el micrófono ya está grabando,
+        el micrófono capturaría las propias palabras de J.A.R.V.I.S. saliendo por los altavoces
+        (bucle de eco acústico). Al esperar con 'pending.result()' y chequear 'tts.is_speaking',
+        aseguramos que el asistente termine completamente de hablar antes de volver a escuchar.
+        """
+        if not text or not text.strip():
+            return
+        pending = tts.speak(text)
+        if pending is not None:
+            pending.result()
+        while tts.is_speaking:
+            time.sleep(0.04)
+
+    def listen_step() -> str | None:
+        """
+        Captura audio del usuario respetando el timeout de inactividad de la sesión.
+        
+        Retorna:
+            str: Texto transcrito por Whisper si el usuario habló.
+            None: Si transcurrieron los 7 segundos de 'SESSION_IDLE_TIMEOUT' en silencio absoluto.
+        """
+        while tts.is_speaking:
+            time.sleep(0.04)
+
+        # Grabamos con VAD (Voice Activity Detection): espera voz inicial hasta 7s
+        audio_path = recorder.record_command(
+            initial_timeout=SESSION_IDLE_TIMEOUT,
+            silence_duration=SESSION_SILENCE_DURATION,
+        )
+        if not audio_path or not os.path.isfile(audio_path):
+            return None
+
+        try:
+            transcript = stt.transcribe(audio_path)
+            return transcript
+        finally:
+            # Limpieza inmediata y segura del archivo temporal WAV en disco
+            if os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception as err:
+                    logger.debug(f"Aviso eliminando temporal: {err}")
+
+    def respond_step(user_transcript: str) -> str:
+        """
+        Procesa una orden dentro de la sesión activa y retorna la respuesta para TTS.
+        
+        Flujo didáctico:
+        1. Normaliza texto y verifica comandos de reseteo de memoria ("olvida todo", "borrar memoria").
+        2. Registra el mensaje del usuario en el historial conversacional (ConversationMemory).
+        3. Consulta a 'IntentRouter': clasifica si la orden es una Skill del sistema o Chat general.
+        4. Si es Skill: reproduce beep corto SFX y ejecuta la habilidad (ej. hora, protocolos Stark).
+        5. Si es Chat: responde con la personalidad Stark definida en JARVIS_SYSTEM_PROMPT.
+        6. Guarda la respuesta en memoria para mantener coherencia en turnos siguientes.
+        """
+        norm = normalize_text(user_transcript)
+
+        # Triggers de reinicio de contexto conversacional
+        clear_memory_triggers = (
+            "olvida lo que hablamos", "reiniciar contexto", "olvidar contexto",
+            "olvida todo", "borrar memoria", "reinicia memoria",
+        )
+        if any(trigger in norm for trigger in clear_memory_triggers):
+            memory.clear()
+            sfx.confirm()
+            return "Entendido, señor. He reiniciado la memoria de nuestra conversación."
+
+        # Registrar el mensaje del usuario en memoria
+        memory.add_message(role="user", content=user_transcript)
+
+        # Analizar intención mediante IntentRouter
+        intent_decision = intent_router.analyze_intent(user_transcript)
+        action = intent_decision.get("action", "chat")
+
+        jarvis_response: str | None = None
+
+        if action == "call_tool":
+            tool_name = intent_decision.get("tool_name", "")
+            parameters = intent_decision.get("parameters", {})
+            logger.info(f"[Tool Call] Ejecutando: '{tool_name}' con parámetros: {parameters}")
+            sfx.confirm()
+            jarvis_response = skill_manager.execute_skill(tool_name, **parameters)
+        else:
+            chat_text = intent_decision.get("response", "")
+            if not chat_text or chat_text == user_transcript:
+                logger.info("[IntentRouter] Derivando a chat con contexto histórico...")
+                prompt_with_ctx = memory.inject_context(JARVIS_SYSTEM_PROMPT)
+                jarvis_response = brain.generate_response(user_transcript, system_prompt=prompt_with_ctx)
+            else:
+                jarvis_response = chat_text
+
+        if jarvis_response:
+            memory.add_message(role="assistant", content=jarvis_response)
+
+        return jarvis_response or "A su disposición, señor."
 
     try:
-        # =========================================================================
-        # BUCLE PRINCIPAL DE DOS ESTADOS
-        # =========================================================================
+        # =====================================================================
+        # BUCLE PRINCIPAL DE DOS NIVELES
+        # =====================================================================
         while True:
-            # Verificamos si el usuario solicitó la salida desde la bandeja del sistema
             if tray.is_exit_requested:
-                print("\n[+] Cierre ordenado solicitado desde System Tray. Finalizando...")
-                farewell_msg = "Entendido señor. Apagando sistemas desde la bandeja del sistema."
-                print(f"JARVIS: \"{farewell_msg}\"")
+                print("\n[+] Cierre ordenado solicitado desde la bandeja del sistema.")
                 tray.set_state("hablando")
-                pending_speech = tts.speak(farewell_msg)
-                if pending_speech is not None:
-                    pending_speech.result()
-                    pending_speech = None
+                speak_blocking("Entendido señor. Apagando sistemas desde la bandeja del sistema.")
                 break
 
-            # ---------------------------------------------------------------------
-            # ESTADO 1 (Pasivo / Reposo):
-            # Escucha en CPU con consumo ultra bajo de recursos esperando "Hey Jarvis".
-            # ---------------------------------------------------------------------
-            # Esperamos que cualquier locución previa termine antes de abrir el detector
-            if pending_speech is not None:
-                pending_speech.result()
-                pending_speech = None
-
-            # REGLA DE ORO ANTI-ECO: Esperar a que el sintetizador finalice completamente
+            # -----------------------------------------------------------------
+            # NIVEL 1: Modo Reposo (Escucha ultra-ligera en CPU para Wake Word)
+            # -----------------------------------------------------------------
             while tts.is_speaking:
                 time.sleep(0.05)
+            time.sleep(0.35)
 
-            # Damos 0.5s para que el hardware y el sistema operativo vacíen el búfer de salida
-            time.sleep(0.5)
-
-            # Notificamos al icono del System Tray el retorno al estado reposo (azul)
             tray.set_state("reposo")
+            print("-" * 55)
+            print("[Modo Reposo] En espera pasiva. Diga 'Hey Jarvis' para activar.")
 
-            print("-" * 50)
-            print("[Modo Reposo] Esperando palabra de activación... Diga 'Hey Jarvis' para activar.")
-
-            # Escucha continua en bloques de 80ms hasta detectar la palabra clave
             is_wake_detected = wake_detector.listen_for_wake_word()
             if not is_wake_detected:
-                # Si la escucha terminó sin detección (ej. stop o timeout), continuamos en reposo
                 continue
 
-            # ---------------------------------------------------------------------
-            # TRANSICIÓN AL ACTIVARSE:
-            # Pitido suave de confirmación (sin locución repetitiva) + escucha inmediata.
-            # ---------------------------------------------------------------------
-            logger.info("[+] Wake Word detectada. Activando J.A.R.V.I.S...")
-            # Emitimos un pitido breve de 120 ms a 900 Hz como acuse de recibo no hablado.
-            # Usar winsound evita activar el motor TTS y arranca el micrófono mucho más rápido.
-            try:
-                import winsound
-                winsound.Beep(900, 120)
-            except Exception:
-                pass  # En entornos sin audio o no-Windows se omite silenciosamente
-
+            # -----------------------------------------------------------------
+            # TRANSICIÓN DE DESPERTAR: Sonido futurista HUD (sin decir '¿Sí, señor?')
+            # -----------------------------------------------------------------
+            logger.info("[+] Wake Word detectada. Activando sesión continua...")
+            sfx.wake()
             tray.set_state("escuchando")
+            print("[Sesión Activa] J.A.R.V.I.S. en línea y escuchando continuamente...")
 
-            # ---------------------------------------------------------------------
-            # ESTADO 2 (Activo / Procesamiento):
-            # Grabamos la petición -> Transcribimos -> IntentRouter / LLM -> TTS
-            # ---------------------------------------------------------------------
-            audio_path = None  # Ruta del archivo temporal grabado
+            # -----------------------------------------------------------------
+            # NIVEL 2: Bucle de Sesión Activa Continua (sin límite de 3 mensajes)
+            # -----------------------------------------------------------------
+            session = ActiveSession(
+                listen=listen_step,
+                respond=respond_step,
+                speak=speak_blocking,
+                sfx=sfx,
+                set_state=tray.set_state,
+                should_abort=lambda: tray.is_exit_requested,
+                post_speech_pause=SESSION_POST_SPEECH_PAUSE,
+            )
+            session_result = session.run()
 
-            try:
-                print("[Micro Activo] Hable ahora, señor...")
-                tray.set_state("escuchando")
-                # REGLA DE ORO: Validar que no haya habla activa antes de abrir el stream del micrófono
-                while tts.is_speaking:
-                    time.sleep(0.05)
-
-                # El grabador calibra el ambiente en 400ms y espera hasta 6s inicio y 2.5s de silencio
-                audio_path = recorder.record_command(initial_timeout=6.0, silence_duration=2.5)
-
-                # Si no hay ruta utilizable, evitamos llamar a Whisper con una grabación inexistente.
-                if not audio_path or not os.path.isfile(audio_path):
-                    print("[!] No se detectó voz; vuelvo al modo reposo.")
-                    continue
-                
-                print("[Transcribiendo audio con Whisper GPU...]")
-                tray.set_state("procesando")
-                # b) Transcripción en GPU con faster-whisper
-                user_transcript = stt.transcribe(audio_path)
-                
-                # c) Filtro de ruido o audio sin contenido verbal
-                meaningful_characters = sum(character.isalnum() for character in user_transcript)
-                if not user_transcript or not user_transcript.strip() or meaningful_characters < 2:
-                    print("[!] No se detectó una orden comprensible. Volviendo a modo reposo...")
-                    continue
-
-                print(f"Usuario: \"{user_transcript}\"")
-                
-                # Normalizamos el texto (minúsculas, sin tildes, sin puntuación)
-                norm_text = normalize_text(user_transcript)
-
-                # d) Detección de comandos de apagado / salida
-                is_exit_requested = any(keyword in norm_text for keyword in exit_keywords)
-                if is_exit_requested:
-                    farewell_msg = "Entendido señor. Apagando sistemas. Hasta luego."
-                    print(f"JARVIS: \"{farewell_msg}\"")
-                    pending_speech = tts.speak(farewell_msg)
-                    if pending_speech is not None:
-                        pending_speech.result()
-                        pending_speech = None
-                    break
-
-                # e) Detección de comando para olvidar/reiniciar la memoria conversacional
-                clear_memory_triggers = ["olvida lo que hablamos", "reiniciar contexto", "olvidar contexto", "olvida todo", "borrar memoria"]
-                if any(trigger in norm_text for trigger in clear_memory_triggers):
-                    memory.clear()
-                    print(f"[DEBUG Memoria] Turnos almacenados: {len(memory.get_messages_list())}")
-                    reset_msg = "Entendido señor. He reiniciado la memoria de nuestra conversación."
-                    print(f"JARVIS: \"{reset_msg}\"")
-                    pending_speech = tts.speak(reset_msg)
-                    continue
-
-                # Registramos el mensaje del usuario en la memoria antes del análisis
-                memory.add_message(role="user", content=user_transcript)
-
-                # f) Clasificación de Intenciones y Function Calling con IntentRouter
-                logger.info("[Analizando intención con IntentRouter...]")
-                intent_decision = intent_router.analyze_intent(user_transcript)
-                action = intent_decision.get("action", "chat")
-                
-                jarvis_response = None
-
-                # Si es llamada a herramienta, la ejecutamos mediante SkillManager
-                if action == "call_tool":
-                    tool_name = intent_decision.get("tool_name", "")
-                    parameters = intent_decision.get("parameters", {})
-                    logger.info(f"[Tool Call Detectado] Ejecutando: '{tool_name}' con parámetros: {parameters}")
-                    jarvis_response = skill_manager.execute_skill(tool_name, **parameters)
-
-                # Si es conversación o chat, procesamos la respuesta generada
-                else:
-                    chat_text = intent_decision.get("response", "")
-                    
-                    # Si el router no generó respuesta directa o devolvió la misma entrada, consultamos al cerebro LLM
-                    if not chat_text or chat_text == user_transcript:
-                        logger.info("[IntentRouter derivó a chat directo. Consultando cerebro LLM con contexto...]")
-                        system_instruction = (
-                            "Eres J.A.R.V.I.S., un asistente virtual. Recuerda los datos personales y preferencias que el usuario te comparta en la conversación. Si el usuario te pregunta por sus gustos o datos previos, responde usando la información guardada en el historial reciente."
-                        )
-                        system_prompt_with_ctx = memory.inject_context(system_instruction)
-                        jarvis_response = brain.generate_response(
-                            user_transcript,
-                            system_prompt=system_prompt_with_ctx,
-                        )
-                    else:
-                        jarvis_response = chat_text
-
-                # Registramos la respuesta final del asistente en la memoria
-                if jarvis_response:
-                    memory.add_message(role="assistant", content=jarvis_response)
-                    logger.info(f"[DEBUG Memoria] Turnos almacenados: {len(memory.get_messages_list())}")
-
-                logger.info(f"JARVIS: \"{jarvis_response}\"")
-                
-                # REPRODUCCIÓN POR VOZ (TTS) GARANTIZADA DE FORMA BLOQUEANTE
-                # Asegura al 100% que J.A.R.V.I.S. hable todas sus respuestas antes de continuar
-                if jarvis_response and jarvis_response.strip():
-                    tray.set_state("hablando")
-                    pending_speech = tts.speak(jarvis_response)
-                    if pending_speech is not None:
-                        pending_speech.result()
-                        pending_speech = None
-
-                # REGLA DE ORO ANTI-ECO: Esperar a que el habla cese y purgar búfer del hardware
-                while tts.is_speaking:
-                    time.sleep(0.05)
-                time.sleep(0.5)
-
-            except Exception as iteration_error:
-                print(f"[X] Error en el procesamiento del comando: {iteration_error}")
-                
-            finally:
-                # Eliminación segura del archivo temporal de audio en Windows
-                if audio_path and os.path.exists(audio_path):
-                    try:
-                        os.remove(audio_path)
-                    except Exception as cleanup_error:
-                        print(f"[!] No se pudo eliminar el archivo temporal: {cleanup_error}")
+            if session_result == SessionEnd.EXIT:
+                logger.info("[Sesión] Salida solicitada por voz.")
+                break
+            elif session_result == SessionEnd.ABORT:
+                logger.info("[Sesión] Cierre abortado por la bandeja del sistema.")
+                break
+            else:
+                logger.info(f"[Sesión] Fin de sesión continua ({session_result.value}). Volviendo a Modo Reposo.")
 
     except KeyboardInterrupt:
         print("\n\n[i] Interrupción de teclado detectada (Ctrl + C).")
         try:
             wake_detector.stop()
             tray.set_state("hablando")
-            pending_farewell = tts.speak("Apagando sistemas por comando de usuario. Que tenga un excelente día.")
-            if pending_farewell is not None:
-                pending_farewell.result()
+            speak_blocking("Apagando sistemas por comando de usuario. Que tenga un buen día, señor.")
         except Exception:
             pass
 
@@ -310,6 +257,7 @@ def main():
             pass
 
     print("\n=== Sesión de J.A.R.V.I.S. finalizada correctamente ===")
+
 
 if __name__ == "__main__":
     main()

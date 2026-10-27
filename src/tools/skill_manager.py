@@ -1,6 +1,16 @@
 import traceback
 from skills.base_skill import BaseSkill
-from skills.system_skills import TimeSkill, AppLauncherSkill, SystemInfoSkill, WebSearchSkill
+from skills.system_skills import (
+    TimeSkill,
+    AppLauncherSkill,
+    SystemInfoSkill,
+    WebSearchSkill,
+    StarkProtocolSkill,
+    VolumeControlSkill,
+    MediaControlSkill,
+    ClipboardSkill,
+    SystemPowerSkill,
+)
 
 class SkillManager:
     """
@@ -35,12 +45,19 @@ class SkillManager:
 
     def _register_default_skills(self) -> None:
         """
-        Instancia y registra las habilidades nativas del sistema (TimeSkill, AppLauncherSkill, SystemInfoSkill, WebSearchSkill).
+        Instancia y registra las habilidades nativas del sistema (básicas y avanzadas de Windows).
         """
         self.register_skill(TimeSkill())
         self.register_skill(AppLauncherSkill())
         self.register_skill(SystemInfoSkill())
         self.register_skill(WebSearchSkill())
+        # Protocolos compuestos de Stark Industries ('activate_protocol'):
+        # Permite ejecutar flujos multi-paso como desarrollo, diagnóstico de hardware y modo sigilo.
+        self.register_skill(StarkProtocolSkill())
+        self.register_skill(VolumeControlSkill())
+        self.register_skill(MediaControlSkill())
+        self.register_skill(ClipboardSkill())
+        self.register_skill(SystemPowerSkill())
 
     def get_skills_manifest(self) -> list[dict]:
         """

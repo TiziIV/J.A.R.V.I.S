@@ -3,7 +3,39 @@
 import json
 import re
 from typing import Any, Mapping, Protocol, Sequence
+from config.prompts import JARVIS_SYSTEM_PROMPT
 from src.brain.memory import ConversationMemory
+
+# Mensajes degradados que devuelven OllamaBrain/GeminiBrain cuando no pueden responder.
+# ¿Por qué se filtran? Si el modelo local Ollama falla por falta de VRAM o timeout,
+# devuelve un mensaje de error amigable. El router debe detectar que fue un fallo técnico
+# para activar el fallback a Gemini, en lugar de creer que el LLM quiso hablarle de eso al usuario.
+# Se comparan solo contra texto plano (sin JSON) para no confundir una respuesta legítima.
+_PROVIDER_ERROR_MARKERS: tuple[str, ...] = (
+    "no responde",
+    "no está disponible en este momento",
+    "no pude conectar con gemini",
+    "gemini no está configurado",
+    "gemini devolvió una respuesta vacía",
+    "no aceptaron la solicitud",
+    "no pudo generar una respuesta",
+)
+
+
+def is_provider_error(raw_response: object) -> bool:
+    """
+    Determina si la salida es vacía o coincide con un mensaje de fallo de un proveedor.
+    
+    Si retorna True, el IntentRouter sabe que el LLM primario falló y procede a invocar
+    inmediatamente al LLM de respaldo (Gemini).
+    """
+    if not isinstance(raw_response, str) or not raw_response.strip():
+        return True
+    # Si contiene una llave '{', es un intento de JSON estructurado, no un error genérico del cliente
+    if "{" in raw_response:
+        return False
+    lowered = raw_response.lower()
+    return any(marker in lowered for marker in _PROVIDER_ERROR_MARKERS)
 
 
 class LanguageModel(Protocol):
@@ -77,7 +109,7 @@ class IntentRouter:
         try:
             # Separamos las instrucciones del texto para reducir la posibilidad de mezclar roles.
             raw_response = self.llm.generate_response(user_text, system_prompt=system_prompt)
-            if not raw_response or "no responde" in raw_response.lower() or "error" in raw_response.lower():
+            if is_provider_error(raw_response):
                 raise RuntimeError("LLM primario no disponible o devolvió respuesta no válida.")
         except Exception as primary_error:
             if self.fallback_llm is not None:
@@ -95,46 +127,87 @@ class IntentRouter:
             payload = self._parse_json_response(raw_response)
             return self._validate_payload(payload, fallback)
         except Exception as e:
-            # Ante errores de parseo de JSON, devolvemos fallback seguro
+            # El modelo pudo ignorar el formato y contestar en texto plano: lo usamos directamente
+            # para evitar una segunda llamada al LLM (que duplicaría la latencia del turno).
+            plain = self._plain_text_decision(raw_response)
+            if plain is not None:
+                return plain
             print(f"[IntentRouter] Info/Fallback: {e} | Crudo: '{raw_response}'")
             return fallback
 
-    def _build_system_prompt(self) -> str:
-        """Incluye el catálogo como datos y define un contrato de salida cerrado."""
-        manifest = json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))
+    def _plain_text_decision(self, raw_response: object) -> dict | None:
+        """
+        Recuperador inteligente cuando el LLM responde en lenguaje natural directo sin envolver en JSON.
         
+        ¿Por qué existe este método?
+        Modelos ligeros locales (como Llama 3 o Qwen con bajo num_predict) a veces devuelven
+        directamente la respuesta hablada (ej. "Enseguida abro el navegador, señor.") ignorando el JSON.
+        En lugar de lanzar un error y hacer una SEGUNDA llamada lenta al LLM (que duplicaría la latencia
+        y arruinaría la fluidez por voz), si detectamos texto inteligible lo aceptamos como chat directo.
+        Si coincide con el nombre exacto de una herramienta sin parámetros obligatorios, la dispara.
+        """
+        if not isinstance(raw_response, str) or "{" in raw_response or is_provider_error(raw_response):
+            return None
+        text = re.sub(r"```[\s\S]*?```|`", "", raw_response).strip().strip('"').strip()
+        if sum(c.isalnum() for c in text) < 2:
+            return None
+        tool = self._tools_by_name.get(text)
+        if tool is not None:
+            declared = tool["parameters"]
+            if not self._get_required_parameter_names(declared, self._get_parameter_names(declared)):
+                return {"action": "call_tool", "tool_name": text, "parameters": {}}
+            return None
+        return {"action": "chat", "response": text}
+
+    def _build_system_prompt(self) -> str:
+        """Personalidad compartida + catálogo como datos + contrato de salida JSON cerrado."""
+        manifest = json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))
+
         # Inyectamos el historial conversacional reciente si la memoria está presente
         history_context = ""
         if self.memory is not None:
             history_text = self.memory.get_context_prompt()
             # Si hay mensajes previos en la memoria, los agregamos como contexto para el modelo
             if history_text and "sin mensajes" not in history_text:
-                history_context = f"\n\n{history_text}\nUsa este historial previo para resolver referencias contextuales y responder con los datos y preferencias del usuario."
+                history_context = f"\n\n{history_text}\nUsa este historial para resolver referencias y responder con los datos y preferencias del usuario."
+
+        protocol_hint = ""
+        if "activate_protocol" in self._tools_by_name:
+            protocol_hint = (
+                "- Si el usuario pide un protocolo o modo (trabajo, programación, diagnóstico, reporte de estado, "
+                "silencio, sigilo), usa 'activate_protocol' con 'protocol' ('trabajo', 'diagnostico' o 'silencio').\n"
+            )
 
         return (
-            "Eres J.A.R.V.I.S., un asistente virtual. Recuerda los datos personales y preferencias que el usuario te comparta en la conversación (como su nombre, su color favorito, etc.). Si el usuario te pregunta por sus gustos o datos previos, responde usando la información guardada en el historial reciente.\n\n"
-            "REGLA DE VOZ OBLIGATORIA: Tus respuestas serán leídas en voz alta. Responde SIEMPRE en 1 o 2 oraciones breves como máximo (menos de 200 caracteres). PROHIBIDO usar listas numeradas, viñetas, asteriscos (**), comillas invertidas (`) o bloques de código.\n\n"
-            "Devuelve ÚNICAMENTE un objeto JSON válido sin texto adicional ni markdown.\n"
+            f"{JARVIS_SYSTEM_PROMPT}\n\n"
+            "FORMATO DE SALIDA: devuelve ÚNICAMENTE un objeto JSON válido en una sola línea, sin texto adicional ni Markdown. "
+            "El campo 'response' contiene exactamente lo que dirás en voz alta.\n"
             "INSTRUCCIONES CLAVE:\n"
             "- Si el usuario pide la hora o fecha actual, usa SIEMPRE 'system_time'.\n"
             "- Si el usuario pide abrir o iniciar una app (calculadora, bloc de notas, etc.), usa SIEMPRE 'app_launcher' con 'app_name'.\n"
             "- Si el usuario pregunta por hardware, CPU o memoria RAM, usa SIEMPRE 'system_info'.\n"
             "- Si el usuario pide buscar en internet o YouTube, usa SIEMPRE 'web_search' con 'query'.\n"
-            "- Si es charla general, saludo o preguntas sobre el usuario o la conversación, responde en formato chat usando la información guardada en el historial reciente.\n\n"
+            "- Si el usuario pide subir, bajar o silenciar el volumen, usa 'volume_control' con 'action'.\n"
+            "- Si el usuario pide pausar, reproducir, siguiente o anterior canción, usa 'media_control' con 'action'.\n"
+            "- Si el usuario pide leer o copiar en el portapapeles, usa 'clipboard_manager' con 'action' (y 'text' si copia).\n"
+            "- Si el usuario pide bloquear la pantalla o cancelar apagado, usa 'system_power' con 'action'.\n"
+            f"{protocol_hint}"
+            "- Si es charla general, saludo o preguntas sobre el usuario o la conversación, responde en formato chat.\n\n"
             "EJEMPLOS DE FORMATO OBLIGATORIO:\n"
             'Herramienta con argumento: {"action":"call_tool","tool_name":"web_search","parameters":{"query":"música clásica"}}\n'
             'Herramienta de apertura: {"action":"call_tool","tool_name":"app_launcher","parameters":{"app_name":"calculadora"}}\n'
             'Herramienta sin argumento: {"action":"call_tool","tool_name":"system_time","parameters":{}}\n'
-            'Chat general: {"action":"chat","response":"Hola señor, ¿en qué puedo ayudarle?"}\n\n'
+            'Chat general: {"action":"chat","response":"En línea, señor. ¿Qué necesitamos?"}\n\n'
             f"Catálogo de herramientas disponibles: {manifest}"
             f"{history_context}"
         )
 
     @staticmethod
     def _parse_json_response(raw_response: str) -> dict[str, Any]:
-        """Quita fences y busca objetos JSON completos aunque haya texto alrededor."""
+        """Quita fences, busca objetos JSON completos y repara salidas truncadas."""
         if not isinstance(raw_response, str):
             raise ValueError("La respuesta del modelo no es texto.")
+        raw_response = raw_response.lstrip("\ufeff")
 
         # Algunos modelos envuelven el JSON en un bloque Markdown pese a la instrucción.
         fenced_blocks = re.findall(
@@ -151,7 +224,97 @@ class IntentRouter:
                 if isinstance(parsed, dict):
                     return parsed
 
+        # Reparador 1: cerramos comillas/llaves pendientes de un objeto cortado por num_predict.
+        repaired = IntentRouter._repair_truncated_json(raw_response)
+        if repaired is not None:
+            return repaired
+
+        # Reparador 2: extraemos el texto de 'response' de un chat truncado aunque el resto esté roto.
+        truncated_chat = re.search(
+            r'\{\s*"action"\s*:\s*"chat"\s*,\s*"response"\s*:\s*"(.+)',
+            raw_response, flags=re.DOTALL,
+        )
+        if truncated_chat:
+            recovered = IntentRouter._read_json_string_prefix(truncated_chat.group(1))
+            if recovered:
+                return {"action": "chat", "response": recovered}
+
         raise ValueError("No se encontró un objeto JSON válido en la respuesta.")
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> dict[str, Any] | None:
+        """
+        Reparador algorítmico de JSON cortado prematuramente por límite de tokens (num_predict).
+        
+        ¿Cómo funciona?
+        1. Localiza la primera llave de apertura '{'.
+        2. Recorre carácter por carácter distinguiendo si está dentro de una cadena literal o no
+           (respetando caracteres de escape '\\"').
+        3. Mantiene una pila (stack) de llaves y corchetes abiertos pendientes de cierre.
+        4. Si el texto se cortó dentro de una cadena, le añade una comilla de cierre '"'.
+        5. Cierra todas las llaves y corchetes pendientes en orden inverso al de la pila (LIFO).
+        6. Reintenta 'json.loads()'. Si se recupera un diccionario válido, evita un descarte innecesario.
+        """
+        start = text.find("{")
+        if start == -1:
+            return None
+        fragment = text[start:]
+        stack: list[str] = []
+        inside_string = False
+        escaped = False
+        for character in fragment:
+            if inside_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    inside_string = False
+                continue
+            if character == '"':
+                inside_string = True
+            elif character in "{[":
+                stack.append("}" if character == "{" else "]")
+            elif character in "}]" and stack:
+                stack.pop()
+        if not stack:
+            return None  # Estaba balanceado: ya se intentó (y falló) el parseo normal.
+        if escaped:
+            fragment = fragment[:-1]
+        if inside_string:
+            fragment += '"'
+        fragment = fragment.rstrip().rstrip(",")
+        try:
+            parsed = json.loads(
+                fragment + "".join(reversed(stack)),
+                object_pairs_hook=IntentRouter._reject_duplicate_keys,
+            )
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _read_json_string_prefix(text: str) -> str:
+        """
+        Lector de cadenas JSON con escape seguro para extracciones directas de regex.
+        
+        Si el LLM generó '{"action":"chat","response":"Hola señor\\n¿Cómo está?',
+        este método procesa los caracteres escapados (saltos de línea '\\n', comillas '\\"')
+        y extrae el contenido lingüístico sin romper el intérprete.
+        """
+        chars: list[str] = []
+        escaped = False
+        for character in text:
+            if escaped:
+                chars.append({"n": " ", "t": " ", "r": "", '"': '"', "\\": "\\", "/": "/"}.get(character, character))
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                break
+            else:
+                chars.append(character)
+        return "".join(chars).strip()
 
     @staticmethod
     def _extract_json_objects(text: str) -> list[str]:
@@ -273,7 +436,7 @@ def generate_with_fallback(
     """
     try:
         response = primary_llm.generate_response(prompt, system_prompt=system_prompt)
-        if not response or "no responde" in response.lower() or "error" in response.lower():
+        if is_provider_error(response):
             raise RuntimeError("LLM primario no disponible o devolvió mensaje de error.")
         return response
     except Exception as primary_error:

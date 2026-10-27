@@ -6,7 +6,7 @@ class BaseSkill(ABC):
     Cada skill representa una capacidad o herramienta ejecutable (ej. consultar hora, abrir apps).
     """
     
-    def __init__(self, name: str, description: str, parameters: dict = None):
+    def __init__(self, name: str, description: str, parameters: dict | None = None) -> None:
         """
         Inicializa los metadatos descriptivos de la skill.
         

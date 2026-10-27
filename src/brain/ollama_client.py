@@ -65,7 +65,7 @@ class OllamaBrain:
                 stream=True,
                 options={
                     "temperature": 0.3,
-                    "num_predict": 250,  # Suficiente para JSON completo del IntentRouter y respuestas conversacionales
+                    "num_predict": 300,  # Suficiente para JSON completo del IntentRouter y respuestas conversacionales
                 },
             )
 

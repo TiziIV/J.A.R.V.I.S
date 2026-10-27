@@ -30,11 +30,13 @@ class WakeWordDetector:
         if not 0.0 <= threshold <= 1.0:
             raise ValueError("threshold debe estar entre 0.0 y 1.0")
 
-        self.threshold = threshold
-        self._stop_event = threading.Event()
-        self._stream_lock = threading.Lock()
-        self._listen_lock = threading.Lock()
+        self.threshold: float = threshold
+        self._stop_event: threading.Event = threading.Event()
+        self._stream_lock: threading.Lock = threading.Lock()
+        self._listen_lock: threading.Lock = threading.Lock()
         self._stream: Any | None = None
+        self._model: _WakeWordModel
+        self._wake_word_name: str
         self._model, self._wake_word_name = self._load_model()
 
     @classmethod

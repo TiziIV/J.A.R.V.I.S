@@ -62,6 +62,86 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             },
             "required": ["query"]
         }
+    },
+    {
+        "name": "volume_control",
+        "description": "Controla el volumen del sistema: subir, bajar o silenciar el audio maestro de Windows.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Acción a realizar: 'subir', 'bajar' o 'silenciar'."
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "media_control",
+        "description": "Controla la reproducción multimedia: pausar, reproducir, siguiente o anterior canción en Windows.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Acción multimedia: 'pausar', 'reproducir', 'siguiente' o 'anterior'."
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "clipboard_manager",
+        "description": "Lee el contenido del portapapeles o copia un texto al portapapeles de Windows.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Acción: 'leer' o 'copiar'."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Texto a copiar al portapapeles (solo para action 'copiar')."
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    # --------------------------------------------------------------------------
+    # PROTOCOLOS COMPUESTOS STARK INDUSTRIES (Fase MCU / Stark)
+    # Justificación junior: Permite al usuario disparar secuencias complejas de acciones
+    # con una sola frase ("Protocolo de trabajo", "Diagnóstico de sistemas", "Protocolo silencio").
+    # El LLM clasifica la intención hacia 'activate_protocol' pasando el tipo como parámetro.
+    # --------------------------------------------------------------------------
+    {
+        "name": "activate_protocol",
+        "description": "Ejecuta protocolos compuestos de Stark Industries: 'trabajo' (modo programación y desarrollo), 'diagnostico' (reporte de estado de GPU, Ollama y hardware), o 'silencio' (modo sigilo y enmudecer audio).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "protocol": {
+                    "type": "string",
+                    "description": "Nombre o tipo de protocolo a ejecutar: 'trabajo', 'diagnostico' o 'silencio'."
+                }
+            },
+            "required": ["protocol"]
+        }
+    },
+    {
+        "name": "system_power",
+        "description": "Bloquea la pantalla de Windows o cancela un apagado programado del sistema.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Acción: 'bloquear' para bloquear pantalla o 'cancelar_apagado' para abortar shutdown."
+                }
+            },
+            "required": ["action"]
+        }
     }
 ]
 

@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -37,6 +38,12 @@ class TextToSpeech:
         self.is_speaking: bool = False
         # Circuit Breaker: si edge-tts falla una vez (403/red), se conmuta permanentemente a System.Speech
         self.edge_tts_disabled: bool = False
+        # Proceso actual de PowerShell para barge-in (interrupción inmediata de voz)
+        self.current_process: Optional[subprocess.Popen] = None
+        # Lock para acceso seguro al proceso desde múltiples hilos
+        self._process_lock: threading.Lock = threading.Lock()
+        # Generación de locución: stop() la incrementa y las tareas en curso/encoladas abortan limpio.
+        self._generation: int = 0
 
         # Ejecutor de un solo trabajador para secuenciar la reproducción sin trabar el hilo principal
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jarvis-tts")
@@ -101,13 +108,15 @@ try {{
                 temp_file_path = temp_file.name
 
             cmd = self._build_powershell_command(temp_file_path)
+            if self._is_cancelled():
+                return
             subprocess.run(
                 cmd,
-                check=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                check=True,
             )
         except Exception as error:
             print(f"[TTS Fallback Error] Falló locución en PowerShell: {error}")
@@ -159,6 +168,9 @@ try {{
             # Ejecutamos la tarea asíncrona de edge-tts dentro del hilo trabajador
             asyncio.run(self._synthesize_edge_tts(chunk, temp_mp3_path))
 
+            # Si hubo barge-in mientras se sintetizaba, no reproducimos el audio ya obsoleto
+            if self._is_cancelled():
+                return
             # Reproducimos el archivo generado
             self._play_audio_file(temp_mp3_path)
         except Exception:
@@ -175,47 +187,115 @@ try {{
                     except Exception:
                         time.sleep(0.1)
 
-    def _process_stream(self, text_or_stream: Union[str, Iterable[str]]) -> None:
+    def _is_cancelled(self) -> bool:
+        """True si stop() invalidó la locución que se está procesando."""
+        current = getattr(self, "_current_generation", None)
+        return current is not None and current != self._generation
+
+    def _process_stream(
+        self, text_or_stream: Union[str, Iterable[str]], generation: Optional[int] = None
+    ) -> None:
         """
         Bucle procesador de locución. Activa is_speaking = True al inicio
-        y lo apaga al finalizar toda la cola de fragmentos.
+        y lo apaga al finalizar toda la cola de fragmentos. Cada fragmento se limpia de
+        Markdown (también en streaming) y se aborta si stop() cambió la generación.
         """
+        self._current_generation = self._generation if generation is None else generation
         self.is_speaking = True
         try:
-            if isinstance(text_or_stream, str):
-                clean = text_or_stream.strip()
+            chunks = [text_or_stream] if isinstance(text_or_stream, str) else text_or_stream
+            for chunk in chunks:
+                if self._is_cancelled():
+                    break
+                if not isinstance(chunk, str) or not chunk.strip():
+                    continue
+                clean = self._clean_for_voice(chunk, max_chars=None)
                 if clean:
                     self._speak_chunk(clean)
-            else:
-                for chunk in text_or_stream:
-                    if chunk and chunk.strip():
-                        self._speak_chunk(chunk.strip())
         finally:
+            self._current_generation = None
             self.is_speaking = False
 
     @staticmethod
-    def _clean_for_voice(text: str) -> str:
+    def _clean_for_voice(text: str, max_chars: Optional[int] = 300) -> str:
         """
-        Limpia el texto antes de enviarlo al motor de síntesis de voz.
-
-        1. Elimina caracteres de formato Markdown (*, #, `, _) que el TTS leería literalmente.
-        2. Trunca el texto a 300 caracteres, cortando en el punto seguido más cercano
-           para no romper una oración a la mitad.
+        Limpia el texto de cualquier formato Markdown y caracteres especiales antes del TTS.
+        
+        ¿Por qué es crucial esta limpieza?
+        Los motores de síntesis de voz (edge-tts y System.Speech) intentan leer fonéticamente
+        cualquier símbolo. Si el LLM incluye '**Hola**' o '`comando`', el sintetizador diría
+        en voz alta: "asterisco asterisco Hola asterisco asterisco backtick comando backtick".
+        Este pipeline elimina viñetas, bloques de código, emojis y símbolos tipográficos,
+        dejando únicamente texto fluido y natural en español hablado.
 
         Args:
             text (str): Texto crudo recibido del LLM.
+            max_chars (Optional[int]): Límite máximo de caracteres (300 por defecto para voz rápida).
 
         Returns:
-            str: Texto limpio y acotado, listo para sintetizar.
+            str: Texto limpio y acotado, listo para sintetizar por voz.
         """
-        # Quitamos símbolos de Markdown: asteriscos, almohadillas, acentos graves, guiones bajos
-        text = re.sub(r"[*#`_]", "", text)
-        # Si el texto supera los 300 caracteres, buscamos el último punto antes del límite
-        if len(text) > 300:
-            cut = text[:300].rfind(".")
-            # Si encontramos un punto, cortamos ahí (incluido); si no, cortamos en bruto
-            text = text[: cut + 1] if cut > 0 else text[:300]
-        return text.strip()
+        # Eliminar bloques de código completos (```...```)
+        text = re.sub(r"```[\s\S]*?```", "", text)
+        # Código inline (`dir /w`): conservamos el texto y quitamos las comillas invertidas
+        text = re.sub(r"`([^`]+)`", r"\1", text)
+        # Enlaces Markdown [texto](url) -> conservamos solo el texto visible
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        # Eliminar encabezados Markdown (## Título) y citas (> texto)
+        text = re.sub(r"^\s*(#{1,6}|>)\s*", "", text, flags=re.MULTILINE)
+        # Eliminar listas numeradas al inicio de línea (1. 2. 3.)
+        text = re.sub(r"^\s*\d+[\.\)]\s+", "", text, flags=re.MULTILINE)
+        # Eliminar viñetas Markdown (- item, * item, • item) al inicio de línea
+        text = re.sub(r"^\s*[\-\*\+•]\s+", "", text, flags=re.MULTILINE)
+        # Eliminar caracteres decorativos sueltos de Markdown (**, *, `, #, ~); '_' pasa a espacio
+        text = re.sub(r"[*#`~]", "", text)
+        text = text.replace("_", " ")
+        # Eliminar emojis/pictogramas y caracteres de control que el sintetizador leería mal
+        text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]", "", text)
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text)
+        # Colapsar saltos de línea múltiples en un espacio
+        text = re.sub(r"\n+", " ", text)
+        # Colapsar espacios múltiples en uno solo
+        text = re.sub(r"\s{2,}", " ", text)
+        text = text.strip()
+
+        # Si se especifica un límite máximo de caracteres y el texto lo supera
+        if max_chars is not None and len(text) > max_chars:
+            cut = text[:max_chars].rfind(".")
+            text = text[: cut + 1] if cut > 0 else text[:max_chars]
+            text = text.strip()
+
+        return text
+
+    # Alias para compatibilidad hacia atrás
+    _sanitize_for_speech = _clean_for_voice
+
+    def stop(self) -> None:
+        """
+        Interrumpe inmediatamente la locución en curso (barge-in).
+        Mata el proceso de PowerShell activo y detiene pygame si está reproduciendo.
+        """
+        # Invalidamos la generación actual: el fragmento en curso y los encolados se descartan
+        self._generation += 1
+        # Matar proceso de PowerShell si existe
+        with self._process_lock:
+            if self.current_process is not None:
+                try:
+                    self.current_process.jarvis_stopped = True
+                    self.current_process.terminate()
+                    self.current_process = None
+                    print("[TTS] Locución interrumpida (barge-in).")
+                except Exception as e:
+                    print(f"[TTS] Error al interrumpir proceso: {e}")
+        # Detener reproducción de pygame si está activa
+        try:
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+        except Exception:
+            pass
+        # Forzar bandera de estado
+        self.is_speaking = False
 
     def speak(self, text_or_stream: Union[str, Iterable[str]]) -> Optional[Future[None]]:
         """
@@ -231,16 +311,16 @@ try {{
             if not text_or_stream or not text_or_stream.strip():
                 print("Texto vacío, omitiendo síntesis de voz.")
                 return None
-            # Aplicamos limpieza de Markdown y truncado antes de enviar al motor de síntesis
-            clean_text = self._clean_for_voice(text_or_stream.strip())
+            # Limpiamos el texto de formato Markdown sin truncar arbitrariamente respuestas largas
+            clean_text = self._clean_for_voice(text_or_stream.strip(), max_chars=None)
             if not clean_text:
                 print("Texto vacío tras limpieza, omitiendo síntesis de voz.")
                 return None
             print(f"[TTS] Reproduciendo locución ({len(clean_text)} caracteres)...")
-            return self._executor.submit(self._process_stream, clean_text)
+            return self._executor.submit(self._process_stream, clean_text, self._generation)
 
         print("[TTS] Iniciando reproducción en streaming de oraciones...")
-        return self._executor.submit(self._process_stream, text_or_stream)
+        return self._executor.submit(self._process_stream, text_or_stream, self._generation)
 
     def close(self) -> None:
         """Espera las tareas pendientes y libera los recursos del reproductor."""

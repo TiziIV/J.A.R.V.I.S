@@ -78,7 +78,7 @@ class GeminiBrain:
         generation_config: types.GenerateContentConfig = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=0.3,
-            max_output_tokens=150,
+            max_output_tokens=300,
         )
         # generate_content es la interfaz oficial síncrona para respuestas de texto.
         response = self.client.models.generate_content(
