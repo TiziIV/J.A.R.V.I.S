@@ -1,5 +1,6 @@
 import traceback
 from skills.base_skill import BaseSkill
+from skills.file_editor_skill import FileEditorSkill
 from skills.system_skills import (
     TimeSkill,
     AppLauncherSkill,
@@ -58,6 +59,8 @@ class SkillManager:
         self.register_skill(MediaControlSkill())
         self.register_skill(ClipboardSkill())
         self.register_skill(SystemPowerSkill())
+        # Editor seguro de archivos con backups SHA-256, validación de rutas y escritura atómica:
+        self.register_skill(FileEditorSkill())
 
     def get_skills_manifest(self) -> list[dict]:
         """

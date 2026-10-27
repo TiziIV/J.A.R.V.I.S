@@ -20,6 +20,7 @@ SKILL_CLASS_BY_TOOL_NAME: dict[str, str] = {
     "media_control": "MediaControlSkill",
     "clipboard_manager": "ClipboardSkill",
     "system_power": "SystemPowerSkill",
+    "file_editor": "FileEditorSkill",
 }
 
 # Mensajes degradados que devuelven los cerebros locales o cloud cuando no pueden responder.
