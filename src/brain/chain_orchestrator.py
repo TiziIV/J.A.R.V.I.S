@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -1645,4 +1646,186 @@ class ChainOrchestrator:
             "execution_id": execution_id,
             "state": record.state.value,
             "restored_files": restored_files,
+        }
+
+    # ------------------------------------------------------------------
+    # Utilidades de extremo a extremo para consola interactiva (/optimizar)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def format_simulation_report(simulation: Mapping[str, Any]) -> str:
+        """
+        Formatea una simulación (`simulate_plan`) en una tabla legible para consola,
+        mostrando cada operación, su valor original y propuesto, nivel de evidencia,
+        riesgo, estrategia de backup y el `approval_hash` requerido.
+        """
+        lines: list[str] = [
+            "======================================================================",
+            f" SIMULACIÓN EN SOLO LECTURA — {simulation.get('application_name', 'Aplicación')}",
+            f" Plan ID: {simulation.get('plan_id')} | Ejecución: {simulation.get('execution_id')}",
+            f" Hash Canónico de Aprobación (SHA-256): {simulation.get('approval_hash')}",
+            "----------------------------------------------------------------------",
+        ]
+        ops = simulation.get("operations_preview") or []
+        for item in ops:
+            sec_str = f"[{item.get('section')}] " if item.get("section") else ""
+            lines.append(
+                f" • [{item.get('operation_id')}] {sec_str}{item.get('key')}: "
+                f"'{item.get('original_value')}' -> '{item.get('proposed_value')}' "
+                f"| Evidencia: {item.get('evidence')} | Riesgo: {item.get('risk_level')}"
+            )
+            lines.append(f"   Motivo: {item.get('justification')}")
+            lines.append(f"   Archivo: {item.get('file_path')}")
+        lines.append("----------------------------------------------------------------------")
+        lines.append(
+            f" Total de operaciones propuestas: {simulation.get('total_operations', len(ops))}"
+        )
+        lines.append(
+            f" Para revertir tras aplicar: /rollback {simulation.get('execution_id')}"
+        )
+        lines.append("======================================================================")
+        return "\n".join(lines)
+
+    def prepare_interactive_optimization(
+        self,
+        app_or_target: str,
+        *,
+        target_filename: Optional[str] = None,
+        file_path: Optional[str | Path] = None,
+        user_goal: Optional[str] = None,
+        provider_callable: Optional[Callable[[str], str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Ejecuta las Fases 1 a 6 en modo de solo lectura para el comando interactivo `/optimizar`:
+        1. Localiza el archivo de configuración dentro de las raíces autorizadas (o valida `file_path`).
+        2. Inspecciona las claves actuales y detecta el hardware local.
+        3. Investiga y clasifica optimizaciones (`VERIFIED` / `PLAUSIBLE`).
+        4. Construye y valida el `ChangePlan` con `PolicyEngine`.
+        5. Ejecuta `simulate_plan(plan)` dejando la ejecución en `AWAITING_APPROVAL`.
+        """
+        clean_target = (app_or_target or "").strip().strip('"').strip("'")
+        goal = (
+            user_goal
+            or f"Optimizar configuración de {clean_target or 'la aplicación'} para GTX 1660 de 6 GB VRAM"
+        )
+        record = self.create_execution()
+        exec_id = record.execution_id
+
+        resolved_file: Optional[Path] = None
+        app_name = clean_target or "Aplicación"
+
+        # 1. Si se proporcionó ruta explícita o el argumento es una ruta existente autorizada
+        candidate_raw = str(file_path).strip() if file_path else clean_target
+        if candidate_raw and (
+            os.path.isabs(candidate_raw) or candidate_raw.endswith((".ini", ".cfg", ".conf", ".json", ".xml", ".txt"))
+        ):
+            try:
+                resolved_file = self.file_editor.validate_authorized_path(
+                    candidate_raw, must_exist=True
+                )
+                app_name = resolved_file.parent.name or resolved_file.stem
+            except Exception:
+                resolved_file = None
+
+        # 2. Si no era una ruta directa, buscamos de forma acotada en las raíces autorizadas
+        if resolved_file is None:
+            candidate_filenames = (
+                [target_filename]
+                if target_filename
+                else [
+                    "GameUserSettings.ini",
+                    "Engine.ini",
+                    "settings.ini",
+                    "settings.json",
+                    "config.ini",
+                    "config.cfg",
+                    "graphics.json",
+                    "settings.xml",
+                ]
+            )
+            for fname in candidate_filenames:
+                if not fname:
+                    continue
+                disc = self.file_editor.discover_config_files_detailed(clean_target, fname)
+                if disc.get("status") == "found" and disc.get("selected_path"):
+                    resolved_file = Path(str(disc["selected_path"]))
+                    break
+                if disc.get("status") == "ambiguous":
+                    self.transition_state(
+                        exec_id,
+                        ChainState.CANCELLED,
+                        reason="Múltiples instalaciones detectadas (ambigüedad).",
+                    )
+                    return {
+                        "status": "ambiguous",
+                        "execution_id": exec_id,
+                        "matches": disc.get("matches", []),
+                        "message": str(disc.get("reason")),
+                    }
+
+        if resolved_file is None:
+            self.transition_state(
+                exec_id,
+                ChainState.CANCELLED,
+                reason="No se localizó un archivo de configuración autorizado.",
+            )
+            return {
+                "status": "not_found",
+                "execution_id": exec_id,
+                "message": (
+                    f"No se encontró un archivo de configuración autorizado para '{clean_target}', señor. "
+                    "Puede indicar el nombre del juego o la ruta absoluta autorizada."
+                ),
+            }
+
+        snap = self.inspect_target_config(resolved_file)
+        hw = self.detect_hardware_context(goal)
+        recs = self.investigate_optimizations(
+            execution_id=exec_id,
+            user_goal=goal,
+            application_name=app_name,
+            config_snapshot=snap,
+            hardware_context=hw,
+            provider_callable=provider_callable,
+        )
+
+        # Verificar si hay al menos una recomendación aplicable cuyo valor difiera del actual
+        existing_keys = snap.get("keys", {})
+        applicable = [
+            r
+            for r in recs
+            if r.evidence in APPROVABLE_EVIDENCE_LEVELS
+            and existing_keys.get((r.section, r.key)) != r.proposed_value
+        ]
+        if not applicable:
+            self.transition_state(
+                exec_id,
+                ChainState.CANCELLED,
+                reason="El archivo ya cuenta con los valores recomendados o no hay cambios verificados.",
+            )
+            return {
+                "status": "no_changes_needed",
+                "execution_id": exec_id,
+                "file_path": str(resolved_file),
+                "message": (
+                    f"El archivo '{resolved_file.name}' ya posee valores óptimos o no requiere cambios "
+                    "adicionales verificados, señor."
+                ),
+            }
+
+        plan = self.build_and_validate_plan(
+            execution_id=exec_id,
+            user_goal=goal,
+            application_name=app_name,
+            config_snapshot=snap,
+            hardware_context=hw,
+            recommendations=recs,
+        )
+        sim = self.simulate_plan(plan)
+        return {
+            "status": "awaiting_approval",
+            "execution_id": exec_id,
+            "plan": plan,
+            "simulation": sim,
+            "formatted_preview": self.format_simulation_report(sim),
         }

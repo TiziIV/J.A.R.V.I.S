@@ -947,6 +947,102 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         self.assertIsNotNone(discovered)
         self.assertEqual(discovered, target_ini.resolve())
 
+    def test_41_interactive_console_optimizar_approve_and_rollback(self) -> None:
+        """41. Verifica el flujo interactivo en consola (/optimizar <juego> -> confirmar 's' -> /rollback <id>)."""
+        from main import run_console_session
+        from src.brain.brain_manager import BrainManager
+
+        game_dir = self.workspace_dir / "StarQuest" / "Config"
+        game_dir.mkdir(parents=True, exist_ok=True)
+        cfg = game_dir / "GameUserSettings.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+        original_sha = compute_sha256_file(cfg)
+
+        bm = BrainManager(initial_mode="AUTO", lazy_init=True)
+        outputs: list[str] = []
+        captured_exec_id: dict[str, str] = {"id": ""}
+
+        # Simulamos entradas de usuario:
+        # 1) /optimizar StarQuest
+        # 2) s (confirmar aplicación)
+        # 3) /rollback <execution_id capturado>
+        # 4) salir
+        step = {"n": 0}
+
+        def fake_input(prompt_str: str) -> str:
+            step["n"] += 1
+            if step["n"] == 1:
+                return "/optimizar StarQuest"
+            if step["n"] == 2:
+                return "s"
+            if step["n"] == 3:
+                for line in outputs:
+                    if "ID de ejecución para rollback:" in line:
+                        captured_exec_id["id"] = (
+                            line.split("ID de ejecución para rollback:")[1]
+                            .strip()
+                            .rstrip(")")
+                        )
+                return f"/rollback {captured_exec_id['id']}"
+            return "salir"
+
+        run_console_session(
+            bm,
+            enable_tts=False,
+            input_fn=fake_input,
+            output_fn=outputs.append,
+            orchestrator=self.orchestrator,
+        )
+
+        joined_out = "\n".join(outputs)
+        self.assertIn("SIMULACIÓN EN SOLO LECTURA", joined_out)
+        self.assertIn("[ChainOrchestrator: COMPLETED]", joined_out)
+        self.assertIn("[ChainOrchestrator: ROLLED_BACK]", joined_out)
+        self.assertEqual(compute_sha256_file(cfg), original_sha)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
+
+    def test_42_interactive_console_optimizar_cancel_and_selective_ids(self) -> None:
+        """42. Verifica la cancelación ('n') sin tocar disco y la aprobación selectiva por ID ('op-001')."""
+        from main import run_console_session
+        from src.brain.brain_manager import BrainManager
+
+        game_dir = self.workspace_dir / "ApexRacer" / "Config"
+        game_dir.mkdir(parents=True, exist_ok=True)
+        cfg = game_dir / "GameUserSettings.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+
+        bm = BrainManager(initial_mode="AUTO", lazy_init=True)
+        outputs: list[str] = []
+
+        # Primero probamos cancelar ('n'), luego aplicar solo 'op-001', luego salir
+        inputs = iter(
+            [
+                "/optimizar ApexRacer",
+                "n",
+                "/optimizar ApexRacer",
+                "op-001",
+                "salir",
+            ]
+        )
+
+        run_console_session(
+            bm,
+            enable_tts=False,
+            input_fn=lambda _: next(inputs),
+            output_fn=outputs.append,
+            orchestrator=self.orchestrator,
+        )
+
+        joined_out = "\n".join(outputs)
+        self.assertIn("Plan cancelado, señor.", joined_out)
+        self.assertIn("[ChainOrchestrator: COMPLETED]", joined_out)
+        updated_text = cfg.read_text(encoding="utf-8")
+        # Solo la primera operación (sg.ShadowQuality=1) se aplicó; la segunda quedó intacta (=3)
+        self.assertIn("sg.ShadowQuality=1", updated_text)
+        self.assertIn("sg.TextureQuality=3", updated_text)
+
 
 if __name__ == "__main__":
     unittest.main()

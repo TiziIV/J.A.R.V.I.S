@@ -103,6 +103,7 @@ def run_console_session(
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
     tts_factory: Optional[Callable[[], Any]] = None,
+    orchestrator: Optional[Any] = None,
 ) -> None:
     """
     Ejecuta el bucle interactivo por consola (modo texto o texto + TTS).
@@ -114,6 +115,21 @@ def run_console_session(
     """
     tts_active: bool = bool(enable_tts)
     tts_engine: Any = None
+    chain_orchestrator: Any = orchestrator
+
+    def _ensure_orchestrator() -> Any:
+        nonlocal chain_orchestrator
+        if chain_orchestrator is None:
+            from src.brain.chain_orchestrator import ChainOrchestrator
+
+            sm = brain_manager.skill_manager
+            fe = sm.skills.get("file_editor") if (sm is not None and hasattr(sm, "skills")) else None
+            chain_orchestrator = ChainOrchestrator(
+                file_editor=fe,
+                brain_manager=brain_manager,
+                skill_manager=sm,
+            )
+        return chain_orchestrator
 
     def _ensure_tts() -> Any:
         nonlocal tts_engine
@@ -135,7 +151,7 @@ def run_console_session(
 
     output_fn("=======================================================")
     output_fn(" J.A.R.V.I.S. — Consola Interactiva Multi-Brain")
-    output_fn(" Comandos: /modo | /voz | /limpiar | salir | exit | chau")
+    output_fn(" Comandos: /modo | /voz | /optimizar <juego> | /rollback <id> | /limpiar | salir")
     output_fn("=======================================================")
 
     try:
@@ -222,6 +238,111 @@ def run_console_session(
                             _speak_blocking(tts_engine, reply)
                         except Exception:
                             pass
+                continue
+
+            # 4b. Comando /optimizar <juego o ruta> -> ejecuta simulación y solicita aprobación explícita
+            if lowered == "/optimizar" or lowered.startswith("/optimizar "):
+                target_arg = text[len("/optimizar") :].strip()
+                if not target_arg:
+                    msg = (
+                        "Uso: /optimizar <nombre_del_juego_o_ruta_de_archivo>. "
+                        "Ejemplo: /optimizar CyberGame"
+                    )
+                    output_fn(f"JARVIS: {msg}")
+                    continue
+
+                orch = _ensure_orchestrator()
+                try:
+                    prep = orch.prepare_interactive_optimization(target_arg)
+                except Exception as opt_err:
+                    output_fn(f"JARVIS: No fue posible preparar la optimización, señor: {opt_err}")
+                    continue
+
+                status = prep.get("status")
+                if status != "awaiting_approval":
+                    msg = str(prep.get("message") or "No se generaron cambios aplicables.")
+                    output_fn(f"JARVIS: {msg}")
+                    if status == "ambiguous" and prep.get("matches"):
+                        for idx_m, m_path in enumerate(prep["matches"], start=1):
+                            output_fn(f"  [{idx_m}] {m_path}")
+                    continue
+
+                output_fn(str(prep["formatted_preview"]))
+                plan = prep["plan"]
+                sim = prep["simulation"]
+                approval_hash = str(sim["approval_hash"])
+
+                try:
+                    confirm_raw = input_fn(
+                        "¿Desea aplicar estos cambios? [s/n o IDs ej. op-001]: "
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    orch.cancel_plan(plan.execution_id, reason="Cancelado por interrupción de entrada.")
+                    output_fn("\nJARVIS: Operación cancelada sin modificar archivos, señor.")
+                    continue
+
+                choice = (confirm_raw or "").strip()
+                choice_low = choice.lower()
+                if choice_low in ("s", "si", "sí", "y", "yes", "aplicar", "autorizar"):
+                    selected_ids = None
+                elif choice_low.startswith("op-"):
+                    selected_ids = [
+                        tok.strip() for tok in choice.split(",") if tok.strip()
+                    ]
+                else:
+                    orch.cancel_plan(plan.execution_id, reason="Rechazado por el usuario en consola.")
+                    output_fn(
+                        "JARVIS: Plan cancelado, señor. No se realizó ninguna modificación en disco."
+                    )
+                    continue
+
+                try:
+                    exec_res = orch.execute_approved_plan(
+                        plan,
+                        approval_hash=approval_hash,
+                        user_approved=True,
+                        approved_operation_ids=selected_ids,
+                    )
+                    summary_msg = (
+                        f"{exec_res['summary']} "
+                        f"(ID de ejecución para rollback: {exec_res['execution_id']})"
+                    )
+                    output_fn(f"[ChainOrchestrator: {exec_res['state']}]")
+                    output_fn(f"JARVIS: {summary_msg}")
+                    if tts_active and tts_engine is not None:
+                        try:
+                            _speak_blocking(tts_engine, summary_msg)
+                        except Exception:
+                            pass
+                except Exception as exec_err:
+                    output_fn(
+                        f"JARVIS: Se produjo un problema al ejecutar el plan y se protegió el archivo: {exec_err}"
+                    )
+                continue
+
+            # 4c. Comando /rollback <execution_id> -> restaura los archivos desde sus backups verificados
+            if lowered == "/rollback" or lowered.startswith("/rollback "):
+                exec_id_arg = text[len("/rollback") :].strip()
+                if not exec_id_arg:
+                    output_fn(
+                        "JARVIS: Por favor indique el ID de ejecución a revertir (ej. /rollback exec-123456), señor."
+                    )
+                    continue
+
+                orch = _ensure_orchestrator()
+                try:
+                    rb_res = orch.rollback_execution(exec_id_arg)
+                    count_rb = len(rb_res.get("restored_files") or [])
+                    msg = (
+                        f"Rollback completado con verificación SHA-256 para '{exec_id_arg}' "
+                        f"({count_rb} archivo(s) restaurado(s) a su estado original), señor."
+                    )
+                    output_fn(f"[ChainOrchestrator: {rb_res['state']}]")
+                    output_fn(f"JARVIS: {msg}")
+                except Exception as rb_err:
+                    output_fn(
+                        f"JARVIS: No fue posible completar el rollback para '{exec_id_arg}', señor: {rb_err}"
+                    )
                 continue
 
             # 5. Procesamiento del turno mediante BrainManager (selector -> skills locales -> LLM)

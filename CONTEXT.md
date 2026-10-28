@@ -353,14 +353,19 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
   - `v4.2.0` (Fases D–F): `FileEditorSkill`, parser INI conservador, escritura atómica e integración en `SkillManager`.
   - `v4.3.0` (Fases G–I): `ChainOrchestrator`, `ChangePlan`, `PolicyEngine` y flujo multi-juego con aprobación criptográfica.
   - `v5.0.0` (Fases J–L): Suite exhaustiva `tests/test_file_editor_and_chain.py` (40 escenarios) y documentación final.
+  - `v5.1.0` (Fases M–O): Integración interactiva en consola (`/optimizar <juego_o_ruta>` y `/rollback <execution_id>`) en `main.py` y `ChainOrchestrator` con vista previa de simulación, aprobación total o selectiva por ID (`op-001`) y 42 pruebas automatizadas.
 
-### 4. Verificaciones Ejecutadas
+### 4. Comandos Interactivos en Consola (`main.py`)
+- `/optimizar <juego_o_ruta>`: Localiza de forma acotada el archivo de configuración del juego/aplicación dentro de las raíces autorizadas, inspecciona sus valores, consulta las recomendaciones para el hardware local, valida con `PolicyEngine` y muestra la tabla de simulación (`SIMULACIÓN EN SOLO LECTURA`) junto con el `approval_hash` SHA-256. A continuación solicita confirmación explícita (`s` para aplicar todo, `op-001,op-002` para aplicar operaciones específicas, o `n` para cancelar sin tocar el disco).
+- `/rollback <execution_id>`: Restaura en orden inverso todos los archivos modificados en esa ejecución verificando el hash SHA-256 original y detectando ediciones manuales posteriores.
+
+### 5. Verificaciones Ejecutadas
 - Compilación estática:
-  `.\venv\Scripts\python.exe -m py_compile skills/file_editor_skill.py src/brain/chain_orchestrator.py tests/test_file_editor_and_chain.py` → **Código de salida 0 (OK)**.
-- Suite específica de `FileEditorSkill` y `ChainOrchestrator`:
-  `.\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain -v` → **40 pruebas ejecutadas, 0 fallos, 0 errores (OK)** en 0.964s.
+  `.\venv\Scripts\python.exe -m py_compile main.py skills/file_editor_skill.py src/brain/chain_orchestrator.py tests/test_file_editor_and_chain.py` → **Código de salida 0 (OK)**.
+- Suite específica de `FileEditorSkill`, `ChainOrchestrator` y consola interactiva:
+  `.\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain -v` → **42 pruebas ejecutadas, 0 fallos, 0 errores (OK)** en 1.134s.
 - Suite completa del repositorio:
-  `.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **379 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)** en 8.948s.
+  `.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **381 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)**.
 
 
 
