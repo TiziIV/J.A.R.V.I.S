@@ -17,8 +17,10 @@ Responsabilidades del orquestador:
 """
 
 import os
+import ntpath
 import re
-import threading
+import stat
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,7 +29,7 @@ from config.settings import BASE_DIR, FORBIDDEN_SYSTEM_PREFIXES
 from skills.base_skill import BaseSkill
 from skills.document_models import Document
 from skills.document_parser import DocumentParser
-from skills.document_templates import get_template
+from skills.document_templates import get_template, is_template_available
 from skills.markdown_renderer import MarkdownRenderer
 from skills.word_renderer import WordRenderer
 
@@ -43,6 +45,7 @@ WINDOWS_RESERVED_NAMES: frozenset[str] = frozenset({
 
 # Caracteres no permitidos en nombres de archivo de Windows
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+FILE_ATTRIBUTE_REPARSE_POINT: int = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 def sanitize_filename(name: str) -> str:
@@ -54,7 +57,8 @@ def sanitize_filename(name: str) -> str:
     if not clean:
         clean = "documento_exportado"
 
-    stem = clean.split(".")[0].upper()
+    # Windows ignora espacios y puntos finales antes de evaluar el nombre de dispositivo.
+    stem = clean.split(".", 1)[0].strip(" .").upper()
     if stem in WINDOWS_RESERVED_NAMES:
         raise ValueError(f"El nombre '{name}' coincide con un nombre reservado del sistema operativo Windows ({stem}).")
 
@@ -121,9 +125,12 @@ class DocumentExportSkill(BaseSkill):
 
         # Construcción de raíces de exportación autorizadas
         if allowed_roots is not None:
-            self._allowed_roots = tuple(Path(r).resolve() for r in allowed_roots)
+            self._allowed_roots = tuple(Path(os.path.abspath(Path(r))) for r in allowed_roots)
         else:
             self._allowed_roots = self._load_configured_roots()
+        self._allowed_root_realpaths: tuple[Path, ...] = tuple(
+            root.resolve(strict=False) for root in self._allowed_roots
+        )
 
         # Componentes desacoplados (el renderizador Word se inicializa sin importar docx)
         self.parser = DocumentParser()
@@ -137,7 +144,7 @@ class DocumentExportSkill(BaseSkill):
 
     def _load_configured_roots(self) -> tuple[Path, ...]:
         """Carga las raíces autorizadas desde la configuración del entorno."""
-        roots: list[Path] = [DEFAULT_EXPORT_DIR.resolve()]
+        roots: list[Path] = [Path(os.path.abspath(DEFAULT_EXPORT_DIR))]
 
         extra_env = os.getenv("JARVIS_EXPORT_ROOTS", "").strip()
         if extra_env:
@@ -145,8 +152,8 @@ class DocumentExportSkill(BaseSkill):
                 clean_item = item.strip()
                 if clean_item:
                     try:
-                        exp = Path(os.path.expandvars(clean_item)).resolve()
-                        norm_lower = str(exp).lower().rstrip("\\/")
+                        exp = Path(os.path.abspath(os.path.expandvars(clean_item)))
+                        norm_lower = str(exp.resolve(strict=False)).lower().rstrip("\\/")
                         if any(norm_lower == f or norm_lower.startswith(f + "\\") for f in FORBIDDEN_SYSTEM_PREFIXES):
                             continue
                         if exp.exists() and exp.is_dir() and exp not in roots:
@@ -176,12 +183,22 @@ class DocumentExportSkill(BaseSkill):
         if raw_format not in ("md", "docx", "both"):
             return f"Lo siento señor, el formato '{raw_format}' no es válido. Los formatos soportados son 'md', 'docx' y 'both'."
 
-        raw_mode = str(args.get("mode", "general")).strip().lower()
+        raw_mode_value = args.get("mode", "general")
+        if not isinstance(raw_mode_value, str) or raw_mode_value.strip().lower() not in ("general", "study"):
+            return "Lo siento señor, el modo debe ser 'general' o 'study'."
+        raw_mode = raw_mode_value.strip().lower()
         title = args.get("title")
         if title:
             title = str(title).strip()
         template_name = args.get("template")
-        overwrite = bool(args.get("overwrite", False))
+        if template_name is not None:
+            if not isinstance(template_name, str) or not is_template_available(template_name):
+                return f"Lo siento señor, la plantilla '{template_name}' no es válida."
+            template_name = template_name.strip()
+        overwrite_value = args.get("overwrite", False)
+        if not isinstance(overwrite_value, bool):
+            return "Lo siento señor, 'overwrite' debe ser un valor booleano true o false."
+        overwrite = overwrite_value
         output_path = args.get("output_path")
 
         # 2. Aplicación de plantilla pedagógica en Modo Estudio
@@ -209,19 +226,46 @@ class DocumentExportSkill(BaseSkill):
             results: dict[str, Path] = {}
             errors: dict[str, str] = {}
 
+            reserved_pair: dict[str, tuple[Path, tuple[int, int, int]]] = {}
+            both_paths: dict[str, Path] = {}
+            if raw_format == "both":
+                try:
+                    base_path = self._resolve_safe_destination(
+                        document.title, ".md", output_path, overwrite=True, normalize_both=True
+                    )
+                    if overwrite:
+                        both_paths = {"md": base_path, "docx": base_path.with_suffix(".docx")}
+                    else:
+                        reserved_pair = self._reserve_unique_format_pair(base_path)
+                        both_paths = {key: value[0] for key, value in reserved_pair.items()}
+                except Exception as exc:
+                    return self._format_response(document.title, {}, {"md": str(exc), "docx": str(exc)}, raw_format)
+
             if raw_format in ("md", "both"):
                 try:
-                    md_path = self._export_markdown(document, output_path, overwrite)
+                    md_output = str(both_paths["md"]) if raw_format == "both" else output_path
+                    md_path = self._export_markdown(
+                        document, md_output, overwrite or bool(reserved_pair),
+                        reserved_identity=reserved_pair.get("md", (None, None))[1],
+                    )
                     results["md"] = md_path
                 except Exception as exc:
                     errors["md"] = str(exc)
+                    if "md" in reserved_pair:
+                        self._remove_owned_reservation(*reserved_pair["md"])
 
             if raw_format in ("docx", "both"):
                 try:
-                    docx_path = self._export_word(document, output_path, overwrite)
+                    docx_output = str(both_paths["docx"]) if raw_format == "both" else output_path
+                    docx_path = self._export_word(
+                        document, docx_output, overwrite or bool(reserved_pair),
+                        reserved_identity=reserved_pair.get("docx", (None, None))[1],
+                    )
                     results["docx"] = docx_path
                 except Exception as exc:
                     errors["docx"] = str(exc)
+                    if "docx" in reserved_pair:
+                        self._remove_owned_reservation(*reserved_pair["docx"])
 
             # 5. Generación de confirmación ejecutiva según resultados
             return self._format_response(document.title, results, errors, raw_format)
@@ -229,27 +273,35 @@ class DocumentExportSkill(BaseSkill):
         except Exception as exc:
             return f"Lo siento señor, ocurrió un fallo imprevisto durante la exportación documental: {exc}"
 
-    def _export_markdown(self, document: Document, output_path: Any, overwrite: bool) -> Path:
+    def _export_markdown(
+        self, document: Document, output_path: Any, overwrite: bool,
+        reserved_identity: tuple[int, int, int] | None = None,
+    ) -> Path:
         """Renderiza y escribe atómicamente el documento en formato Markdown."""
+        # El renderizado en memoria evita dejar una reserva vacía si el renderer falla.
+        md_text = self.md_renderer.render(document)
         dest_file = self._resolve_safe_destination(
             document.title,
             ext=".md",
             output_path=output_path,
             overwrite=overwrite
         )
-        md_text = self.md_renderer.render(document)
+        reservation_identity = reserved_identity or (None if overwrite else self._file_identity(dest_file))
         try:
-            self._write_file_atomically(dest_file, md_text.encode("utf-8"), overwrite=overwrite)
+            self._write_file_atomically(
+                dest_file, md_text.encode("utf-8"), overwrite=overwrite,
+                reserved_identity=reservation_identity,
+            )
             return dest_file
         except Exception:
-            if not overwrite and dest_file.exists() and dest_file.stat().st_size == 0:
-                try:
-                    dest_file.unlink()
-                except OSError:
-                    pass
+            if reservation_identity is not None:
+                self._remove_owned_reservation(dest_file, reservation_identity)
             raise
 
-    def _export_word(self, document: Document, output_path: Any, overwrite: bool) -> Path:
+    def _export_word(
+        self, document: Document, output_path: Any, overwrite: bool,
+        reserved_identity: tuple[int, int, int] | None = None,
+    ) -> Path:
         """Renderiza y escribe atómicamente el documento en formato Word DOCX."""
         dest_file = self._resolve_safe_destination(
             document.title,
@@ -259,26 +311,34 @@ class DocumentExportSkill(BaseSkill):
         )
 
         # Usar un archivo temporal en el mismo directorio de destino para garantizar atomicidad
+        reservation_identity = reserved_identity or (None if overwrite else self._file_identity(dest_file))
         target_dir = dest_file.parent
+        self._assert_safe_destination(dest_file)
         target_dir.mkdir(parents=True, exist_ok=True)
-        temp_file = target_dir / f".~{dest_file.name}.{uuid.uuid4().hex[:8]}.tmp"
+        self._assert_safe_destination(dest_file)
+        temp_file = target_dir / f".~{dest_file.name}.{uuid.uuid4().hex}.tmp"
 
         try:
+            temp_fd = os.open(str(temp_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            temp_stat = os.fstat(temp_fd)
+            temp_identity = (temp_stat.st_dev, temp_stat.st_ino, temp_stat.st_size)
+            os.close(temp_fd)
+            self._assert_safe_destination(temp_file)
+            if self._file_identity(temp_file) != temp_identity:
+                raise PermissionError("El temporal Word cambió antes de iniciar el renderizado.")
             self.word_renderer.render_to_file(document, temp_file)
-            # Reemplazo atómico sobre el destino final
-            os.replace(temp_file, dest_file)
+            self._assert_safe_destination(temp_file)
+            if self._file_identity(temp_file)[:2] != temp_identity[:2]:
+                raise PermissionError("El temporal Word cambió durante el renderizado.")
+            with temp_file.open("r+b") as rendered_file:
+                os.fsync(rendered_file.fileno())
+            self._replace_with_retry(temp_file, dest_file, reservation_identity)
             return dest_file
         except Exception:
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
-            if not overwrite and dest_file.exists() and dest_file.stat().st_size == 0:
-                try:
-                    dest_file.unlink()
-                except OSError:
-                    pass
+            if "temp_identity" in locals():
+                self._remove_owned_file(temp_file, temp_identity)
+            if reservation_identity is not None:
+                self._remove_owned_reservation(dest_file, reservation_identity)
             raise
 
     def _resolve_safe_destination(
@@ -287,6 +347,8 @@ class DocumentExportSkill(BaseSkill):
         ext: str,
         output_path: Any,
         overwrite: bool,
+        *,
+        normalize_both: bool = False,
     ) -> Path:
         """
         Valida rigurosamente la seguridad de la ruta en Windows y previene colisiones concurrentes.
@@ -296,7 +358,6 @@ class DocumentExportSkill(BaseSkill):
 
         if not output_path:
             target_dir = self._allowed_roots[0]
-            target_dir.mkdir(parents=True, exist_ok=True)
             candidate = target_dir / default_name
         else:
             raw_path_str = str(output_path).strip()
@@ -309,15 +370,25 @@ class DocumentExportSkill(BaseSkill):
             if raw_path_str.startswith(r"\\") or raw_path_str.startswith("//"):
                 raise PermissionError("Acceso denegado: Las rutas de red UNC no están autorizadas.")
 
+            drive, _ = ntpath.splitdrive(raw_path_str)
+            if drive and not raw_path_str.startswith(drive + "\\") and not raw_path_str.startswith(drive + "/"):
+                raise PermissionError("Acceso denegado: Las rutas relativas a una unidad (por ejemplo C:archivo) no están autorizadas.")
+            if raw_path_str.startswith(("\\", "/")) and not (raw_path_str.startswith("\\\\") or raw_path_str.startswith("//")) and not drive:
+                raise PermissionError("Acceso denegado: Las rutas con raíz sin unidad no están autorizadas.")
             candidate_path = Path(raw_path_str)
 
             # Si es un nombre de archivo simple o ruta relativa
             if not candidate_path.is_absolute():
-                target_dir = self._allowed_roots[0]
-                target_dir.mkdir(parents=True, exist_ok=True)
-                clean_name = sanitize_filename(candidate_path.name)
-                if not clean_name.lower().endswith(ext.lower()):
-                    clean_name = f"{clean_name}{ext}"
+                relative_is_directory = raw_path_str.endswith(("\\", "/"))
+                directory_parts = candidate_path.parts if relative_is_directory else candidate_path.parts[:-1]
+                target_dir = self._allowed_roots[0].joinpath(*directory_parts)
+                for part in directory_parts:
+                    self._validate_windows_component(part)
+                clean_name = (
+                    default_name
+                    if relative_is_directory
+                    else self._validated_explicit_name(candidate_path.name, ext, normalize_both)
+                )
                 candidate = target_dir / clean_name
             else:
                 # Es ruta absoluta: validar pertenencia física
@@ -326,41 +397,24 @@ class DocumentExportSkill(BaseSkill):
                     clean_name = default_name
                 else:
                     target_dir = candidate_path.parent
-                    clean_name = sanitize_filename(candidate_path.name)
-                    if not clean_name.lower().endswith(ext.lower()):
-                        clean_name = f"{clean_name}{ext}"
+                    clean_name = self._validated_explicit_name(candidate_path.name, ext, normalize_both)
 
                 # Comprobación de prefijos de sistema prohibidos
-                resolved_target_dir = target_dir.resolve()
+                candidate = target_dir / clean_name
+                self._assert_safe_destination(candidate)
+                resolved_target_dir = target_dir.resolve(strict=False)
                 norm_lower = str(resolved_target_dir).lower().rstrip("\\/")
                 for forbidden in FORBIDDEN_SYSTEM_PREFIXES:
                     if norm_lower == forbidden or norm_lower.startswith(forbidden + "\\"):
                         raise PermissionError(f"Acceso denegado: La ubicación '{target_dir}' es un directorio protegido de Windows.")
 
                 # Comprobación estricta de pertenencia a una raíz autorizada
-                is_authorized = False
-                for root in self._allowed_roots:
-                    root_resolved = root.resolve()
-                    try:
-                        # is_relative_to verifica si target_dir está dentro de root_resolved
-                        if resolved_target_dir == root_resolved or resolved_target_dir.is_relative_to(root_resolved):
-                            is_authorized = True
-                            break
-                    except AttributeError:
-                        # Fallback de compatibilidad
-                        if str(resolved_target_dir).lower().startswith(str(root_resolved).lower()):
-                            is_authorized = True
-                            break
-
-                if not is_authorized:
-                    raise PermissionError(
-                        f"Acceso denegado: La ruta '{target_dir}' no reside en ninguna de las raíces de exportación autorizadas."
-                    )
-
-                target_dir.mkdir(parents=True, exist_ok=True)
-                candidate = target_dir / clean_name
+                self._matching_root(candidate)
 
         # Manejo de concurrencia y prevención de colisiones cuando overwrite=False
+        self._assert_safe_destination(candidate)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_safe_destination(candidate)
         if overwrite:
             return candidate
 
@@ -373,6 +427,7 @@ class DocumentExportSkill(BaseSkill):
         ej. doc.docx -> doc_(1).docx -> doc_(2).docx
         """
         target_dir = base_file.parent
+        self._assert_safe_destination(base_file)
         target_dir.mkdir(parents=True, exist_ok=True)
         stem = base_file.stem
         ext = base_file.suffix
@@ -387,31 +442,213 @@ class DocumentExportSkill(BaseSkill):
             try:
                 # Reserva atómica libre de condiciones TOCTOU
                 fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                info = os.fstat(fd)
                 os.close(fd)
+                identity = (info.st_dev, info.st_ino, info.st_size)
+                try:
+                    self._assert_safe_destination(candidate)
+                except Exception:
+                    self._remove_owned_reservation(candidate, identity)
+                    raise
                 return candidate
             except FileExistsError:
                 candidate = target_dir / f"{clean_stem}_({idx}){ext}"
                 idx += 1
 
-    def _write_file_atomically(self, target_file: Path, data: bytes, overwrite: bool) -> None:
+    def _write_file_atomically(
+        self, target_file: Path, data: bytes, overwrite: bool,
+        reserved_identity: tuple[int, int, int] | None = None,
+    ) -> None:
         """
         Escribe datos binarios de forma atómica en Windows mediante archivo temporal y reemplazo seguro.
         """
+        self._assert_safe_destination(target_file)
+        if reserved_identity is not None and self._file_identity(target_file) != reserved_identity:
+            raise PermissionError("La reserva del destino cambió antes de escribir.")
         target_dir = target_file.parent
         target_dir.mkdir(parents=True, exist_ok=True)
 
         temp_file = target_dir / f".~{target_file.name}.{uuid.uuid4().hex[:8]}.tmp"
+        temp_identity: tuple[int, int, int] | None = None
         try:
-            temp_file.write_bytes(data)
-            # Reemplazo atómico en Windows
-            os.replace(temp_file, target_file)
+            with temp_file.open("xb") as stream:
+                temp_stat = os.fstat(stream.fileno())
+                temp_identity = (temp_stat.st_dev, temp_stat.st_ino, temp_stat.st_size)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._replace_with_retry(temp_file, target_file, reserved_identity)
         except Exception:
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
+            if temp_identity is not None:
+                self._remove_owned_file(temp_file, temp_identity)
             raise
+
+    @staticmethod
+    def _file_identity(path: Path) -> tuple[int, int, int]:
+        """Identifica un archivo sin seguir enlaces para limpiar solo reservas propias."""
+        info = os.lstat(path)
+        return info.st_dev, info.st_ino, info.st_size
+
+    def _remove_owned_reservation(self, path: Path, identity: tuple[int, int, int]) -> None:
+        """Elimina una reserva vacía solo si sigue siendo el mismo archivo creado aquí."""
+        try:
+            info = os.lstat(path)
+            current = (info.st_dev, info.st_ino, info.st_size)
+            if current == identity and stat.S_ISREG(info.st_mode) and info.st_size == 0:
+                path.unlink()
+        except OSError:
+            pass
+
+    def _remove_owned_file(self, path: Path, identity: tuple[int, int, int]) -> None:
+        """Limpia un temporal parcial si conserva la identidad del archivo creado por esta operación."""
+        try:
+            info = os.lstat(path)
+            if (info.st_dev, info.st_ino) == identity[:2] and stat.S_ISREG(info.st_mode):
+                path.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _path_is_reparse_point(path: Path) -> bool:
+        """Detecta symlinks y reparse points sin seguir el destino del enlace."""
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PermissionError(f"No se pudo inspeccionar el componente '{path.name}' de forma segura.") from exc
+        attributes = getattr(info, "st_file_attributes", 0)
+        return stat.S_ISLNK(info.st_mode) or bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+    @staticmethod
+    def _is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _matching_root(self, candidate: Path) -> tuple[Path, Path]:
+        absolute_candidate = Path(os.path.abspath(candidate))
+        for root, expected_real_root in zip(self._allowed_roots, self._allowed_root_realpaths):
+            if self._is_within(absolute_candidate, root):
+                return root, expected_real_root
+        raise PermissionError("Acceso denegado: el destino no reside bajo una raíz de exportación autorizada.")
+
+    def _assert_safe_destination(self, candidate: Path) -> None:
+        """Revalida físicamente raíz, ancestros y destino justo antes de operar."""
+        root, expected_real_root = self._matching_root(candidate)
+        relative_parts = Path(os.path.abspath(candidate)).relative_to(root).parts
+        for part in relative_parts:
+            self._validate_windows_component(part)
+
+        chain: list[Path] = []
+        current = Path(os.path.abspath(candidate))
+        while current.parent != current:
+            chain.append(current)
+            current = current.parent
+        for component in reversed(chain):
+            if os.path.lexists(component) and self._path_is_reparse_point(component):
+                raise PermissionError(
+                    f"Acceso denegado: se detectó symlink, junction o reparse point en '{component}'."
+                )
+
+        try:
+            current_real_root = root.resolve(strict=False)
+            physical_parent = candidate.parent.resolve(strict=False)
+        except OSError as exc:
+            raise PermissionError("No se pudo resolver de forma segura la ruta física de exportación.") from exc
+        if current_real_root != expected_real_root:
+            raise PermissionError("Acceso denegado: la raíz autorizada cambió físicamente desde que se inicializó la skill.")
+        if not self._is_within(physical_parent, expected_real_root):
+            raise PermissionError("Acceso denegado: la ruta física del destino sale de la raíz autorizada.")
+        norm_lower = str(physical_parent).lower().rstrip("\\/")
+        for forbidden in FORBIDDEN_SYSTEM_PREFIXES:
+            if norm_lower == forbidden or norm_lower.startswith(forbidden + "\\"):
+                raise PermissionError("Acceso denegado: la ubicación pertenece a un directorio protegido de Windows.")
+
+        if os.path.lexists(candidate):
+            if self._path_is_reparse_point(candidate):
+                raise PermissionError("Acceso denegado: el archivo de destino existente es un enlace o reparse point.")
+            try:
+                physical_target = candidate.resolve(strict=True)
+            except OSError as exc:
+                raise PermissionError("No se pudo validar físicamente el destino existente.") from exc
+            if not self._is_within(physical_target, expected_real_root):
+                raise PermissionError("Acceso denegado: el destino físico sale de la raíz autorizada.")
+
+    def _validated_explicit_name(self, name: str, ext: str, normalize_both: bool) -> str:
+        base = name
+        if normalize_both and Path(base).suffix.lower() in (".md", ".docx"):
+            base = Path(base).stem
+        if Path(base).suffix.lower() == ext.lower():
+            base = Path(base).stem
+        self._validate_windows_component(base)
+        return f"{base}{ext}"
+
+    @staticmethod
+    def _validate_windows_component(component: str) -> None:
+        if not component or component in (".", "..") or INVALID_FILENAME_CHARS.search(component):
+            raise ValueError("La ruta contiene un componente vacío o con caracteres no válidos.")
+        if component.rstrip(" .") != component:
+            raise ValueError(f"El componente '{component}' termina en espacios o puntos, lo que Windows normaliza.")
+        windows_stem = component.split(".", 1)[0].strip(" .").upper()
+        if windows_stem in WINDOWS_RESERVED_NAMES:
+            raise ValueError(f"El componente '{component}' es un nombre reservado de Windows.")
+
+    def _reserve_unique_format_pair(
+        self, base_file: Path,
+    ) -> dict[str, tuple[Path, tuple[int, int, int]]]:
+        """Reserva los dos formatos con una base común y revierte solo su reserva parcial."""
+        parent = base_file.parent
+        stem = base_file.stem
+        self._assert_safe_destination(base_file)
+        for index in range(1000000):
+            base = stem if index == 0 else f"{stem}_({index})"
+            candidates = {"md": parent / f"{base}.md", "docx": parent / f"{base}.docx"}
+            reservations: dict[str, tuple[Path, tuple[int, int, int]]] = {}
+            collision = False
+            for kind, candidate in candidates.items():
+                self._assert_safe_destination(candidate)
+                try:
+                    fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    info = os.fstat(fd)
+                    os.close(fd)
+                    identity = (info.st_dev, info.st_ino, info.st_size)
+                    reservations[kind] = (candidate, identity)
+                    self._assert_safe_destination(candidate)
+                except FileExistsError:
+                    collision = True
+                    break
+                except Exception:
+                    for reserved_path, reserved_identity in reservations.values():
+                        self._remove_owned_reservation(reserved_path, reserved_identity)
+                    raise
+            if not collision:
+                return reservations
+            for reserved_path, identity in reservations.values():
+                self._remove_owned_reservation(reserved_path, identity)
+        raise FileExistsError("No se encontró un nombre común libre para los formatos Markdown y Word.")
+
+    def _replace_with_retry(
+        self,
+        source: Path,
+        destination: Path,
+        reserved_identity: tuple[int, int, int] | None,
+    ) -> None:
+        """Reintenta brevemente solo bloqueos transitorios de reemplazo en Windows."""
+        for attempt in range(4):
+            self._assert_safe_destination(source)
+            self._assert_safe_destination(destination)
+            if reserved_identity is not None and self._file_identity(destination) != reserved_identity:
+                raise PermissionError("La reserva del destino cambió antes del reemplazo atómico.")
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32) or attempt == 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def _format_response(
         self,

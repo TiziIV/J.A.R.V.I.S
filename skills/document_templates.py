@@ -417,6 +417,15 @@ def get_template(name: str | None) -> BaseDocumentTemplate:
     return _TEMPLATES_REGISTRY["structured_notes"]
 
 
+def is_template_available(name: str) -> bool:
+    """Indica si el identificador o alias pertenece al registro de plantillas."""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    normalized = name.strip().lower().replace("-", "_").replace(" ", "_")
+    target_id = _ALIASES.get(normalized, normalized)
+    return target_id in _TEMPLATES_REGISTRY
+
+
 def list_available_templates() -> list[dict[str, str]]:
     """
     Retorna la lista de todas las plantillas disponibles con sus descripciones.

@@ -126,7 +126,14 @@ class WordRenderer:
             sub_run.font.color.rgb = RGBColor(0x59, 0x59, 0x59)
 
         # Iterar sobre elementos del Document IR
-        for elem in document.elements:
+        for index, elem in enumerate(document.elements):
+            if (
+                index == 0
+                and isinstance(elem, Heading)
+                and elem.level == 1
+                and elem.text.strip() == document.title.strip()
+            ):
+                continue
             self._render_element(doc, elem)
 
         # Guardar en disco

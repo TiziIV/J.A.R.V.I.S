@@ -129,6 +129,9 @@ class DocumentParser:
                 cit_text = cit_match.group(2).strip()
                 url_match = RE_URL.search(cit_text)
                 url_val = url_match.group(0) if url_match else None
+                if url_match:
+                    # Guardamos la URL una sola vez en el campo estructurado del IR.
+                    cit_text = (cit_text[:url_match.start()] + cit_text[url_match.end():]).strip()
                 elements.append(Citation(source_id=source_id, text=cit_text, url=url_val))
                 i += 1
                 continue
@@ -162,6 +165,8 @@ class DocumentParser:
                     quote_text = "\n".join(bq_lines)
                     url_match = RE_URL.search(quote_text)
                     url_val = url_match.group(0) if url_match else None
+                    if url_match:
+                        quote_text = (quote_text[:url_match.start()] + quote_text[url_match.end():]).strip()
                     # Si tiene formato de cita o referencia con autor/guion
                     elements.append(
                         Citation(
@@ -260,14 +265,16 @@ class DocumentParser:
                 i += 1
 
             full_para_text = " ".join(para_lines).strip()
-            # Detección de formato general en negrita o cursiva
-            is_bold = full_para_text.startswith("**") and full_para_text.endswith("**") and len(full_para_text) > 4
-            is_italic = (
-                (full_para_text.startswith("*") and full_para_text.endswith("*") and len(full_para_text) > 2)
-                or (full_para_text.startswith("_") and full_para_text.endswith("_") and len(full_para_text) > 2)
-            ) and not is_bold
-
-            elements.append(Paragraph(text=full_para_text, bold=is_bold, italic=is_italic))
+            # Solo quitamos delimitadores si la línea completa forma un énfasis válido.
+            bold_match = re.fullmatch(r"\*\*(.+?)\*\*", full_para_text)
+            italic_match = re.fullmatch(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|_(?!_)(.+?)_(?!_)", full_para_text)
+            if bold_match:
+                elements.append(Paragraph(text=bold_match.group(1), bold=True))
+            elif italic_match:
+                italic_text = italic_match.group(1) or italic_match.group(2)
+                elements.append(Paragraph(text=italic_text, italic=True))
+            else:
+                elements.append(Paragraph(text=full_para_text))
 
         # Determinar título final
         final_title = title.strip() if (title and title.strip()) else (inferred_title or "Documento Exportado")

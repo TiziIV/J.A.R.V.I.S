@@ -15,7 +15,6 @@ Características:
 - Incluye citas y referencias bibliográficas al pie o en sección final.
 """
 
-from pathlib import Path
 from skills.document_models import (
     Callout,
     Citation,
