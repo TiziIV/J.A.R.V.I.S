@@ -1,23 +1,32 @@
 """
 Suite exhaustiva de pruebas unitarias e integración para `FileEditorSkill`,
 `BackupManager`, `RollbackManager`, `AuditLogger`, `ChangeOperation`, `ChangePlan`,
-`PolicyEngine` y `ChainOrchestrator`.
+`OperationStatus`, `PolicyEngine` y `ChainOrchestrator`.
 
-Cubre los 40 escenarios obligatorios de seguridad en Windows, preservación estructural
-de archivos INI/CFG/CONF/JSON/XML/TXT, escritura atómica con reintentos, detección de
-concurrencia, aprobación criptográfica vinculada a hash SHA-256, verificación post-escritura
-y rollback transaccional sin realizar llamadas de red ni tocar archivos reales del usuario.
+Cubre los escenarios de seguridad defensiva en Windows, preservación estructural de
+archivos INI/CFG/CONF/JSON/XML/TXT, escritura atómica con reintentos, detección de
+concurrencia (TOCTOU), validación pre-flight del grafo de dependencias (unicidad de IDs,
+detección de ciclos con DFS/Kahn, ordenamiento topológico determinista, aprobaciones
+selectivas, propagación transitiva de estados `FAILED`/`BLOCKED`, evidencia verificable
+de dependencias previas), integridad criptográfica del `approval_hash` SHA-256,
+verificación post-escritura, aislamiento temporal dedicado y rollback seguro sin realizar
+llamadas de red ni modificar archivos reales del usuario.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import tempfile
+import shutil
+import stat
+import sys
 import unittest
+import uuid
 from pathlib import Path
+from typing import Any, Callable, Optional, Sequence
 from unittest.mock import patch
 
+from config.settings import BASE_DIR
 from skills.file_editor_skill import (
     AuditLogger,
     BackupManager,
@@ -32,21 +41,92 @@ from src.brain.chain_orchestrator import (
     ChainState,
     ChangeOperation,
     ChangePlan,
+    DuplicateExecutionError,
+    OperationStatus,
     PolicyValidationError,
 )
 from src.tools.skill_manager import SkillManager
 
 
+def _make_readonly_retry_handler() -> Callable[..., None]:
+    """
+    Construye un manejador compatible con `shutil.rmtree` (`onexc` en Python >= 3.12
+    u `onerror` en versiones previas) que restaura permisos de escritura si un test
+    marcó deliberadamente un archivo como solo lectura en Windows, y vuelve a ejecutar
+    la función de borrado sin ocultar errores reales de limpieza.
+    """
+
+    def _handle_remove_readonly(
+        func: Callable[[str], Any],
+        path: str,
+        exc_or_info: Any,
+    ) -> None:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+
+    return _handle_remove_readonly
+
+
+def _rmtree_strict_windows(target_dir: Path) -> None:
+    """
+    Elimina recursivamente un directorio temporal de prueba resolviendo atributos
+    de solo lectura en Windows y propagando cualquier error real de limpieza.
+    """
+    if not target_dir.exists():
+        return
+    handler = _make_readonly_retry_handler()
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target_dir, onexc=handler)
+    else:
+        shutil.rmtree(target_dir, onerror=handler)
+
+
 class TestFileEditorAndChainOrchestrator(unittest.TestCase):
-    """Pruebas aisladas en directorios temporales para FileEditorSkill y ChainOrchestrator."""
+    """
+    Pruebas aisladas en una raíz temporal dedicada y configurable para
+    `FileEditorSkill` y `ChainOrchestrator`.
+    """
+
+    _temp_root: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """
+        Inicializa una raíz temporal dedicada y configurable (`JARVIS_TEST_TEMP_ROOT`),
+        resuelta mediante `Path.resolve()`, evitando problemas de DACLs heredados en
+        directorios `%TEMP%` del sistema en Windows.
+        """
+        configured_root = os.environ.get("JARVIS_TEST_TEMP_ROOT", "").strip()
+        if configured_root:
+            cls._temp_root = Path(configured_root).resolve()
+        else:
+            cls._temp_root = (BASE_DIR / "temp" / "jarvis_test_isolated").resolve()
+        cls._temp_root.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Limpia la raíz temporal dedicada al finalizar la clase si quedó vacía."""
+        if hasattr(cls, "_temp_root") and cls._temp_root.exists():
+            _rmtree_strict_windows(cls._temp_root)
+            parent_temp = cls._temp_root.parent
+            if (
+                parent_temp.name == "temp"
+                and parent_temp.exists()
+                and not any(parent_temp.iterdir())
+            ):
+                try:
+                    parent_temp.rmdir()
+                except OSError:
+                    pass
 
     def setUp(self) -> None:
-        self._tmp_dir = tempfile.TemporaryDirectory()
-        self.base_dir = Path(self._tmp_dir.name).resolve()
-        self.workspace_dir = self.base_dir / "authorized_games"
-        self.backup_dir = self.base_dir / "backups"
-        self.audit_log_path = self.base_dir / "logs" / "audit.jsonl"
-        self.outside_dir = self.base_dir / "outside_unauthorized"
+        """Crea un directorio temporal aislado y resuelto canónicamente para cada test."""
+        unique_folder = f"ut_{self._testMethodName}_{uuid.uuid4().hex[:8]}"
+        self.base_dir = (self._temp_root / unique_folder).resolve()
+        self.workspace_dir = (self.base_dir / "authorized_games").resolve()
+        self.backup_dir = (self.base_dir / "backups").resolve()
+        self.audit_log_path = (self.base_dir / "logs" / "audit.jsonl").resolve()
+        self.outside_dir = (self.base_dir / "outside_unauthorized").resolve()
 
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
@@ -54,7 +134,7 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
 
         self.audit_logger = AuditLogger(log_file=self.audit_log_path)
         self.backup_manager = BackupManager(audit_logger=self.audit_logger)
-        # Incluimos workspace_dir y backup_dir como raíces autorizadas del entorno de prueba
+        # Inyectamos explícitamente las rutas canónicas autorizadas del fixture aislado
         self.editor = FileEditorSkill(
             authorized_roots=[self.workspace_dir, self.backup_dir],
             backup_dir=self.backup_dir,
@@ -70,7 +150,12 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self._tmp_dir.cleanup()
+        """Limpia estrictamente el directorio temporal del test verificando que no quede en disco."""
+        _rmtree_strict_windows(self.base_dir)
+        self.assertFalse(
+            self.base_dir.exists(),
+            f"El directorio temporal '{self.base_dir}' no se limpió correctamente.",
+        )
 
     # ------------------------------------------------------------------
     # 1 a 4: Backups byte a byte, SHA-256, nombres únicos y no sobrescritura
@@ -1042,6 +1127,859 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         # Solo la primera operación (sg.ShadowQuality=1) se aplicó; la segunda quedó intacta (=3)
         self.assertIn("sg.ShadowQuality=1", updated_text)
         self.assertIn("sg.TextureQuality=3", updated_text)
+
+    # ------------------------------------------------------------------
+    # Helpers auxiliares para escenarios de endurecimiento (43 a 62)
+    # ------------------------------------------------------------------
+
+    def _build_custom_ini_op(
+        self,
+        op_id: str,
+        cfg_path: Path,
+        key: str,
+        expected_val: str,
+        proposed_val: str,
+        *,
+        section: str = "ScalabilityGroups",
+        depends_on: Optional[Sequence[str]] = None,
+        expected_hash: Optional[str] = None,
+    ) -> ChangeOperation:
+        """Crea una `ChangeOperation` INI válida para pruebas de grafos y estados."""
+        sha = expected_hash if expected_hash is not None else compute_sha256_file(cfg_path)
+        return ChangeOperation(
+            id=op_id,
+            file_path=str(cfg_path),
+            format="ini",
+            operation_type="update_key",
+            section=section,
+            key=key,
+            expected_current_value=expected_val,
+            proposed_value=proposed_val,
+            justification=f"Ajuste técnico para {key}",
+            risk_level="LOW",
+            evidence="VERIFIED",
+            verification_method="read_back_and_verify_ini_key_and_sha256",
+            reversible=True,
+            requires_approval=True,
+            expected_file_hash=sha,
+            depends_on=list(depends_on) if depends_on else [],
+        )
+
+    def _build_custom_plan(
+        self,
+        execution_id: str,
+        operations: list[ChangeOperation],
+        *,
+        plan_id: Optional[str] = None,
+    ) -> ChangePlan:
+        """Construye un `ChangePlan` válido asociado a `execution_id`."""
+        return ChangePlan(
+            plan_id=plan_id or f"plan-{execution_id}",
+            execution_id=execution_id,
+            user_goal="Optimizar configuración para GTX 1660 6 GB",
+            application_name="HardenedTestGame",
+            application_version="1.0",
+            hardware_context={"gpu_model": "GTX 1660", "vram_gb": 6},
+            operations=operations,
+            provider="local_heuristic",
+        )
+
+    # ------------------------------------------------------------------
+    # 43 a 62: Endurecimiento de Grafo de Dependencias, Estados, Hash y Aislamiento
+    # ------------------------------------------------------------------
+
+    def test_43_missing_dependency_rejected_in_preflight(self) -> None:
+        """43. (Grupo 1) Rechaza aprobación selectiva cuando falta una dependencia directa o transitiva."""
+        cfg = self.workspace_dir / "dep_missing.ini"
+        original_text = (
+            "[ScalabilityGroups]\n"
+            "sg.ShadowQuality=3\n"
+            "sg.TextureQuality=3\n"
+            "sg.EffectsQuality=3\n"
+        )
+        cfg.write_text(original_text, encoding="utf-8")
+        orig_sha = compute_sha256_file(cfg)
+
+        rec = self.orchestrator.create_execution("exec-43")
+        op_a = self._build_custom_ini_op("op-A", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-A"]
+        )
+        op_c = self._build_custom_ini_op(
+            "op-C", cfg, "sg.EffectsQuality", "3", "1", depends_on=["op-B"]
+        )
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b, op_c])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        # Seleccionar solo op-B sin op-A (dependencia directa pendiente) debe fallar en pre-flight
+        with patch.object(self.editor, "modify_ini_or_text", wraps=self.editor.modify_ini_or_text) as spy_mod:
+            with self.assertRaises(PolicyValidationError):
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-B"],
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+
+        self.assertEqual(rec.state, ChainState.REJECTED)
+        self.assertEqual(compute_sha256_file(cfg), orig_sha)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+
+        # Tampoco se permite seleccionar [op-B, op-C] omitiendo la dependencia transitiva op-A
+        rec2 = self.orchestrator.create_execution("exec-43b")
+        plan2 = self._build_custom_plan(rec2.execution_id, [op_a, op_b, op_c])
+        sim2 = self.orchestrator.simulate_plan(plan2)
+        with self.assertRaises(PolicyValidationError):
+            self.orchestrator.execute_approved_plan(
+                plan2,
+                approval_hash=sim2["approval_hash"],
+                user_approved=True,
+                approved_operation_ids=["op-B", "op-C"],
+            )
+        self.assertEqual(compute_sha256_file(cfg), orig_sha)
+
+    def test_44_complete_dependencies_approved_and_executed(self) -> None:
+        """44. (Grupo 2) Ejecuta correctamente cuando todas las dependencias requeridas están incluidas."""
+        cfg = self.workspace_dir / "dep_complete.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\nsg.EffectsQuality=3\n",
+            encoding="utf-8",
+        )
+
+        rec = self.orchestrator.create_execution("exec-44")
+        op_a = self._build_custom_ini_op("op-A", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-A"]
+        )
+        op_c = self._build_custom_ini_op(
+            "op-C", cfg, "sg.EffectsQuality", "3", "1", depends_on=["op-B"]
+        )
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b, op_c])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        # Seleccionamos el subgrafo completo válido [op-A, op-B]
+        res = self.orchestrator.execute_approved_plan(
+            plan,
+            approval_hash=sim["approval_hash"],
+            user_approved=True,
+            approved_operation_ids=["op-A", "op-B"],
+        )
+        self.assertEqual(res["state"], ChainState.COMPLETED.value)
+        self.assertFalse(res["fully_completed"])
+        self.assertEqual(res["plan_status"], "PARTIALLY_APPLIED")
+        self.assertEqual(op_a.status, OperationStatus.APPLIED.value)
+        self.assertEqual(op_b.status, OperationStatus.APPLIED.value)
+        self.assertEqual(op_c.status, OperationStatus.PENDING.value)
+
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn("sg.ShadowQuality=1", text)
+        self.assertIn("sg.TextureQuality=1", text)
+        self.assertIn("sg.EffectsQuality=3", text)
+        self.assertEqual(len(list(self.backup_dir.glob("*.bak"))), 2)
+
+    def test_45_cycle_detection_direct_and_three_node(self) -> None:
+        """45. (Grupo 3) Detecta y rechaza ciclos A -> B -> A y A -> B -> C -> A sin tocar archivos."""
+        cfg = self.workspace_dir / "cycle.ini"
+        original_text = (
+            "[ScalabilityGroups]\n"
+            "sg.ShadowQuality=3\n"
+            "sg.TextureQuality=3\n"
+            "sg.EffectsQuality=3\n"
+        )
+        cfg.write_text(original_text, encoding="utf-8")
+
+        # Ciclo de 2 nodos: A <-> B
+        op_a = self._build_custom_ini_op(
+            "op-A", cfg, "sg.ShadowQuality", "3", "1", depends_on=["op-B"]
+        )
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-A"]
+        )
+        rec = self.orchestrator.create_execution("exec-45-2node")
+        plan_2node = self._build_custom_plan(rec.execution_id, [op_a, op_b])
+
+        with self.assertRaises(PolicyValidationError) as ctx_2:
+            self.orchestrator.simulate_plan(plan_2node)
+        self.assertIn("ciclo", str(ctx_2.exception).lower())
+        self.assertEqual(rec.state, ChainState.REJECTED)
+
+        # Ciclo de 3 nodos: A -> B -> C -> A
+        op_1 = self._build_custom_ini_op(
+            "op-1", cfg, "sg.ShadowQuality", "3", "1", depends_on=["op-3"]
+        )
+        op_2 = self._build_custom_ini_op(
+            "op-2", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-1"]
+        )
+        op_3 = self._build_custom_ini_op(
+            "op-3", cfg, "sg.EffectsQuality", "3", "1", depends_on=["op-2"]
+        )
+        rec3 = self.orchestrator.create_execution("exec-45-3node")
+        plan_3node = self._build_custom_plan(rec3.execution_id, [op_1, op_2, op_3])
+
+        with self.assertRaises(PolicyValidationError) as ctx_3:
+            self.orchestrator.policy_engine.validate_plan(plan_3node)
+        self.assertIn("ciclo", str(ctx_3.exception).lower())
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+
+    def test_46_topological_order_with_inverted_selection(self) -> None:
+        """46. (Grupo 4) Fuerza el orden topológico determinista A -> B -> C aunque la selección llegue como [C, B, A]."""
+        cfg = self.workspace_dir / "topo.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nKeyA=0\nKeyB=0\nKeyC=0\nKeyIndep=0\n",
+            encoding="utf-8",
+        )
+
+        # Definimos el plan con C y B antes que A, y una operación independiente KeyIndep
+        op_a = self._build_custom_ini_op("op-A", cfg, "KeyA", "0", "1", depends_on=[])
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "KeyB", "0", "2", depends_on=["op-A"]
+        )
+        op_c = self._build_custom_ini_op(
+            "op-C", cfg, "KeyC", "0", "3", depends_on=["op-B"]
+        )
+        op_indep = self._build_custom_ini_op(
+            "op-D", cfg, "KeyIndep", "0", "4", depends_on=[]
+        )
+
+        rec = self.orchestrator.create_execution("exec-46")
+        # Incluso si en el plan están como [op-C, op-B, op-A, op-D] y la selección llega invertida:
+        plan = self._build_custom_plan(
+            rec.execution_id, [op_c, op_b, op_a, op_indep]
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+
+        executed_order: list[str] = []
+        real_apply = self.orchestrator._apply_single_operation
+
+        def spy_apply(op: ChangeOperation, **kwargs: Any) -> dict[str, Any]:
+            executed_order.append(op.id)
+            return real_apply(op, **kwargs)
+
+        with patch.object(
+            self.orchestrator, "_apply_single_operation", side_effect=spy_apply
+        ):
+            res = self.orchestrator.execute_approved_plan(
+                plan,
+                approval_hash=sim["approval_hash"],
+                user_approved=True,
+                approved_operation_ids=["op-C", "op-B", "op-A"],
+            )
+
+        self.assertEqual(executed_order, ["op-A", "op-B", "op-C"])
+        self.assertEqual(
+            [item["operation_id"] for item in res["applied_operations"]],
+            ["op-A", "op-B", "op-C"],
+        )
+        final_text = cfg.read_text(encoding="utf-8")
+        self.assertIn("KeyA=1", final_text)
+        self.assertIn("KeyB=2", final_text)
+        self.assertIn("KeyC=3", final_text)
+        self.assertIn("KeyIndep=0", final_text)
+
+    def test_47_direct_dependency_failure_blocks_dependent(self) -> None:
+        """47. (Grupo 5) Si A falla, A pasa a FAILED y su dependiente directa B pasa a BLOCKED sin tocar FileEditorSkill."""
+        cfg = self.workspace_dir / "direct_fail.ini"
+        original_text = "[ScalabilityGroups]\nKeyA=0\nKeyB=0\n"
+        cfg.write_text(original_text, encoding="utf-8")
+        orig_sha = compute_sha256_file(cfg)
+
+        op_a = self._build_custom_ini_op("op-A", cfg, "KeyA", "0", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "KeyB", "0", "2", depends_on=["op-A"]
+        )
+
+        rec = self.orchestrator.create_execution("exec-47")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        called_keys: list[dict[str, Any]] = []
+
+        def fail_on_a(file_path: Any, key_values: Optional[dict[str, Any]] = None, **kwargs: Any) -> dict[str, Any]:
+            called_keys.append(dict(key_values or {}))
+            return {"status": "error", "errors": ["Fallo simulado en op-A"]}
+
+        with patch.object(self.editor, "modify_ini_or_text", side_effect=fail_on_a):
+            with self.assertRaises(RuntimeError):
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                )
+
+        # Solo se intentó ejecutar op-A; op-B fue bloqueada y nunca llegó a FileEditorSkill
+        self.assertEqual(len(called_keys), 1)
+        self.assertIn("KeyA", called_keys[0])
+        self.assertEqual(op_a.status, OperationStatus.FAILED.value)
+        self.assertEqual(op_b.status, OperationStatus.BLOCKED.value)
+        self.assertEqual(rec.operation_states["op-A"], OperationStatus.FAILED.value)
+        self.assertEqual(rec.operation_states["op-B"], OperationStatus.BLOCKED.value)
+        self.assertIn("op-B", rec.blocked_operations)
+        self.assertEqual(rec.state, ChainState.FAILED)
+        self.assertEqual(compute_sha256_file(cfg), orig_sha)
+
+    def test_48_transitive_blocked_propagation_on_failure(self) -> None:
+        """48. (Grupo 6) Si A falla en A -> B -> C -> D, propaga BLOCKED transitivamente a B, C y D."""
+        cfg = self.workspace_dir / "transitive_block.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nK1=0\nK2=0\nK3=0\nK4=0\n",
+            encoding="utf-8",
+        )
+
+        op_a = self._build_custom_ini_op("op-A", cfg, "K1", "0", "1")
+        op_b = self._build_custom_ini_op("op-B", cfg, "K2", "0", "1", depends_on=["op-A"])
+        op_c = self._build_custom_ini_op("op-C", cfg, "K3", "0", "1", depends_on=["op-B"])
+        op_d = self._build_custom_ini_op("op-D", cfg, "K4", "0", "1", depends_on=["op-C"])
+
+        rec = self.orchestrator.create_execution("exec-48")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b, op_c, op_d])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        with patch.object(
+            self.editor,
+            "modify_ini_or_text",
+            return_value={"status": "error", "errors": ["Error en raíz op-A"]},
+        ) as spy_mod:
+            with self.assertRaises(RuntimeError):
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                )
+            self.assertEqual(spy_mod.call_count, 1)
+
+        self.assertEqual(op_a.status, OperationStatus.FAILED.value)
+        self.assertEqual(op_b.status, OperationStatus.BLOCKED.value)
+        self.assertEqual(op_c.status, OperationStatus.BLOCKED.value)
+        self.assertEqual(op_d.status, OperationStatus.BLOCKED.value)
+        self.assertEqual(rec.blocked_operations, ["op-B", "op-C", "op-D"])
+        self.assertFalse(plan.is_fully_completed())
+
+    def test_49_nonexistent_operation_id_rejected(self) -> None:
+        """49. (Grupo 7) Rechaza expresamente IDs inexistentes sin convertirlos en cancelaciones silenciosas."""
+        cfg = self.workspace_dir / "unknown_id.ini"
+        cfg.write_text("[ScalabilityGroups]\nsg.ShadowQuality=3\n", encoding="utf-8")
+
+        op_1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        rec = self.orchestrator.create_execution("exec-49")
+        plan = self._build_custom_plan(rec.execution_id, [op_1])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
+            with self.assertRaises(PolicyValidationError) as ctx:
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-999-inexistente"],
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+
+        self.assertIn("op-999-inexistente", str(ctx.exception))
+        # No debe quedar como CANCELLED silencioso, sino como REJECTED por validación fallida
+        self.assertEqual(rec.state, ChainState.REJECTED)
+        self.assertNotEqual(rec.state, ChainState.CANCELLED)
+
+    def test_50_mixed_valid_and_invalid_ids_rejected_atomically(self) -> None:
+        """50. (Grupo 8) Rechaza selecciones mixtas (ID válido + ID inválido) sin ejecutar la operación válida."""
+        cfg = self.workspace_dir / "mixed_ids.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+
+        op_1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        op_2 = self._build_custom_ini_op("op-002", cfg, "sg.TextureQuality", "3", "1")
+        rec = self.orchestrator.create_execution("exec-50")
+        plan = self._build_custom_plan(rec.execution_id, [op_1, op_2])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
+            with self.assertRaises(PolicyValidationError) as ctx:
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-001", "op-fantasma"],
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+
+        self.assertIn("op-fantasma", str(ctx.exception))
+        self.assertEqual(op_1.status, OperationStatus.PENDING.value)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+
+    def test_51_empty_selection_rejected_vs_explicit_cancellation(self) -> None:
+        """51. (Grupo 9) Distingue entre selección vacía al ejecutar (error de validación) y cancelación explícita."""
+        cfg = self.workspace_dir / "empty_sel.ini"
+        cfg.write_text("[ScalabilityGroups]\nsg.ShadowQuality=3\n", encoding="utf-8")
+
+        op_1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+
+        # Caso A: Selección vacía accidental `[]` al invocar execute_approved_plan -> PolicyValidationError
+        rec_empty = self.orchestrator.create_execution("exec-51-empty")
+        plan_empty = self._build_custom_plan(rec_empty.execution_id, [op_1])
+        sim_empty = self.orchestrator.simulate_plan(plan_empty)
+
+        with self.assertRaises(PolicyValidationError) as ctx_empty:
+            self.orchestrator.execute_approved_plan(
+                plan_empty,
+                approval_hash=sim_empty["approval_hash"],
+                user_approved=True,
+                approved_operation_ids=[],
+            )
+        self.assertIn("vacía", str(ctx_empty.exception).lower())
+        self.assertEqual(rec_empty.state, ChainState.REJECTED)
+
+        # Caso B: Selección con string en blanco `[""]` -> PolicyValidationError
+        rec_blank = self.orchestrator.create_execution("exec-51-blank")
+        plan_blank = self._build_custom_plan(rec_blank.execution_id, [op_1])
+        sim_blank = self.orchestrator.simulate_plan(plan_blank)
+
+        with self.assertRaises(PolicyValidationError):
+            self.orchestrator.execute_approved_plan(
+                plan_blank,
+                approval_hash=sim_blank["approval_hash"],
+                user_approved=True,
+                approved_operation_ids=["   "],
+            )
+        self.assertEqual(rec_blank.state, ChainState.REJECTED)
+
+        # Caso C: Cancelación explícita del usuario mediante cancel_plan() -> ChainState.CANCELLED
+        rec_cancel = self.orchestrator.create_execution("exec-51-cancel")
+        plan_cancel = self._build_custom_plan(rec_cancel.execution_id, [op_1])
+        self.orchestrator.simulate_plan(plan_cancel)
+        cancel_res = self.orchestrator.cancel_plan(
+            rec_cancel.execution_id, reason="Cancelación explícita solicitada por el usuario."
+        )
+        self.assertEqual(cancel_res["state"], ChainState.CANCELLED.value)
+        self.assertEqual(rec_cancel.state, ChainState.CANCELLED)
+
+    def test_52_zero_writes_and_zero_backups_when_preflight_fails(self) -> None:
+        """52. (Grupo 10) Demuestra mediante spies y verificación en disco que 0 backups y 0 escrituras ocurren si falla pre-flight."""
+        cfg = self.workspace_dir / "zero_side_effects.ini"
+        original_bytes = b"[ScalabilityGroups]\r\nsg.ShadowQuality=3\r\nsg.TextureQuality=3\r\n"
+        cfg.write_bytes(original_bytes)
+
+        op_a = self._build_custom_ini_op("op-A", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-A"]
+        )
+        rec = self.orchestrator.create_execution("exec-52")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        with (
+            patch.object(self.editor, "create_backup", wraps=self.editor.create_backup) as spy_backup,
+            patch.object(self.editor, "modify_ini_or_text", wraps=self.editor.modify_ini_or_text) as spy_modify,
+            patch.object(
+                self.editor,
+                "_atomic_write_bytes_with_retries",
+                wraps=self.editor._atomic_write_bytes_with_retries,
+            ) as spy_atomic,
+        ):
+            with self.assertRaises(PolicyValidationError):
+                # Falla en pre-flight porque op-B requiere op-A que no fue seleccionada
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-B"],
+                )
+
+            self.assertEqual(spy_backup.call_count, 0)
+            self.assertEqual(spy_modify.call_count, 0)
+            self.assertEqual(spy_atomic.call_count, 0)
+
+        self.assertEqual(cfg.read_bytes(), original_bytes)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+        self.assertEqual(rec.applied_backups, [])
+        self.assertEqual(rec.applied_operations, [])
+
+    def test_53_previously_executed_verifiable_dependency_allowed(self) -> None:
+        """53. (Grupo 11) Permite aprobar una operación cuya dependencia ya fue ejecutada y verificada en disco."""
+        cfg = self.workspace_dir / "prev_dep_ok.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n",
+            encoding="utf-8",
+        )
+
+        op_a = self._build_custom_ini_op("op-A", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-A"]
+        )
+        rec = self.orchestrator.create_execution("exec-53")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        # Etapa 1: El usuario aprueba y ejecuta únicamente op-A
+        res1 = self.orchestrator.execute_approved_plan(
+            plan,
+            approval_hash=sim["approval_hash"],
+            user_approved=True,
+            approved_operation_ids=["op-A"],
+        )
+        self.assertEqual(op_a.status, OperationStatus.APPLIED.value)
+        self.assertEqual(op_b.status, OperationStatus.PENDING.value)
+        self.assertFalse(res1["fully_completed"])
+        self.assertIsNotNone(op_a.executed_file_hash)
+
+        # Etapa 2: Ahora el usuario aprueba únicamente op-B (cuya dependencia op-A ya está APPLIED y verificada en disco)
+        res2 = self.orchestrator.execute_approved_plan(
+            plan,
+            approval_hash=sim["approval_hash"],
+            user_approved=True,
+            approved_operation_ids=["op-B"],
+        )
+        self.assertEqual(res2["state"], ChainState.COMPLETED.value)
+        self.assertTrue(res2["fully_completed"])
+        self.assertEqual(res2["plan_status"], "COMPLETED")
+        self.assertEqual(op_b.status, OperationStatus.APPLIED.value)
+
+        final_text = cfg.read_text(encoding="utf-8")
+        self.assertIn("sg.ShadowQuality=1", final_text)
+        self.assertIn("sg.TextureQuality=1", final_text)
+        self.assertEqual(len(rec.applied_operations), 2)
+
+    def test_54_previously_executed_dependency_without_valid_evidence_rejected(self) -> None:
+        """54. (Grupo 12) Rechaza dependencia marcada como APPLIED si carece de evidencia real en disco o en registro."""
+        cfg = self.workspace_dir / "prev_dep_fake.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+
+        op_a = self._build_custom_ini_op("op-A", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg, "sg.TextureQuality", "3", "1", depends_on=["op-A"]
+        )
+        rec = self.orchestrator.create_execution("exec-54")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        # Manipulamos el estado de op-A a APPLIED sin haberla ejecutado realmente en disco
+        op_a.transition_status(OperationStatus.APPLIED, reason="Estado falso sin escritura")
+        object.__setattr__(op_a, "executed_file_hash", compute_sha256_file(cfg))
+
+        with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
+            with self.assertRaises(PolicyValidationError) as ctx:
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-B"],
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+
+        self.assertIn("evidencia", str(ctx.exception).lower())
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+
+    def test_55_duplicate_operation_ids_in_plan_and_selection_rejected(self) -> None:
+        """55. (Grupo 13) Rechaza IDs duplicados tanto en la definición del plan como en la selección de aprobación."""
+        cfg = self.workspace_dir / "dup_ids.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n",
+            encoding="utf-8",
+        )
+
+        # 1. IDs duplicados dentro del plan
+        op_1 = self._build_custom_ini_op("op-dup", cfg, "sg.ShadowQuality", "3", "1")
+        op_2 = self._build_custom_ini_op("op-dup", cfg, "sg.TextureQuality", "3", "1")
+        rec1 = self.orchestrator.create_execution("exec-55-plan")
+        bad_plan = self._build_custom_plan(rec1.execution_id, [op_1, op_2])
+
+        with self.assertRaises(PolicyValidationError) as ctx_plan:
+            self.orchestrator.simulate_plan(bad_plan)
+        self.assertIn("duplicado", str(ctx_plan.exception).lower())
+
+        # 2. IDs duplicados en approved_operation_ids
+        op_a = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op("op-002", cfg, "sg.TextureQuality", "3", "1")
+        rec2 = self.orchestrator.create_execution("exec-55-sel")
+        valid_plan = self._build_custom_plan(rec2.execution_id, [op_a, op_b])
+        sim = self.orchestrator.simulate_plan(valid_plan)
+
+        with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
+            with self.assertRaises(PolicyValidationError) as ctx_sel:
+                self.orchestrator.execute_approved_plan(
+                    valid_plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-001", "op-001"],
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+        self.assertIn("duplicados", str(ctx_sel.exception).lower())
+
+    def test_56_self_referential_dependency_rejected(self) -> None:
+        """56. (Grupo 14) Rechaza cualquier operación que declare dependencia autorreferencial (A -> A)."""
+        cfg = self.workspace_dir / "self_dep.ini"
+        cfg.write_text("[ScalabilityGroups]\nsg.ShadowQuality=3\n", encoding="utf-8")
+
+        op_self = self._build_custom_ini_op(
+            "op-self", cfg, "sg.ShadowQuality", "3", "1", depends_on=["op-self"]
+        )
+        rec = self.orchestrator.create_execution("exec-56")
+        plan = self._build_custom_plan(rec.execution_id, [op_self])
+
+        with self.assertRaises(PolicyValidationError) as ctx:
+            self.orchestrator.simulate_plan(plan)
+        self.assertIn("autorreferencial", str(ctx.exception).lower())
+        self.assertEqual(rec.state, ChainState.REJECTED)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+
+    def test_57_plan_or_selection_modified_after_approval_invalidates_authorization(self) -> None:
+        """57. (Grupo 15) Cualquier modificación de campos o de la selección vinculada tras aprobar invalida la autorización."""
+        cfg = self.workspace_dir / "tamper_after.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+
+        # Subcaso A: Modificar depends_on después de simulate_plan invalida el approval_hash
+        op_1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        op_2 = self._build_custom_ini_op("op-002", cfg, "sg.TextureQuality", "3", "1")
+        rec_a = self.orchestrator.create_execution("exec-57a")
+        plan_a = self._build_custom_plan(rec_a.execution_id, [op_1, op_2])
+        sim_a = self.orchestrator.simulate_plan(plan_a)
+
+        # Mutamos depends_on e incluso intentamos pasar el nuevo plan.approval_hash()
+        op_2.depends_on.append("op-001")
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan_a,
+                approval_hash=plan_a.approval_hash(),
+                user_approved=True,
+            )
+
+        # Subcaso B: Modificar las operaciones seleccionadas después de vincular la aprobación selectiva
+        op_3 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        op_4 = self._build_custom_ini_op("op-002", cfg, "sg.TextureQuality", "3", "1")
+        rec_b = self.orchestrator.create_execution("exec-57b")
+        plan_b = self._build_custom_plan(rec_b.execution_id, [op_3, op_4])
+        sim_b = self.orchestrator.simulate_plan(
+            plan_b, selected_operation_ids=["op-001"]
+        )
+
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan_b,
+                approval_hash=sim_b["approval_hash"],
+                user_approved=True,
+                approved_operation_ids=["op-001", "op-002"],
+            )
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
+
+    def test_58_altered_or_cross_plan_approval_hash_rejected(self) -> None:
+        """58. (Grupo 16) Rechaza un hash alterado o la reutilización de un approval_hash de otro plan."""
+        cfg = self.workspace_dir / "cross_plan.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+
+        op_p1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        rec1 = self.orchestrator.create_execution("exec-58-plan1")
+        plan1 = self._build_custom_plan(rec1.execution_id, [op_p1], plan_id="plan-alpha")
+        sim1 = self.orchestrator.simulate_plan(plan1)
+
+        op_p2 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "2")
+        rec2 = self.orchestrator.create_execution("exec-58-plan2")
+        plan2 = self._build_custom_plan(rec2.execution_id, [op_p2], plan_id="plan-beta")
+        self.orchestrator.simulate_plan(plan2)
+
+        # Intentar ejecutar plan2 usando el approval_hash válido de plan1
+        with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
+            with self.assertRaises(ApprovalBindingError):
+                self.orchestrator.execute_approved_plan(
+                    plan2,
+                    approval_hash=sim1["approval_hash"],
+                    user_approved=True,
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+
+        self.assertEqual(rec2.state, ChainState.REJECTED)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
+
+    def test_59_accidental_reexecution_of_applied_operation_rejected(self) -> None:
+        """59. (Grupo 17) Impide volver a aplicar accidentalmente una operación APPLIED o un plan completado."""
+        cfg = self.workspace_dir / "idempotency.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n",
+            encoding="utf-8",
+        )
+
+        op_a = self._build_custom_ini_op("op-A", cfg, "sg.ShadowQuality", "3", "1")
+        op_b = self._build_custom_ini_op("op-B", cfg, "sg.TextureQuality", "3", "1")
+        rec = self.orchestrator.create_execution("exec-59")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        # Aplicamos op-A en el primer paso
+        self.orchestrator.execute_approved_plan(
+            plan,
+            approval_hash=sim["approval_hash"],
+            user_approved=True,
+            approved_operation_ids=["op-A"],
+        )
+        self.assertEqual(op_a.status, OperationStatus.APPLIED.value)
+        self.assertEqual(len(list(self.backup_dir.glob("*.bak"))), 1)
+
+        # Intentar volver a ejecutar op-A (sola o junto con op-B) debe rechazarse con DuplicateExecutionError
+        with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
+            with self.assertRaises(DuplicateExecutionError):
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    approved_operation_ids=["op-A", "op-B"],
+                )
+            self.assertEqual(spy_mod.call_count, 0)
+
+        self.assertEqual(len(list(self.backup_dir.glob("*.bak"))), 1)
+
+    def test_60_independent_operations_behavior_on_failure(self) -> None:
+        """60. (Grupo 18) Verifica el comportamiento de operaciones independientes ante un fallo y que el plan no se declare COMPLETED."""
+        cfg_fail = self.workspace_dir / "game_video.ini"
+        cfg_indep = self.workspace_dir / "game_audio.ini"
+        cfg_fail.write_text("[ScalabilityGroups]\nShadow=3\nPostProcess=3\n", encoding="utf-8")
+        cfg_indep.write_text("[Audio]\nMasterVolume=100\n", encoding="utf-8")
+
+        op_a = self._build_custom_ini_op("op-A", cfg_fail, "Shadow", "3", "1")
+        op_b = self._build_custom_ini_op(
+            "op-B", cfg_fail, "PostProcess", "3", "1", depends_on=["op-A"]
+        )
+        op_indep = self._build_custom_ini_op(
+            "op-Indep", cfg_indep, "MasterVolume", "100", "80", section="Audio"
+        )
+
+        rec = self.orchestrator.create_execution("exec-60")
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b, op_indep])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        real_modify = self.editor.modify_ini_or_text
+
+        def fail_only_video(file_path: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            if Path(str(file_path)).name == "game_video.ini":
+                return {"status": "error", "errors": ["Fallo simulado en archivo de video"]}
+            return real_modify(file_path, *args, **kwargs)
+
+        # Con continue_independent=True y auto_rollback=False:
+        # op-A falla (FAILED), op-B se bloquea (BLOCKED), y op-Indep (en otro archivo) se aplica (APPLIED),
+        # pero el plan global termina en FAILED (jamás COMPLETED).
+        with patch.object(self.editor, "modify_ini_or_text", side_effect=fail_only_video):
+            with self.assertRaises(RuntimeError):
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                    continue_independent=True,
+                    auto_rollback=False,
+                )
+
+        self.assertEqual(op_a.status, OperationStatus.FAILED.value)
+        self.assertEqual(op_b.status, OperationStatus.BLOCKED.value)
+        self.assertEqual(op_indep.status, OperationStatus.APPLIED.value)
+        self.assertEqual(rec.state, ChainState.FAILED)
+        self.assertFalse(plan.is_fully_completed())
+        self.assertIn("MasterVolume=80", cfg_indep.read_text(encoding="utf-8"))
+        self.assertEqual(len(rec.applied_operations), 1)
+        self.assertEqual(rec.applied_operations[0]["operation_id"], "op-Indep")
+
+    def test_61_failure_during_write_preserves_evidence_and_protects_external_user_edits(self) -> None:
+        """61. (Grupo 19) Verifica que un fallo de escritura preserve la evidencia previa y no sobrescriba ediciones externas del usuario."""
+        cfg = self.workspace_dir / "partial_protect.ini"
+        cfg.write_text(
+            "[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n",
+            encoding="utf-8",
+        )
+
+        op_1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        op_2 = self._build_custom_ini_op("op-002", cfg, "sg.TextureQuality", "3", "1")
+        rec = self.orchestrator.create_execution("exec-61")
+        plan = self._build_custom_plan(rec.execution_id, [op_1, op_2])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        real_modify = self.editor.modify_ini_or_text
+        call_num = {"n": 0}
+        user_manual_content = (
+            "[ScalabilityGroups]\nsg.ShadowQuality=1\nsg.TextureQuality=3\nUserCustomSetting=42\n"
+        )
+
+        def fail_second_after_external_user_edit(
+            file_path: Any, *args: Any, **kwargs: Any
+        ) -> dict[str, Any]:
+            call_num["n"] += 1
+            if call_num["n"] == 1:
+                return real_modify(file_path, *args, **kwargs)
+            # Simulamos que el usuario editó manualmente el archivo justo antes del fallo de op-002
+            cfg.write_text(user_manual_content, encoding="utf-8")
+            return {"status": "error", "errors": ["Fallo durante escritura de op-002"]}
+
+        with patch.object(
+            self.editor, "modify_ini_or_text", side_effect=fail_second_after_external_user_edit
+        ):
+            with self.assertRaises(RuntimeError):
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                )
+
+        # 1. op-001 conserva su estado APPLIED y su evidencia en record.applied_operations
+        self.assertEqual(op_1.status, OperationStatus.APPLIED.value)
+        self.assertEqual(len(rec.applied_operations), 1)
+        self.assertEqual(rec.applied_operations[0]["operation_id"], "op-001")
+        # 2. op-002 queda como FAILED y no se registra como aplicada
+        self.assertEqual(op_2.status, OperationStatus.FAILED.value)
+        self.assertEqual(len(rec.failed_operations), 1)
+        # 3. El rollback automático detectó la edición externa del usuario y NO sobrescribió UserCustomSetting=42
+        self.assertEqual(rec.state, ChainState.FAILED)
+        self.assertIn("UserCustomSetting=42", cfg.read_text(encoding="utf-8"))
+
+    def test_62_inconsistency_between_state_and_real_disk_result_and_readonly_cleanup(self) -> None:
+        """62. (Grupo 20) Detecta inconsistencia si modify_ini_or_text reporta éxito sin escribir en disco, protege estados terminales y limpia archivos read-only."""
+        cfg = self.workspace_dir / "inconsistent.ini"
+        original_text = "[ScalabilityGroups]\nsg.ShadowQuality=3\n"
+        cfg.write_text(original_text, encoding="utf-8")
+        orig_sha = compute_sha256_file(cfg)
+
+        op_1 = self._build_custom_ini_op("op-001", cfg, "sg.ShadowQuality", "3", "1")
+        rec = self.orchestrator.create_execution("exec-62")
+        plan = self._build_custom_plan(rec.execution_id, [op_1])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        # Simulamos que modify_ini_or_text devuelve "success" mintiendo sobre la escritura real en disco
+        fake_success = {
+            "status": "success",
+            "file_path": str(cfg),
+            "original_hash": orig_sha,
+            "final_hash": orig_sha,
+            "backup_path": None,
+            "applied_changes": [{"section": "ScalabilityGroups", "key": "sg.ShadowQuality", "old_value": "3", "new_value": "1"}],
+            "errors": [],
+            "warnings": [],
+            "execution_id": rec.execution_id,
+        }
+
+        with patch.object(self.editor, "modify_ini_or_text", return_value=fake_success):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.orchestrator.execute_approved_plan(
+                    plan,
+                    approval_hash=sim["approval_hash"],
+                    user_approved=True,
+                )
+
+        self.assertIn("inconsistencia", str(ctx.exception).lower())
+        # La operación jamás debe quedar en APPLIED si la verificación en disco falló
+        self.assertEqual(op_1.status, OperationStatus.FAILED.value)
+        self.assertEqual(rec.applied_operations, [])
+        self.assertEqual(rec.state, ChainState.FAILED)
+
+        # Intentar modificar silenciosamente el estado terminal FAILED a APPLIED o PENDING debe fallar
+        with self.assertRaises(PolicyValidationError):
+            op_1.status = OperationStatus.APPLIED.value
+        with self.assertRaises(PolicyValidationError):
+            op_1.transition_status(OperationStatus.PENDING)
+
+        # Además creamos un archivo con atributo de solo lectura dentro del directorio temporal
+        # para verificar que tearDown restaure permisos y lo elimine sin errores en Windows.
+        ro_file = self.workspace_dir / "readonly_test.ini"
+        ro_file.write_text("[RO]\nLocked=1\n", encoding="utf-8")
+        os.chmod(ro_file, stat.S_IREAD)
 
 
 if __name__ == "__main__":

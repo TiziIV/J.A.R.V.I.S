@@ -367,5 +367,53 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
 - Suite completa del repositorio:
   `.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **381 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)**.
 
+---
+
+## Cambios de esta iteración (2026-11-03 — Fase de Endurecimiento, Integridad y Validación de ChainOrchestrator)
+
+### 1. Validación Pre-Flight y Grafo de Dependencias (`src/brain/chain_orchestrator.py`)
+- **`PolicyEngine.validate_dependency_graph` y `ChainOrchestrator.preflight_validate`:**
+  - Mecanismo centralizado de validación previa (pre-flight) ejecutado íntegramente en memoria antes de abrir cualquier archivo en modo escritura o generar backups.
+  - Verifica IDs únicos y no vacíos, ausencia de dependencias autorreferenciales (`A -> A`), existencia de todas las dependencias declaradas y compatibilidad con el estado actual de cada operación.
+  - Detecta ciclos dirigidos mediante **DFS de 3 colores** (`0=no visitado`, `1=en pila de recursión`, `2=completado`) reportando la ruta exacta del ciclo (`A -> B -> A`).
+  - Genera un orden de ejecución topológico determinista mediante **algoritmo de Kahn con cola de prioridad (`heapq`)** ponderada por el índice original de aparición, garantizando que ante una selección invertida (`[C, B, A]` donde `C -> B -> A`) la ejecución respete estrictamente `A -> B -> C` y que las operaciones independientes conserven su orden original.
+
+### 2. Modelo de Estados de Operación e Idempotencia (`OperationStatus`)
+- **`OperationStatus(str, Enum)`:**
+  - Estados formales por operación: `PENDING`, `APPLIED` (con alias `EXECUTED`), `FAILED` y `BLOCKED`.
+  - Transiciones controladas mediante `ALLOWED_OPERATION_STATUS_TRANSITIONS` (`PENDING -> {APPLIED, FAILED, BLOCKED}`) registradas en `ChangeOperation.status_history`.
+  - **Inmutabilidad de estados terminales:** `ChangeOperation.__setattr__` y `transition_status` impiden modificar silenciosamente el estado una vez alcanzado un estado terminal (`APPLIED`, `FAILED`, `BLOCKED`).
+  - **Prevención de reejecución accidental y verificación real en disco:** Se rechaza con `DuplicateExecutionError` reejecutar operaciones ya `APPLIED`, y `_verify_single_operation_on_disk` comprueba el contenido real del archivo en disco antes de declarar una operación como aplicada.
+  - **Integridad de estado del plan (`ChangePlan.is_fully_completed`):** Un plan que conserve operaciones en estado `PENDING`, `FAILED` o `BLOCKED` nunca se declara `fully_completed=True` (reporta `plan_status="PARTIALLY_APPLIED"` en ejecuciones selectivas parciales).
+
+### 3. Aprobación Selectiva e Integridad Criptográfica SHA-256
+- **Validación de selección (`selected_operation_ids`):**
+  - Rechaza expresamente IDs desconocidos, selecciones mixtas (ID válido + ID inválido), IDs duplicados en la selección y selecciones vacías (`[]`), distinguiendo errores de validación respecto de la cancelación explícita del usuario (`cancel_plan()` -> `ChainState.CANCELLED`).
+  - Verifica dependencias directas y transitivas de las operaciones seleccionadas: una dependencia no incluida en la selección solo se admite si ya figura en `OperationStatus.APPLIED` y supera `_verify_completed_dependency_evidence` (existencia de `executed_file_hash`, registro verificable en `execution_records` o backup en disco y coincidencia de estado real en el archivo).
+- **Vinculación criptográfica (`approval_hash` y `bind_selective_approval`):**
+  - `ChangePlan.canonical_json()` serializa de forma determinista todos los campos relevantes de cada operación (`operation_id`, `target_path`, `format`, `section`, `key`, `old_value`, `new_value`, `value_type`, `evidence_level`, `risk_level`, `requires_approval`, `reversible`, `verification_method`, `depends_on`, `original_file_hash`).
+  - El hash SHA-256 se recalcula inmediatamente antes de ejecutar (`execute_approved_plan`); cualquier alteración posterior a la aprobación en las operaciones del plan o en la lista vinculada por `bind_selective_approval` invalida la autorización (`ApprovalBindingError`).
+
+### 4. Propagación de Errores, Backups y Operaciones Parciales
+- **Propagación transitiva (`_propagate_blocked_status`):**
+  - Si una operación `A` falla durante la escritura, pasa a `OperationStatus.FAILED` y todas sus dependientes directas y transitivas (`B`, `C`, ...) transicionan inmediatamente a `OperationStatus.BLOCKED` sin invocar `FileEditorSkill` ni crear backups para ellas.
+  - Cuando `continue_independent=True` y `auto_rollback=False`, las operaciones independientes continúan su ejecución y el resultado parcial conserva la evidencia completa de las operaciones aplicadas (`applied_operations`, `failed_operations`, `blocked_operations`).
+- **Protección de ediciones externas en rollback (`_rollback_applied_records`):**
+  - El rollback automático pasa `expected_current_hash=latest_rec.post_edit_sha256` a `FileEditorSkill.rollback`, garantizando que jamás se sobrescriban cambios manuales legítimos realizados por el usuario después de una operación.
+
+### 5. Aislamiento Determinista de Tests en Windows (`tests/test_file_editor_and_chain.py`)
+- Se reemplazó `tempfile.TemporaryDirectory()` del directorio `%TEMP%` global por una raíz temporal dedicada y configurable mediante `JARVIS_TEST_TEMP_ROOT` (por defecto `BASE_DIR / "temp" / "jarvis_test_isolated"`), resuelta canónicamente con `Path.resolve()`.
+- Cada test crea un subdirectorio único aislado e inyecta sus raíces autorizadas en la instancia de prueba de `FileEditorSkill` sin debilitar las validaciones de producción.
+- La rutina de limpieza `_rmtree_strict_windows` utiliza `onexc` (Python 3.12+) / `onerror` para restaurar `stat.S_IWRITE` únicamente al eliminar archivos de prueba marcados como solo lectura, verificando que no queden directorios huérfanos y propagando cualquier error inesperado.
+
+### 6. Resultados Reales de Verificación
+- Compilación estática:
+  `.\venv\Scripts\python.exe -m py_compile skills/file_editor_skill.py src/brain/chain_orchestrator.py tests/test_file_editor_and_chain.py` → **Código de salida 0 (OK)**.
+- Suite específica de `FileEditorSkill` y `ChainOrchestrator` (42 escenarios originales + 20 nuevos grupos de endurecimiento):
+  `.\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain -v` → **62 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)** en 6.805s.
+- Suite global del repositorio:
+  `.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **401 pruebas ejecutadas, 0 fallos, 0 errores (100% OK)** en 30.444s.
+
+
 
 
