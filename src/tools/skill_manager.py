@@ -1,6 +1,7 @@
 import traceback
 from skills.base_skill import BaseSkill
 from skills.file_editor_skill import FileEditorSkill
+from skills.document_export_skill import DocumentExportSkill
 from skills.system_skills import (
     TimeSkill,
     AppLauncherSkill,
@@ -61,6 +62,8 @@ class SkillManager:
         self.register_skill(SystemPowerSkill())
         # Editor seguro de archivos con backups SHA-256, validación de rutas y escritura atómica:
         self.register_skill(FileEditorSkill())
+        # Exportación documental y Modo Estudio para Markdown y Word (.docx):
+        self.register_skill(DocumentExportSkill())
 
     def get_skills_manifest(self) -> list[dict]:
         """
@@ -80,13 +83,14 @@ class SkillManager:
             })
         return manifest
 
-    def execute_skill(self, skill_name: str, **kwargs) -> str:
+    def execute_skill(self, skill_name: str, params: dict | None = None, **kwargs) -> str:
         """
         Busca una skill registrada por su nombre y ejecuta su método execute con los argumentos dados.
         
         Args:
-            skill_name (str): Nombre identificador de la skill (ej. 'system_time', 'app_launcher').
-            **kwargs: Argumentos necesarios para la ejecución de la skill.
+            skill_name (str): Nombre identificador de la skill (ej. 'system_time', 'app_launcher', 'document_export').
+            params (dict, optional): Parámetros empaquetados en diccionario (opcional).
+            **kwargs: Argumentos directos por clave necesarios para la ejecución de la skill.
             
         Returns:
             str: Resultado de la ejecución en lenguaje natural listo para TTS.
@@ -97,10 +101,16 @@ class SkillManager:
 
         skill_instance = self.skills[skill_name]
         
+        # Consolidar parámetros recibidos como diccionario posicional o vía kwargs
+        exec_args: dict = {}
+        if isinstance(params, dict):
+            exec_args.update(params)
+        exec_args.update(kwargs)
+
         try:
-            print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {kwargs}")
+            print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {exec_args}")
             # Ejecutamos el método execute de la skill concreta
-            result = skill_instance.execute(**kwargs)
+            result = skill_instance.execute(**exec_args)
             return result
             
         except Exception as e:

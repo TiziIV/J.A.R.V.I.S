@@ -52,3 +52,6 @@ data/
 # Coverage y datos locales
 .coverage
 data/
+
+# Exportaciones documentales de usuario
+exports/

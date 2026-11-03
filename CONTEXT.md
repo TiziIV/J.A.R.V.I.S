@@ -417,3 +417,304 @@ Asistente modular de voz para Windows, con transcripción local mediante faster-
 
 
 
+
+## Fase de corrección de integridad, autorización y recuperación del ChainOrchestrator (2026-11-03)
+
+### Estado implementado
+
+- `src/brain/chain_orchestrator.py`: se agregaron `ROLLED_BACK` y `ROLLBACK_FAILED` para operaciones. Solo se llega a `ROLLED_BACK` después de restaurar y comprobar en disco el SHA-256 original; un error deja estado explícito `ROLLBACK_FAILED`. El historial conserva la etapa anterior `APPLIED`, motivo, hora y referencia al backup. El rollback manual rechaza repetición completa y reanuda únicamente backups cuyas operaciones siguen aplicadas o tienen reversión fallida; `force=True` queda rechazado para no omitir la defensa frente a cambios externos. Rollback parcial conserva resumen y operaciones ya revertidas.
+- La autorización se separa del hash de integridad: un nonce de alta entropía se emite solo después de una respuesta afirmativa en el flujo de consola, con vencimiento, `plan_id`, `execution_id`, hash canónico y selección en orden determinista. El token se busca por clave exacta y su consumo se serializa con un lock de un solo uso. `user_approved=True` ya no autoriza ejecución por sí solo. El límite declarado es el proceso local: código arbitrario dentro del proceso podría eludir el flujo de consola.
+- Después de la confirmación, la definición de cada operación se congela; la simulación mantiene una instantánea serializada, y la ejecución reconstruye las operaciones desde ella, restaurando su estado de ejecución desde un registro interno. Así, la modificación del objeto externo no modifica silenciosamente la acción aplicada.
+- El grafo usa Kahn iterativo para orden y detección de ciclos, sin DFS recursivo. `CHAIN_MAX_OPERATIONS` limita planes (predeterminado 5000); `CHAIN_APPROVAL_TTL_SECONDS` define la duración predeterminada del token (300 s).
+- La evidencia de dependencias comprueba el valor de la operación y que el hash en disco coincida con el último paso registrado para ese archivo, permitiendo operaciones compatibles sucesivas sobre el mismo archivo.
+- Las operaciones independientes omitidas por política se registran con ID, ruta y motivo en `skipped_operations` y en el audit logger. Las dependencias que no pueden continuar conservan `BLOCKED`.
+- `main.py`: el flujo `/optimizar` obtiene el token interactivo después de que el usuario seleccione y confirme las operaciones. `config/settings.py`: límites locales configurables. `tests/test_file_editor_and_chain.py`: se mantienen las 62 pruebas originales y se agregan once pruebas de estados de rollback, autorización, congelamiento/instantánea, grafo de 2000 nodos y límite máximo, selección ordenada, expiración/reutilización, omisiones, rollback parcial reanudable y evidencia transitiva en sucesivas ediciones del mismo archivo.
+
+### Verificaciones realmente ejecutadas
+
+- `python -m py_compile skills/file_editor_skill.py src/brain/chain_orchestrator.py tests/test_file_editor_and_chain.py main.py config/settings.py`: correcto, sin errores de sintaxis.
+- La orden solicitada `python -m unittest tests.test_file_editor_and_chain -v` no puede importar el módulo en este intérprete porque falta `psutil`. Como verificación aislada, se ejecutó la misma suite con `psutil` sustituido en memoria (las pruebas del orquestador no requieren su cálculo de CPU/RAM): **73 pruebas, 0 fallos, 0 errores**.
+- La suite global se intentó antes del ajuste final de estados de rollback y terminó con **277 pruebas, 9 fallos y 26 errores**. El intérprete no tiene, entre otras dependencias, `edge_tts`; varias pruebas de memoria también fallaron por estado compartido en `data/memory_store.json`. No se repitió después del ajuste final para evitar más escrituras al almacenamiento compartido; esa ejecución no certifica la versión final ni el repositorio completo.
+- Esa ejecución global accedió e intentó persistir datos de prueba en `data/memory_store.json`. No se inspeccionó su contenido ni se restauró porque el archivo está ignorado y no existe una copia base segura conocida; preservarlo evita sobrescribir datos locales del usuario.
+- No se probó hardware físico, GPU, micrófono ni reproducción; no son parte de esta fase de orquestación.
+
+### Pendiente y riesgos
+
+- Repetir la suite específica y global con el entorno virtual/dependencias del proyecto correctamente instaladas y con los tests de memoria aislados de los datos locales.
+- No se ejecutó commit ni push: la condición solicitada para publicarlos exige que toda la suite pase, y la suite global no pasó. No se creó tag. El árbol preparado se mantuvo vacío.
+- El token es una garantía del flujo de autorización controlado por la aplicación dentro de este proceso, no una frontera contra código local comprometido. La evidencia de cambios compatibles depende del registro en memoria de la ejecución; no implementa persistencia/recovery manager.
+- No se inició la fase `ChangePlan Recovery & Transaction Manager`.
+
+## Fase de aislamiento de memoria y seguridad de tests (2026-11-03)
+
+### Protección inicial del archivo real
+
+- `data/memory_store.json` existía al inicio: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`.
+- Se creó antes de ejecutar pruebas una copia externa y única en `C:\Users\MV\AppData\Local\Temp\JARVIS_MEMORY_SAFETY_BACKUPS\memory_store_20261103_115628_426.json`. Copia y original coinciden en tamaño y SHA-256. No se mostró ni se usó el contenido del archivo real.
+- Tras los conjuntos específicos, integraciones, ChainOrchestrator y suite global (incluidos ambos intentos globales), el original permaneció en **1.218 bytes** y con el mismo SHA-256. No se restauró ni modificó.
+
+### Auditoría y causa raíz
+
+- El almacenamiento se implementa en `src/brain/memory.py`. `ConversationMemory.__init__` carga el archivo configurado; `add_message`, `set_preference` y `clear` disparan `save_to_disk`; `load_from_disk` y `save_to_disk` también aceptan una ruta sobrescrita.
+- Mapa: `main.py` crea `ConversationMemory` → lo inyecta en `BrainManager` → `IntentRouter` usa la memoria de la solicitud; en modo voz, `run_voice_session` reutiliza esa instancia o crea una. El constructor de `BrainManager` solo conserva la instancia inyectada y no crea persistencia global. Importar `src.brain.memory` no crea una instancia ni carga el JSON.
+- La causa del acceso previo es que varias pruebas crean `ConversationMemory()` con la ruta real predeterminada. La protección anterior dependía de detectar `unittest` junto con argumentos de consola, permitía omisión si `JARVIS_FORCE_PERSISTENCE` estaba definida y no validaba `save_to_disk(file_path=...)` ni `load_from_disk(file_path=...)`. La suite anterior reportada en este contexto encontró fallos de memoria con estado compartido; no hay traza histórica suficiente para atribuir cada escritura previa a una prueba individual.
+
+### Aislamiento implementado
+
+- En `src/brain/memory.py`, los ejecutores detectados (`unittest` o `pytest`) redirigen el valor predeterminado a un archivo JSON con nombre aleatorio bajo `JARVIS_TEST_TEMP_ROOT`; el valor por defecto es `temp/jarvis_test_isolated/`, ignorado por Git. Cada instancia obtiene un archivo distinto para que no recupere datos de ejecuciones anteriores.
+- Las rutas se canonicalizan y, en modo de pruebas, constructor, carga y guardado solo aceptan rutas bajo la raíz autorizada. `JARVIS_FORCE_PERSISTENCE` ya no elude el control. `storage_file=None` continúa desactivando persistencia explícitamente. En ejecución de producción sin runner de pruebas, la ruta y el formato existentes se conservan.
+- Cada guardado usa un temporal aleatorio y `os.replace`; un lock por instancia serializa los guardados simultáneos y `finally` limpia temporales remanentes. Esto elimina colisiones de nombres observadas durante las pruebas concurrentes en Windows.
+- Las pruebas de persistencia existentes usan ahora archivos dentro del directorio temporal dedicado. Se añadió `tests/test_memory_isolation.py` con cobertura de ruta Windows, aislamiento por instancia, crear/actualizar/eliminar, reinicialización, rechazo de rutas externas incluso con `JARVIS_FORCE_PERSISTENCE`, intentos de acceso y ausencia de instancia global retenida.
+
+### Verificaciones realmente ejecutadas
+
+- Memoria específica, orden normal: `tests.test_memory_isolation`, `tests.test_memory_persistence`, `tests.test_memory_window`, `tests.test_memory_overflow` → **42 pruebas, OK**.
+- Los mismos módulos en orden inverso → **42 pruebas, OK**.
+- Integración de persistencia de `tests.test_advanced_features_mission` → **1 prueba, OK**.
+- Integraciones relacionadas y ChainOrchestrator/FileEditor: conjunto combinado con los módulos de memoria, `test_advanced_features_mission`, `test_brain_deliberation`, `test_intent_router_chaos`, `test_concurrency_and_locks` y `test_file_editor_and_chain` → **208 pruebas, OK**. `test_file_editor_and_chain` ejecutó sus 73 pruebas.
+- Concurrencia tras corregir temporales únicos y serializar guardados → **4 pruebas de concurrencia de memoria, OK**, sin errores de reemplazo.
+- `py_compile` sobre `src/brain/memory.py` y las pruebas afectadas → **OK**.
+- Suite global `python -m unittest discover -s tests -p 'test_*.py'` → **419 pruebas; 418 pasaron y 1 tuvo error**. El único error fue `test_codex_integration.TestCodexClientUnit.test_validate_workspace_rejects_outside_project_root`: durante la limpieza de su `TemporaryDirectory`, Windows devolvió `PermissionError [WinError 5]` en `shutil.rmtree`/`chmod`. Se repitió con `TEMP/TMP` en la raíz de visualizaciones autorizada y falló en la misma limpieza. No se alteró ese test ajeno a esta fase.
+- Dependencias del entorno virtual: `edge_tts`, `psutil` disponibles. No se instalaron dependencias ni se usaron sustitutos artificiales.
+- Hash posterior a cada bloque y al cierre: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`.
+
+### Estado de Git, limitaciones y siguiente paso
+
+- El historial completo del prompt se añadió a `prompts_history.txt`; `.gitignore` continúa excluyéndolo. `data/` también sigue ignorado.
+- Antes de esta fase ya estaban modificados `CONTEXT.md`, `config/settings.py`, `main.py`, `src/brain/chain_orchestrator.py` y `tests/test_file_editor_and_chain.py`; esos cambios preexistentes se conservaron. Esta fase agrega cambios en memoria y pruebas. No se prepararon archivos ni se hizo commit/tag/push porque la suite global no está completamente validada.
+- Limitación: los procesos de prueba personalizados que no carguen `unittest`/`pytest` deben configurar `JARVIS_ENV=test` o inyectar `storage_file` temporal. `JARVIS_TEST_TEMP_ROOT` solo puede seleccionar un subdirectorio de la raíz autorizada canónica.
+- Siguiente paso recomendado: resolver el error de permisos de limpieza del `TemporaryDirectory` en el entorno de ejecución y repetir la suite global completa. Hasta entonces, esta fase **no se declara completada** conforme al criterio de aceptación solicitado.
+
+- Durante los dos intentos globales quedó un directorio temporal de TemporaryDirectory bajo la raíz autorizada de visualizaciones; la limpieza también fue rechazada por PermissionError al enumerar/chmod. No se pudo retirarlo desde esta sesión y no contiene datos del proyecto conocidos.
+
+- El conteo global de 419 corresponde al intento anterior a la última prueba que bloquea la redefinición de la raíz. La versión final sí pasó los conjuntos dirigidos actualizados (42 pruebas de memoria; 208 pruebas combinadas), pero no se repitió la suite global completa después de ese endurecimiento.
+
+## Fase de corrección de WinError 5 en test_codex_integration (2026-11-03)
+
+### Diagnóstico reproducido
+
+- Comando original reproducido: `python -m unittest tests.test_codex_integration.TestCodexClientUnit.test_validate_workspace_rejects_outside_project_root -v`. Falló al salir del contexto de `tempfile.TemporaryDirectory`, con `PermissionError [WinError 5]` en `os.walk`/`shutil.rmtree`; la recuperación intentó `chmod` (`tempfile._resetperms`) y también recibió `Access denied`.
+- La ruta concreta de reproducción fue `C:\Users\MV\AppData\Local\Temp\tmpg1ctsu7s`. La causa no es el comportamiento funcional de `validate_workspace`: el método solo resuelve la ruta, consulta `exists/is_dir` y rechaza el directorio externo. El bloque problemático no escribe archivos ni ejecuta procesos.
+- La suite usa `subprocess.run` simulado en los demás tests. En el test afectado, una regresión ahora exige que esa llamada no se invoque. El rastreo de procesos con `psutil` no encontró procesos inspeccionables con cwd ni archivos abiertos bajo la carpeta. 294 procesos no fueron inspeccionables por permisos del entorno; por ello no se afirma que se inspeccionaron todos los procesos del sistema.
+- Diagnóstico: la política de acceso del sandbox de esta sesión impide enumerar y cambiar permisos de los directorios aleatorios creados por Python bajo `%TEMP%` (y también ocurrió al redirigir `TEMP/TMP` a otra raíz permitida). No hay evidencia de un proceso hijo o handle abandonado. La raíz existente `%TEMP%` sí es legible y sirve para probar que `validate_workspace` rechaza una ruta fuera del proyecto.
+
+### Directorio pendiente de la ejecución anterior
+
+- Sigue existiendo `C:\Users\MV\.codex\visualizations\2026\11\03\01a1a1e9-158a-71d2-b044-0b0599c7096a\jarvis-suite-6b589977ceb24ada916d27d471404659`, creado durante el intento de suite con `TEMP/TMP` alternativos. Metadatos: atributo `Directory` (16), creación UTC `2026-11-03 15:03:58.679`, última modificación UTC `15:04:25.439`.
+- Se pudo leer su ACL; las entradas reportadas eran heredadas y no apareció una entrada Deny. No se pudo enumerar el contenido y una eliminación explícita del directorio falló por `Access denied`. `psutil` no encontró cwd/handles de procesos inspeccionables bajo esa ruta. Se deja intacto porque el entorno impide comprobar su contenido y demostrar que la eliminación sea segura.
+
+### Corrección y verificaciones de esta fase
+
+- `tests/test_codex_integration.py`: `test_validate_workspace_rejects_outside_project_root` usa el directorio `%TEMP%` existente en vez de crear un `TemporaryDirectory` que no aporta a la validación de límites. Conserva la comprobación de error `INVALID_REQUEST` y confirma que la validación no invoque `subprocess.run`. No se usa `ignore_cleanup_errors`, no se omite la prueba y no se modificó producción.
+- Reproducción previa al cambio: **1 test, 1 error**, duración 0,005 s.
+- Tras el cambio, el test aislado pasó. Después, `python -m unittest tests.test_codex_integration -v` se ejecutó dos veces: **18/18 aprobadas en cada ejecución**, 0 fallidas, 0 errores, 0 omitidas; cada corrida duró 0,024 s.
+- No se han ejecutado todavía la suite de memoria, la integración combinada ni la suite global de esta fase; quedan pendientes en el orden solicitado.
+- Integridad antes/después de la reproducción: `data/memory_store.json` sigue en 1.218 bytes y SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`.
+- El prompt íntegro de esta fase se agregó a `prompts_history.txt`, que permanece ignorado por Git.
+
+## Cierre de la estabilización temporal en Windows (2026-11-03)
+
+### Resultado final de la corrección
+
+- La causa quedó localizada en el sandbox de esta sesión: el test original solo necesitaba una ruta existente fuera del proyecto, pero creaba una carpeta aleatoria con `TemporaryDirectory`. El runner podía crearla, pero al limpiar no podía enumerarla ni aplicar el `chmod` de recuperación; no era una fuga de procesos, ni un handle del test, ni un defecto funcional de `validate_workspace`.
+- Corrección acotada en `tests/test_codex_integration.py`: la prueba valida directamente la raíz `%TEMP%` existente, confirma el rechazo `INVALID_REQUEST` y comprueba que `subprocess.run` no se invoque. No se crean recursos que requieran limpieza, no se oculta ningún error y no cambió código de producción.
+- Suite completa de Codex: `python -m unittest tests.test_codex_integration -v` → **18/18 aprobadas en dos ejecuciones consecutivas**, 0 fallidas, 0 errores, 0 omitidas (0,024 s cada ejecución).
+- Memoria: `tests.test_memory_isolation`, `tests.test_memory_persistence`, `tests.test_memory_window`, `tests.test_memory_overflow` → **42/42 aprobadas** (0,771 s).
+- Integración combinada actualizada (incluye las suites de memoria, BrainManager, IntentRouter, concurrencia, FileEditor/ChainOrchestrator y Codex) → **226/226 aprobadas**, 0 fallidas, 0 errores, 0 omitidas (14,292 s).
+- Suite global final, posterior a la corrección: `python -m unittest discover -s tests -p 'test_*.py'` → **420/420 aprobadas**, código de salida 0, 0 fallidas, 0 errores, 0 omitidas. Resumen de unittest: 23,681 s; tiempo medido de proceso: 26,994 s.
+
+### Integridad, temporales y Git
+
+- Antes y después de las ejecuciones, `data/memory_store.json` conservó **1.218 bytes** y SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`. No se leyó, modificó, eliminó ni restauró su contenido.
+- El directorio previo `...\visualizations\...\jarvis-suite-6b589977ceb24ada916d27d471404659` sigue presente. Tiene atributo Directory normal; la ACL pudo consultarse y las entradas visibles eran heredadas sin Deny explícito. La enumeración y la eliminación fallaron con `Access denied`. `psutil` no observó procesos inspeccionables con cwd o archivos abiertos debajo de esa ruta; 294 procesos del sistema no fueron inspeccionables por permisos. Se deja intacto, sin forzar limpieza.
+- La reproducción original de esta fase creó `C:\Users\MV\AppData\Local\Temp\tmpg1ctsu7s`; su ACL tampoco pudo consultarse y la enumeración fue denegada. No se encontró proceso inspeccionable asociado. Se deja intacto bajo la misma regla de seguridad.
+- `git diff --check` pasó. `prompts_history.txt` y `data/` continúan ignorados. No hay archivos preparados; no se hizo commit, tag ni push por instrucción explícita.
+- Cambios de esta fase: `tests/test_codex_integration.py`, `CONTEXT.md` y `prompts_history.txt` (ignorado). Los cinco archivos que ya tenían cambios antes de esta fase, más el trabajo de aislamiento local, se conservaron.
+- Estado: criterio de validación de esta fase satisfecho; la eliminación de las dos carpetas residuales no se intentó forzar porque Windows/sandbox denegó acceso y no se pudo verificar su contenido.
+
+## Mini-fase N1–N10 — endurecimiento de memoria y autorización (2026-11-03)
+
+### Cambios en curso para revisión
+
+- `src/brain/chain_orchestrator.py`: bloquea asignaciones públicas de estado distintas al valor actual; `APPLIED` exige SHA-256 posterior, estado e historial de transición; `is_fully_completed()` verifica la evidencia de todas las operaciones. Rechaza sustituir un plan asociado a una ejecución, re-simular un plan con operaciones aplicadas o rollback fallido, y reutilizar IDs de ejecución. Modificaciones sobre archivos existentes requieren SHA-256 inicial con formato válido. El token se valida y consume bajo lock antes de transiciones de ejecución; tokens consumidos/vencidos se purgan. Se corrigió la documentación del grafo (Kahn).
+- `src/brain/memory.py`: modo test se activa solo con `JARVIS_ENV=test|testing`; ruta productiva absoluta anclada al proyecto; escritura atómica con temporal exclusivo, flush y fsync del archivo. POSIX sincroniza el directorio; Windows no permite usar el mismo mecanismo estándar de fsync para directorios. Se conserva el original corrupto y se bloquean guardados automáticos; existe recuperación explícita desde JSON válido con copia `.corrupt.<uuid>` verificada antes de reemplazar.
+- `skills/file_editor_skill.py`: el despacho público de `execute` rechaza backup/modificación/rollback; las APIs internas llamadas tras autorización por ChainOrchestrator permanecen separadas.
+- `tests/test_file_editor_and_chain.py`: la suite usa raíz exclusiva `temp/chain_test_runs/run_<uuid>` y solo elimina la raíz de su corrida; casos de estado falso y re-simulación se actualizan/añaden.
+- Pruebas de memoria agregan modo explícito, JSON corrupto, recuperación preservando copia y fallo de reemplazo. Las suites que construyen memoria por defecto declaran `JARVIS_ENV=test`.
+- N5 sigue reservado: no se agregó WAL, persistencia de ejecuciones, recuperación al arranque, HMAC persistente, locks interproceso ni Transaction Manager. La interfaz futura debe persistir snapshots aprobados, estados y hashes/evidencias; validar integridad y versión del esquema; recuperar bajo diseño explícito y coordinar transiciones entre procesos antes de permitir reanudación.
+
+### Verificación
+
+- Estado de pruebas: modificaciones recientes aún no verificadas al momento de esta anotación. Se registrarán abajo los resultados realmente obtenidos en orden N1–N10.
+- El archivo `data/memory_store.json` no se debe usar como fixture; antes de cada suite se comprobarán tamaño y SHA-256 frente a la referencia documentada.
+- Sin commit, tag, push, reset ni limpieza de estado preexistente.
+
+## Cierre de implementación N1–N10 (2026-11-03)
+
+### Estado por hallazgo
+
+- N1: implementado; re-simulación rechazada para planes aplicados o con rollback fallido; sustitución del plan y reutilización del ID de ejecución rechazadas. La selección parcial continúa por aprobación nueva sin re-simular.
+- N2: implementado; asignación pública no cambia estados, `APPLIED` requiere autoridad interna posterior a verificación de disco, SHA-256 e historial. `is_fully_completed()` exige evidencia interna válida para cada operación. La transición central sincroniza el estado del plan enviado y el del registro.
+- N3: implementado con `JARVIS_ENV=test|testing` explícito. La ruta predeterminada de producción se ancla a la raíz del proyecto; el runner o `openwakeword` por sí solos no activan aislamiento. En modo test la ruta productiva y overrides fuera de la raíz se rechazan.
+- N4: implementado; estados de almacenamiento para ausente/cargado/corrupto/ilegible, bloqueo de guardado al detectar corrupción, escritura temporal exclusiva con flush/fsync y replace atómico, y recuperación explícita desde archivo válido tras copia única `.corrupt.<uuid>` con verificación SHA-256. POSIX sincroniza el directorio; Windows no ofrece el mismo fsync de directorio estándar.
+- N5: reservado y no implementado. No hay WAL, persistencia de ejecuciones, recuperación al arranque, HMAC persistente, locks interproceso ni Transaction Manager.
+- N6: implementado; token, plan, hash y selección se comprueban antes de mutar estado; la invalidación no cambia planes pendientes o completados.
+- N7: implementado; tokens vencidos/consumidos se purgan y el consumo es atómico bajo lock.
+- N8: implementado; el despacho general `FileEditorSkill.execute` rechaza backup/modificación/rollback. La vía de orquestación interna sigue usando APIs del editor después de autorizar.
+- N9: implementado para Chain/FileEditor: raíz única por corrida y cleanup limitado a esa raíz; memoria mantiene archivos de prueba únicos y no elimina la raíz común.
+- N10: implementado; documentación del algoritmo Kahn corregida, ruta de memoria anclada y requisitos futuros de N5 documentados.
+
+### Pruebas finales ejecutadas
+
+- N1/N2 dirigidas (dependencia válida, estado falso) y prueba ampliada de identidad/re-simulación: incluidas en la suite Chain final; además casos críticos de token y re-simulación en orden inverso: **5/5 OK**.
+- N3/N4 y fallos controlados: `tests.test_memory_isolation` (incluye JSON corrupto/vacío, recuperación, permisos simulados, write/replace fallidos y preservación): pasó como parte de la suite de memoria.
+- N6/N7 dirigidas: vencimiento, selección, reutilización, expiración purgada y concurrencia: **5/5 OK** en orden inverso.
+- N8: integración de SkillManager y bloqueo de `modify`/`rollback`: **1/1 OK**; lectura sigue disponible.
+- N9: dos raíces simultáneas y limpieza aislada: **1/1 OK**.
+- ChainOrchestrator/FileEditorSkill completa: `python` + `unittest` con stub de `psutil` para métricas no usadas → **78 pruebas, 0 fallos, 0 errores**.
+- Memoria, orden normal: aislamiento, persistencia, ventana y overflow → **51 pruebas, OK**. Orden inverso antes del último caso N4 → **50 pruebas, OK**; los nuevos casos también pasaron en la corrida de 51.
+- Integración final: **199 pruebas ejecutadas, 0 fallos, 15 errores**. Suite bloqueada por dependencias ausentes: `edge_tts`, `ollama`, `pygame`, `pystray` (y dependencias de otras suites como `numpy` y `PIL`). `psutil` se sustituyó en memoria solo para ejecutar tests que usan sus imports; eso no valida esas dependencias.
+- Global final (`unittest discover`): **306 pruebas ejecutadas, 0 fallos, 25 errores**. No certifica el repositorio completo porque faltan dependencias multimedia/audio/LLM/UI; no se omitieron esos errores.
+- `py_compile` de módulos/casos afectados pasó. `git diff --check` pasó; Git solo mostró avisos de conversión LF→CRLF.
+
+### Datos, Git y pendientes
+
+- Antes y después de cada conjunto final, `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`.
+- `prompts_history.txt` contiene el prompt íntegro de esta mini-fase y sigue ignorado; `data/memory_store.json` también está ignorado. No se prepararon cambios.
+- Se preservaron cambios preexistentes detectados al inicio en `CONTEXT.md`, `config/settings.py`, `main.py`, `src/brain/chain_orchestrator.py`, `src/brain/memory.py`, y pruebas existentes; no hubo reset/clean ni eliminación de residuos previos.
+- Git permanece en `main...origin/main`, con cambios locales no preparados; no se creó commit, tag ni push.
+- La mini-fase **no queda certificada**: las suites dirigidas pasan y los datos reales siguen intactos, pero el criterio requiere global completo sin errores. Repetir integración/global en el entorno del proyecto con dependencias instaladas antes de consolidar Git.
+
+## Cierre de microfase forense A1–A6 (2026-11-03)
+
+### Resolución
+
+- A1: ChainOrchestrator rechaza volver a simular ejecuciones incompatibles, terminales, con plan ya asociado, operaciones ejecutadas/rollback, o snapshots/runtime ya consumidos. Las validaciones se hacen antes de publicar cambios; se cubrieron re-simulación tras ejecución y fallo, reuso de ID y ausencia de mutaciones parciales.
+- A2: la memoria identifica explícitamente las cargas de la ruta primaria. Cargar un archivo alternativo (válido, ausente o corrupto) no borra ni altera el error/bloqueo del almacenamiento primario. Las pruebas fijan `JARVIS_ENV=test`, importan dependencias reales desde el `venv` y evitan leer la memoria productiva.
+- A3: recuperación respeta `max_turns`; errores de lectura conservan el contenido actual en memoria y no reemplazan el archivo original. Se verificó el camino de `PermissionError` simulado y la copia recuperada conserva verificación de integridad.
+- A4: los tests de memoria usan directorios únicos por corrida/caso y limpian únicamente su propio directorio. La prueba de aislamiento verifica que la ruta temporal de test no sea la ruta real; no se accedió al contenido del archivo productivo.
+- A5: autorización y consumo de token se validan antes de las transiciones. Rechazos, hash/selección incorrectos y estados incompatibles mantienen el estado anterior; un token ante estado cancelado no se consume. Se probaron además el camino autorizado y concurrencia.
+- A6: `CONTEXT.md` ya no describe `hmac.compare_digest` como mecanismo vigente: documenta la búsqueda exacta de token bajo lock. Se añaden aquí los resultados globales actualizados y comandos reproducibles.
+
+### Verificación realmente ejecutada
+
+- Intérprete usado en todas las verificaciones: `.\venv\Scripts\python.exe` (Python 3.12.8), con `JARVIS_ENV=test`; no se usaron stubs globales ni se instalaron dependencias. El entorno tenía los módulos de runtime requeridos y `pip check` informó `No broken requirements found`.
+- Aislamiento de memoria: `python -m unittest tests.test_memory_isolation -v` → **21/21 OK**.
+- Chain/FileEditor: `python -m unittest tests.test_file_editor_and_chain -v` → **82/82 OK**.
+- Grupo memoria: `tests.test_memory_isolation`, `tests.test_memory_persistence`, `tests.test_memory_window` y `tests.test_memory_overflow` → **51 pruebas OK**; también se ejecutaron en orden inverso.
+- Integración combinada de Chain/FileEditor, memoria, misión, concurrencia, IntentRouter y Codex → **219/219 OK**, 0 fallos, 0 errores.
+- Suite global final, `unittest discover -s tests -p "test_*.py"` con salida capturada para evitar ruido de consola → **442/442 OK**, 0 fallos, 0 errores, 0 omitidas (50,196 s en el resumen del runner). Una ejecución global adicional también se lanzó; la corrida global resumida confirmó el resultado completo.
+- `git diff --check` pasó. Git reportó solo avisos de normalización LF→CRLF.
+- Para repetir memoria desde PowerShell: `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_memory_isolation tests.test_memory_persistence tests.test_memory_window tests.test_memory_overflow`.
+- Para repetir toda la suite: `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"`.
+
+### Integridad del archivo real y estado de Git
+
+- Antes/después de las suites, `data/memory_store.json` existía y conservó **1.218 bytes** y SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`. Solo se consultaron existencia, tamaño y hash; nunca se leyó ni modificó su contenido.
+- El prompt completo se agregó a `prompts_history.txt`; el archivo sigue ignorado por Git. `data/` también continúa ignorado.
+- Se conservaron los cambios locales preexistentes. No se hizo reset, clean, stage, commit, tag ni push.
+- Estado A1–A6: **corregido y verificado por pruebas unitarias y suite global completa**. Esta conclusión cubre A1–A6 y no cambia el estado histórico de hallazgos reservados en fases anteriores.
+
+## Implementación de N5: Recovery & Transaction Manager (2026-11-03)
+
+### Arquitectura y componentes implementados
+
+- **`src/brain/transaction_manager.py` (nuevo módulo):**
+  - `TransactionState` y `ALLOWED_TRANSACTION_STATE_TRANSITIONS`: máquina de estados estricta (`PLANNED`, `PREPARING`, `APPLYING`, `COMMITTED`, `ROLLING_BACK`, `ROLLED_BACK`, `RECOVERY_PENDING`, `RECOVERED`, `ABORTED`, `CORRUPTED`) con bloqueo de retrocesos ilegales mediante `InvalidTransactionStateError`.
+  - `OperationJournalStage`: etapas por operación (`PENDING`, `INTENT_LOGGED`, `BACKUP_VERIFIED`, `APPLIED`, `FAILED`, `ROLLED_BACK`, `ROLLBACK_FAILED`).
+  - `GlobalTransactionLock`: lock exclusivo global que combina cerrojo de hilos por ruta canónica (`threading.Lock`), reentrancia controlada para la misma instancia/hilo y bloqueo interproceso en Windows mediante `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` sobre `data/transactions/global_transaction.lock` con timeout configurable (`TRANSACTION_LOCK_TIMEOUT_SEC = 5.0`) y `TransactionLockTimeoutError`.
+  - `TransactionJournal`: persistencia **WAL-first** (`tx_<transaction_id>.wal.jsonl`) con `flush()` + `os.fsync()` en cada `WalEvent` encadenado por SHA-256 (`prev_event_hash` → `event_hash`), seguida de actualización atómica de snapshot (`tx_<transaction_id>.snapshot.tmp.<uuid>` → `flush()` + `os.fsync()` → `os.replace()`).
+  - Validación criptográfica y estructural de la cadena WAL: verificación de `record_hash` del snapshot, reconstrucción desde génesis o replay de cola WAL posterior a `last_wal_seq`, detección estricta de `DUPLICATE_SEQ`, `MISSING_SEQ`, `OUT_OF_ORDER_SEQ`, `FOREIGN_TRANSACTION_ID`, `SNAPSHOT_INCOMPATIBLE`, y distinción entre `TRUNCATED_FINAL_WAL_LINE` (recuperable ignorando la línea final incompleta tras crash de escritura) e `INTERIOR_WAL_CORRUPTION` (transacción marcada como `CORRUPTED`).
+  - Cadena de custodia SHA-256 multi-operación sobre el mismo archivo (`H0 -> H1 -> H2 -> H3`): `TransactionRecord.rebuild_file_hash_chains()` y validación previa al commit garantizando que `expected_pre_sha256[op_i] == actual_post_sha256[op_{i-1}]`.
+  - `TransactionManager`: coordinación transaccional (`begin_transaction`, `log_operation_intent`, `log_backup_verified`, `log_operation_applied`, `log_operation_failed`, `log_operation_rolled_back`, `log_operation_rollback_failed`, `commit_transaction`) y motor de recuperación idempotente (`recover_transaction`, `recover_pending_transactions`) con `RecoveryReport`.
+
+- **Integración por composición en `skills/file_editor_skill.py`, `src/brain/chain_orchestrator.py`, `config/settings.py` y `main.py`:**
+  - `config/settings.py`: añadidas `TRANSACTION_JOURNAL_DIR = BASE_DIR / "data" / "transactions"` y `TRANSACTION_LOCK_TIMEOUT_SEC = 5.0`.
+  - `skills/file_editor_skill.py`: `modify_ini_or_text()` incorpora hooks opcionales (`on_intent_prepared`, `on_backup_verified`, `on_after_atomic_replace`) retrocompatibles que permiten registrar la intención y el backup verificado en el WAL antes del `os.replace()` atómico.
+  - `src/brain/chain_orchestrator.py`:
+    - Integra `TransactionManager` por composición sin romper constructores ni firmas públicas existentes.
+    - `execute_approved_plan()` ejecuta el protocolo transaccional de 14 pasos bajo `GlobalTransactionLock`, registrando cada etapa en el WAL, validando la cadena `H0 -> H1 -> H2` y revirtiendo en orden **LIFO** (`reversed(...)`) ante fallos intermedios.
+    - `rollback_execution()` soporta **rehidratación desde disco** (`rehydrate_execution()`) cuando una ejecución `COMMITTED` ya no está en `self._executions` tras reiniciar el proceso, reconstruyendo los `BackupRecord` verificados y ejecutando el rollback transaccional LIFO completo.
+    - `recover_pending_transactions()` escanea journals incompletos (`PREPARING`, `APPLYING`, `ROLLING_BACK`, `RECOVERY_PENDING`), restaura en orden LIFO todas las operaciones cuyo `current_disk_sha256 != expected_pre_sha256` verificando el SHA-256 del `.bak` antes y después de restaurar, elimina temporales `.jarvis_tmp` huérfanos, y rehidrata el estado en memoria del orquestador.
+  - `main.py`: `_ensure_orchestrator()` invoca `self.chain_orchestrator.recover_pending_transactions()` de forma perezosa al inicializar el orquestador para `/optimizar` o `/rollback`, sin penalizar el arranque de voz.
+
+### Verificación realmente ejecutada (N5)
+
+- Intérprete usado: `.\venv\Scripts\python.exe` (Python 3.12.8) con `$env:JARVIS_ENV="test"`.
+- Suite nueva N5 (`tests/test_transaction_recovery.py`, casos **T01–T24**):
+  - `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_transaction_recovery -v` → **24/24 OK** (24,415 s).
+- Suite `ChainOrchestrator` / `FileEditorSkill`:
+  - `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain -v` → **82/82 OK** (30,402 s).
+- Suite de memoria (`test_memory_isolation`, `test_memory_persistence`, `test_memory_window`, `test_memory_overflow`):
+  - `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_memory_isolation tests.test_memory_persistence tests.test_memory_window tests.test_memory_overflow -v` → **55/55 OK** (17,249 s).
+- Suite global completa:
+  - `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` → **466/466 OK**, 0 fallos, 0 errores (87,821 s).
+
+### Integridad del almacenamiento real y limitaciones conocidas
+
+- `data/memory_store.json` verificado antes y después de la implementación y las pruebas: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (intacto, sin lecturas de contenido ni modificaciones).
+- Limitación conocida de plataforma: Windows no expone `os.fsync()` sobre descriptores de directorio como POSIX; la durabilidad se garantiza mediante `flush()` + `os.fsync()` sobre cada archivo `.wal.jsonl`, `.snapshot.tmp` y `.jarvis_tmp` antes de `os.replace()`, combinado con recuperación WAL-first al arranque.
+
+
+
+## Implementación de Paso #3.A: DocumentExportSkill y Modo Estudio (2026-11-03)
+
+### 1. Arquitectura y Estructura de Módulos
+
+Se implementó el subsistema modular de exportación documental desacoplado de proveedores de IA y renderizadores externos:
+
+- `skills/document_models.py`: Modelo Documental Intermedio (IR) con inmutabilidad profunda.
+  - Dataclasses congeladas (`frozen=True`): `DocElement`, `Heading` (H1-H6), `Paragraph` (bold/italic), `ListItem` (level >= 0), `ListBlock` (ordenado/viñetas), `Table` (encabezados, filas coherentes, caption), `CodeBlock` (código con lenguaje), `Callout` (NOTE, WARNING, TIP, IMPORTANT), `Citation` (source_id, texto, url), y `Document` (título, autor, metadatos inmutables, elementos).
+  - Normalización en `__post_init__`: secuencias a tuplas inmutables y metadatos a tuplas ordenadas de pares clave-valor (`metadata_dict` para acceso cómodo), con hashabilidad completa.
+- `skills/document_parser.py`: Parser estructurado agnóstico a bibliotecas externas.
+  - Transforma Markdown estándar, bloques de código cercados (` ``` ` o ` ~~~ `), tablas con separadores, callouts de estilo GitHub/Obsidian (`> [!NOTE]`), citas y referencias bibliográficas (`[^1]: ...`), listas anidadas por indentación y unicode íntegro a instancias de `Document`.
+  - Valida contenido no vacío y límite configurable de longitud (predeterminado 5 MB).
+- `skills/document_templates.py`: Plantillas del Modo Estudio.
+  - Base abstracta `BaseDocumentTemplate` y 8 plantillas pedagógicas especializadas:
+    1. `StructuredNotesTemplate` (`structured_notes` / `apuntes`): marco teórico, desarrollo, puntos críticos y fuentes.
+    2. `ExecutiveSummaryTemplate` (`executive_summary` / `resumen`): contexto, síntesis y recomendaciones.
+    3. `StudyGuideTemplate` (`study_guide` / `guia`): hoja de ruta, contenido y checklist de autoevaluación.
+    4. `QASheetTemplate` (`qa_sheet` / `preguntas`): pares pregunta-respuesta para repaso activo.
+    5. `ComparativeTableTemplate` (`comparative_table` / `comparativa`): matrices de contraste y criterios.
+    6. `GlossaryTemplate` (`glossary` / `glosario`): compilación terminológica y definiciones.
+    7. `QuizTemplate` (`quiz` / `cuestionario`): evaluaciones formativas y clave de autoevaluación.
+    8. `TechnicalReportTemplate` (`technical_report` / `informe`): alcance, ingeniería, resultados y conclusiones.
+  - Registro dinámico `get_template()` con soporte de alias en español y preservación estricta de fuentes originales sin invención de citas.
+- `skills/markdown_renderer.py`: Renderizador Markdown.
+  - Genera Markdown estándar y limpio compatible con Obsidian y GitHub, codificado estrictamente en UTF-8.
+- `skills/word_renderer.py`: Renderizador Microsoft Word (.docx).
+  - Utiliza `python-docx` con **carga diferida estricta** (lazy import).
+  - Estilos tipográficos: portada con título y metadatos, encabezados jerárquicos, tablas con bordes ('Table Grid') y encabezados destacados con sombreado, bloques de código monoespaciados (Consolas) con fondo gris, callouts temáticos (azul, verde, ámbar, rojo) y listas con sangría.
+  - Si `python-docx` no está instalado, no interrumpe el arranque ni la exportación Markdown.
+- `skills/document_export_skill.py`: Coordinador `DocumentExportSkill` (`BaseSkill`).
+  - Nombre oficial: `'document_export'`.
+  - Parámetros: `content`, `format` (`'md'`, `'docx'`, `'both'`), `title`, `output_path`, `mode` (`'general'`, `'study'`), `template`, `overwrite`.
+  - Seguridad Windows: anti-traversal, anti-UNC, anti-symlink/junction fuera de raíces autorizadas, bloqueo de nombres reservados (`CON`, `PRN`, `AUX`, `NUL`, etc.) y prefijos del sistema.
+  - Concurrencia y colisiones: reserva atómica con `os.O_CREAT | os.O_EXCL` para generación determinista de sufijos (`doc_(1).docx`, `doc_(2).docx`) libre de condiciones TOCTOU, y reemplazo atómico mediante archivos temporales en el mismo directorio.
+- `src/tools/skill_manager.py`: Integración oficial de la skill en el catálogo nativo con soporte unificado para ejecución vía diccionario o kwargs: `SkillManager.execute_skill("document_export", params)`.
+
+### 2. Dependencias y Configuración
+
+- Dependencia añadida a `requirements.txt`: `python-docx` (instalada versión 1.2.0 con `lxml` 6.1.3).
+- Raíces autorizadas predeterminadas: `<BASE_DIR>/exports/`. Soporta ampliación mediante `JARVIS_EXPORT_ROOTS`.
+
+### 3. Verificación y Pruebas Realmente Ejecutadas
+
+- Compilación estática:
+  `python -m py_compile skills/document_models.py skills/document_parser.py skills/document_templates.py skills/markdown_renderer.py skills/word_renderer.py skills/document_export_skill.py` -> 0 errores.
+- Suite exhaustiva específica (`tests/test_document_export_skill.py`):
+  `python -m unittest tests.test_document_export_skill -v` -> **25/25 pruebas aprobadas (100% OK)** en 0.427s.
+  Cubre: renderizado MD, DOCX, tablas multicelda, código, listas anidadas, callouts, Unicode, vacíos, malformados, path traversal, rutas no autorizadas, UNC, symlinks, prevención de sobrescritura, sufijos secuenciales, concurrencia de hilos, limpieza de temporales, fallos de escritura, disponibilidad opcional de python-docx, integración SkillManager, arranque y carga diferida, independencia de IA, preservación de citas, formato both, e integridad de memoria.
+- Suite global completa:
+  `python -m unittest discover -s tests -p "test_*.py"` -> **491/491 pruebas aprobadas (100% OK)** en ~85s. Sin regresiones en los 466 tests preexistentes.
+- Formato y estilo: `git diff --check` -> 0 errores.
+- Arranque instantáneo: `python main.py --help` -> OK.
+
+### 4. Integridad de Memoria y N5
+
+- `data/memory_store.json`: verificado mediante metadatos antes y después del paso. Tamaño: **1.218 bytes**, SHA-256: `83640eaadff5e33feb9126f6eebb9f7960f924f01bb3a1968468014223341222` (intacto, sin lecturas de contenido ni escrituras).
+- N5 (`src/brain/transaction_manager.py`): intacto y preservado sin modificaciones.
+
+### 5. Limitaciones Conocidas
+
+- La creación de enlaces simbólicos en Windows requiere privilegios elevados o modo desarrollador habilitado; la resolución física segura de rutas canónicas (`resolve()` y `realpath()`) previene el escape de raíces autorizadas independientemente del tipo de enlace.
