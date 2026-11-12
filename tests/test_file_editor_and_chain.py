@@ -6,7 +6,7 @@ Suite exhaustiva de pruebas unitarias e integración para `FileEditorSkill`,
 Cubre los escenarios de seguridad defensiva en Windows, preservación estructural de
 archivos INI/CFG/CONF/JSON/XML/TXT, escritura atómica con reintentos, detección de
 concurrencia (TOCTOU), validación pre-flight del grafo de dependencias (unicidad de IDs,
-detección de ciclos con DFS/Kahn, ordenamiento topológico determinista, aprobaciones
+detección de ciclos mediante Kahn, ordenamiento topológico determinista, aprobaciones
 selectivas, propagación transitiva de estados `FAILED`/`BLOCKED`, evidencia verificable
 de dependencias previas), integridad criptográfica del `approval_hash` SHA-256,
 verificación post-escritura, aislamiento temporal dedicado y rollback seguro sin realizar
@@ -16,10 +16,12 @@ llamadas de red ni modificar archivos reales del usuario.
 from __future__ import annotations
 
 import json
+import copy
 import os
 import shutil
 import stat
 import sys
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -81,6 +83,13 @@ def _rmtree_strict_windows(target_dir: Path) -> None:
         shutil.rmtree(target_dir, onerror=handler)
 
 
+def _new_chain_suite_root() -> Path:
+    """Crea una carpeta exclusiva para una corrida; nunca devuelve la raíz compartida."""
+    root = (BASE_DIR / "temp" / "chain_test_runs" / f"run_{uuid.uuid4().hex}").resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    return root
+
+
 class TestFileEditorAndChainOrchestrator(unittest.TestCase):
     """
     Pruebas aisladas en una raíz temporal dedicada y configurable para
@@ -96,28 +105,13 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         resuelta mediante `Path.resolve()`, evitando problemas de DACLs heredados en
         directorios `%TEMP%` del sistema en Windows.
         """
-        configured_root = os.environ.get("JARVIS_TEST_TEMP_ROOT", "").strip()
-        if configured_root:
-            cls._temp_root = Path(configured_root).resolve()
-        else:
-            cls._temp_root = (BASE_DIR / "temp" / "jarvis_test_isolated").resolve()
-        cls._temp_root.mkdir(parents=True, exist_ok=True)
+        cls._temp_root = _new_chain_suite_root()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        """Limpia la raíz temporal dedicada al finalizar la clase si quedó vacía."""
+        """Limpia únicamente la raíz exclusiva creada por esta ejecución de suite."""
         if hasattr(cls, "_temp_root") and cls._temp_root.exists():
             _rmtree_strict_windows(cls._temp_root)
-            parent_temp = cls._temp_root.parent
-            if (
-                parent_temp.name == "temp"
-                and parent_temp.exists()
-                and not any(parent_temp.iterdir())
-            ):
-                try:
-                    parent_temp.rmdir()
-                except OSError:
-                    pass
 
     def setUp(self) -> None:
         """Crea un directorio temporal aislado y resuelto canónicamente para cada test."""
@@ -160,6 +154,25 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
     # ------------------------------------------------------------------
     # 1 a 4: Backups byte a byte, SHA-256, nombres únicos y no sobrescritura
     # ------------------------------------------------------------------
+
+    def test_00_suite_roots_are_independent_and_cleanup_is_scoped(self) -> None:
+        """Dos raíces simultáneas permanecen aisladas al limpiar solo una de ellas."""
+        first_root = _new_chain_suite_root()
+        second_root = _new_chain_suite_root()
+        try:
+            first_marker = first_root / "marker.tmp"
+            second_marker = second_root / "marker.tmp"
+            first_marker.write_text("first", encoding="utf-8")
+            second_marker.write_text("second", encoding="utf-8")
+            self.assertNotEqual(first_root, second_root)
+            _rmtree_strict_windows(first_root)
+            self.assertFalse(first_root.exists())
+            self.assertEqual(second_marker.read_text(encoding="utf-8"), "second")
+        finally:
+            if first_root.exists():
+                _rmtree_strict_windows(first_root)
+            if second_root.exists():
+                _rmtree_strict_windows(second_root)
 
     def test_01_backup_byte_for_byte_before_modify(self) -> None:
         """1. Verifica que se cree un backup byte a byte idéntico antes de modificar un archivo."""
@@ -674,6 +687,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan,
                 approval_hash=valid_hash,
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan, approval_hash=valid_hash, selected_operation_ids=None,
+                    input_fn=lambda _: "sí"
+                ),
+
             )
         self.assertIn("sg.ShadowQuality=3", cfg.read_text(encoding="utf-8"))
 
@@ -739,6 +757,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                input_fn=lambda _: "sí"
+            ),
+
         )
         self.assertEqual(result["state"], ChainState.COMPLETED.value)
         self.assertEqual(len(result["verifications"]), 1)
@@ -775,6 +798,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                input_fn=lambda _: "sí"
+            ),
+
         )
         self.assertNotEqual(compute_sha256_file(cfg), original_sha)
 
@@ -811,6 +839,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                input_fn=lambda _: "sí"
+            ),
+
         )
 
         # Modificación externa posterior a la ejecución del plan:
@@ -818,6 +851,12 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             self.orchestrator.rollback_execution("exec-rb-conf", force=False)
+        self.assertTrue(
+            any(
+                op.status == OperationStatus.ROLLBACK_FAILED.value
+                for op in self.orchestrator.get_execution("exec-rb-conf").plan.operations
+            )
+        )
 
     def test_34_partial_failure_in_multi_operation_plan_stops_and_rolls_back(self) -> None:
         """34. Verifica que un fallo parcial en múltiples operaciones detenga las restantes y revierta."""
@@ -862,6 +901,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                 )
 
         self.assertEqual(self.orchestrator.get_execution("exec-multi").state, ChainState.ROLLED_BACK)
@@ -885,14 +929,20 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         read_out = self.editor.execute(action="read", file_path=str(cfg))
         self.assertIn("sm_test.ini", read_out)
 
+        self.assertIn("Acción rechazada", sm.execute_skill(
+            "file_editor", action="modify", file_path=str(cfg), section="Graphics",
+            key_values={"FOV": "105"}
+        ))
+        self.assertIn("Acción rechazada", sm.execute_skill("file_editor", action="rollback"))
+
         upd_out = self.editor.execute(
             action="modify",
             file_path=str(cfg),
             section="Graphics",
             key_values={"FOV": "105"},
         )
-        self.assertIn("Se aplicaron y verificaron", upd_out)
-        self.assertIn("FOV=105", cfg.read_text(encoding="utf-8"))
+        self.assertIn("Acción rechazada", upd_out)
+        self.assertIn("FOV=90", cfg.read_text(encoding="utf-8"))
 
     def test_36_simulated_provider_investigation_and_caching(self) -> None:
         """36. Verifica investigación con proveedor simulado, clasificación y caché anti-duplicados."""
@@ -1051,8 +1101,9 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         # Simulamos entradas de usuario:
         # 1) /optimizar StarQuest
         # 2) s (confirmar aplicación)
-        # 3) /rollback <execution_id capturado>
-        # 4) salir
+        # 3) confirmación final de un solo uso
+        # 4) /rollback <execution_id capturado>
+        # 5) salir
         step = {"n": 0}
 
         def fake_input(prompt_str: str) -> str:
@@ -1062,6 +1113,8 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             if step["n"] == 2:
                 return "s"
             if step["n"] == 3:
+                return "sí"
+            if step["n"] == 4:
                 for line in outputs:
                     if "ID de ejecución para rollback:" in line:
                         captured_exec_id["id"] = (
@@ -1108,6 +1161,7 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 "n",
                 "/optimizar ApexRacer",
                 "op-001",
+                "sí",
                 "salir",
             ]
         )
@@ -1185,6 +1239,523 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
+    # 63+: Autorización humana, snapshot, rollback y grafos grandes
+
+    def test_63_rollback_marks_verified_operations_and_rejects_repeat(self) -> None:
+        """El rollback verificado sincroniza estados/historial y no puede repetirse."""
+        cfg = self.workspace_dir / "rollback_state.ini"
+        cfg.write_text("[S]\nK=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-rollback-state")
+        plan = self._build_custom_plan(
+            rec.execution_id, [self._build_custom_ini_op("A", cfg, "K", "1", "2", section="S")]
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        auth = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], input_fn=lambda _: "sí"
+        )
+        self.orchestrator.execute_approved_plan(
+            plan, approval_hash=sim["approval_hash"], authorization_token=auth
+        )
+        self.orchestrator.rollback_execution(rec.execution_id)
+        self.assertEqual(plan.operations[0].status, OperationStatus.ROLLED_BACK.value)
+        self.assertEqual(plan.operations[0].status_history[-1][1], OperationStatus.ROLLED_BACK.value)
+        self.assertEqual(rec.operation_states["A"], OperationStatus.ROLLED_BACK.value)
+        history_before = {
+            "state": rec.state,
+            "operation_statuses": [op.status for op in rec.plan.operations],
+            "runtime": copy.deepcopy(rec.operation_runtime_snapshot),
+            "snapshot": json.loads(json.dumps(rec.approved_plan_snapshot)),
+            "approval_hash": rec.approval_hash,
+            "bound": rec.bound_operation_ids,
+            "plan": rec.plan,
+        }
+        fresh_clone = self._build_custom_plan(
+            rec.execution_id,
+            [self._build_custom_ini_op("A", cfg, "K", "1", "2", section="S")],
+            plan_id=plan.plan_id,
+        )
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.simulate_plan(fresh_clone)
+        self.assertEqual(rec.state, history_before["state"])
+        self.assertEqual([op.status for op in rec.plan.operations], history_before["operation_statuses"])
+        self.assertEqual(rec.operation_runtime_snapshot, history_before["runtime"])
+        self.assertEqual(rec.approved_plan_snapshot, history_before["snapshot"])
+        self.assertEqual(rec.approval_hash, history_before["approval_hash"])
+        self.assertEqual(rec.bound_operation_ids, history_before["bound"])
+        self.assertIs(rec.plan, history_before["plan"])
+        with self.assertRaises(RuntimeError):
+            self.orchestrator.rollback_execution(rec.execution_id)
+
+    def test_63b_failed_record_rejects_simulation_and_plan_rebuild_without_mutation(self) -> None:
+        """Una ejecución FAILED conserva toda su traza frente a clones y rebuilds."""
+        cfg = self.workspace_dir / "failed_record.ini"
+        cfg.write_text("[S]\nK=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-failed-record")
+        op = self._build_custom_ini_op("A", cfg, "K", "1", "2", section="S")
+        plan = self._build_custom_plan(rec.execution_id, [op])
+        rec.plan = plan
+        rec.submitted_plan = plan
+        rec.approval_hash = plan.approval_hash()
+        rec.approved_plan_snapshot = json.loads(plan.canonical_json())
+        rec.operation_runtime_snapshot = {"A": {"status": "FAILED", "reason": "historical"}}
+        rec.operation_states = {"A": "FAILED"}
+        self.orchestrator.transition_state(rec.execution_id, ChainState.FAILED)
+        clone = self._build_custom_plan(
+            rec.execution_id,
+            [self._build_custom_ini_op("A", cfg, "K", "1", "2", section="S")],
+            plan_id=plan.plan_id,
+        )
+        state_before = rec.state
+        operation_statuses_before = [item.status for item in rec.plan.operations]
+        runtime_before = json.loads(json.dumps(rec.operation_runtime_snapshot))
+        snapshot_before = json.loads(json.dumps(rec.approved_plan_snapshot))
+        approval_hash_before = rec.approval_hash
+        record_plan_before = rec.plan
+        submitted_plan_before = rec.submitted_plan
+        bound_ids_before = rec.bound_operation_ids
+
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.simulate_plan(clone)
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.build_and_validate_plan(
+                execution_id=rec.execution_id,
+                user_goal="retry",
+                application_name="test",
+                config_snapshot={},
+                hardware_context={},
+                recommendations=[],
+            )
+        self.assertEqual(rec.state, state_before)
+        self.assertEqual([item.status for item in rec.plan.operations], operation_statuses_before)
+        self.assertEqual(rec.operation_runtime_snapshot, runtime_before)
+        self.assertEqual(rec.approved_plan_snapshot, snapshot_before)
+        self.assertEqual(rec.approval_hash, approval_hash_before)
+        self.assertIs(rec.plan, record_plan_before)
+        self.assertIs(rec.submitted_plan, submitted_plan_before)
+        self.assertEqual(rec.bound_operation_ids, bound_ids_before)
+
+    def test_64_user_approved_boolean_is_not_authorization(self) -> None:
+        """La compatibilidad del argumento legado no permite autorizar una escritura."""
+        cfg = self.workspace_dir / "no_boolean_auth.ini"
+        original = "[S]\nK=1\n"
+        cfg.write_text(original, encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-no-boolean-auth")
+        plan = self._build_custom_plan(
+            rec.execution_id, [self._build_custom_ini_op("A", cfg, "K", "1", "2", section="S")]
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan, approval_hash=sim["approval_hash"], user_approved=True
+            )
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original)
+
+    def test_65_approved_snapshot_rejects_external_definition_mutation(self) -> None:
+        """Una edición posterior del objeto externo nunca cambia lo que se aplicaría."""
+        cfg = self.workspace_dir / "snapshot_mutation.ini"
+        original = "[S]\nK=1\n"
+        cfg.write_text(original, encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-snapshot-mutation")
+        plan = self._build_custom_plan(
+            rec.execution_id, [self._build_custom_ini_op("A", cfg, "K", "1", "2", section="S")]
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        auth = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], input_fn=lambda _: "sí"
+        )
+        for field_name, changed_value in (
+            ("file_path", str(cfg.parent / "other.ini")),
+            ("expected_current_value", "999"),
+            ("id", "mutated-id"),
+            ("depends_on", ("other",)),
+        ):
+            with self.assertRaises(PolicyValidationError):
+                setattr(plan.operations[0], field_name, changed_value)
+        with self.assertRaises(AttributeError):
+            plan.operations[0].depends_on.append("other")
+        with self.assertRaises(PolicyValidationError):
+            plan.operations[0].proposed_value = "999"
+        self.orchestrator.execute_approved_plan(
+            plan, approval_hash=sim["approval_hash"], authorization_token=auth
+        )
+        self.assertIn("K=2", cfg.read_text(encoding="utf-8"))
+
+    def test_66_iterative_graph_handles_two_thousand_operations_and_cycle(self) -> None:
+        """Kahn valida cadenas y ciclos grandes sin recursión de Python."""
+        cfg = self.workspace_dir / "large_graph.ini"
+        cfg.write_text("[S]\nK=1\n", encoding="utf-8")
+        ops = [
+            self._build_custom_ini_op(
+                f"op-{idx:04d}", cfg, "K", "1", "2",
+                depends_on=[f"op-{idx - 1:04d}"] if idx else [],
+            )
+            for idx in range(2000)
+        ]
+        ordered = self.orchestrator.topological_sort_operations(ops)
+        self.assertEqual(len(ordered), 2000)
+        ops[0].depends_on = ["op-1999"]
+        with self.assertRaises(PolicyValidationError):
+            self.orchestrator.topological_sort_operations(ops)
+
+    def test_67_expired_and_selection_mismatched_tokens_are_rejected(self) -> None:
+        """El vencimiento y la selección forman parte vinculante del token humano."""
+        cfg = self.workspace_dir / "token_selection.ini"
+        cfg.write_text("[S]\nA=1\nB=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-token-selection")
+        operations = [
+            self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S"),
+            self._build_custom_ini_op("B", cfg, "B", "1", "2", section="S"),
+        ]
+        plan = self._build_custom_plan(rec.execution_id, operations)
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], selected_operation_ids=["A"],
+            input_fn=lambda _: "sí", ttl_seconds=1,
+        )
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan, approval_hash=sim["approval_hash"], authorization_token=token,
+                approved_operation_ids=["B"],
+            )
+        self.assertEqual(rec.state, ChainState.AWAITING_APPROVAL)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), "[S]\nA=1\nB=1\n")
+
+        expired = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], selected_operation_ids=["A"],
+            input_fn=lambda _: "sí", ttl_seconds=1,
+        )
+        import time as time_module
+        future = time_module.time() + 2
+        with patch("src.brain.chain_orchestrator.time.time", return_value=future):
+            with self.assertRaises(ApprovalBindingError):
+                self.orchestrator.execute_approved_plan(
+                    plan, approval_hash=sim["approval_hash"], authorization_token=expired,
+                    approved_operation_ids=["A"],
+                )
+        self.assertNotIn(expired, self.orchestrator._approval_tokens)
+        self.assertEqual(rec.state, ChainState.AWAITING_APPROVAL)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), "[S]\nA=1\nB=1\n")
+
+    def test_68_authorization_token_cannot_be_reused(self) -> None:
+        """El token se consume una vez antes de aplicar cualquier operación."""
+        cfg = self.workspace_dir / "token_reuse.ini"
+        cfg.write_text("[S]\nA=1\nB=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-token-reuse")
+        operations = [
+            self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S"),
+            self._build_custom_ini_op("B", cfg, "B", "1", "2", section="S"),
+        ]
+        plan = self._build_custom_plan(rec.execution_id, operations)
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], selected_operation_ids=["A"],
+            input_fn=lambda _: "sí",
+        )
+        self.orchestrator.execute_approved_plan(
+            plan, approval_hash=sim["approval_hash"], authorization_token=token,
+            approved_operation_ids=["A"],
+        )
+        self.assertNotIn(token, self.orchestrator._approval_tokens)
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan, approval_hash=sim["approval_hash"], authorization_token=token,
+                approved_operation_ids=["A"],
+            )
+
+    def test_68b_concurrent_calls_consume_one_authorization_once(self) -> None:
+        """Dos llamadas simultáneas con el mismo token solo permiten una aplicación."""
+        cfg = self.workspace_dir / "token_concurrent.ini"
+        cfg.write_text("[S]\nA=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-token-concurrent")
+        plan = self._build_custom_plan(
+            rec.execution_id,
+            [self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S")],
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], input_fn=lambda _: "sí"
+        )
+        barrier = threading.Barrier(3)
+        outcomes: list[str] = []
+
+        def attempt() -> None:
+            barrier.wait()
+            try:
+                self.orchestrator.execute_approved_plan(
+                    plan, approval_hash=sim["approval_hash"], authorization_token=token
+                )
+                outcomes.append("applied")
+            except ApprovalBindingError:
+                outcomes.append("rejected")
+
+        workers = [threading.Thread(target=attempt) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+        self.assertCountEqual(outcomes, ["applied", "rejected"])
+        self.assertEqual(len(rec.applied_operations), 1)
+        self.assertNotIn(token, self.orchestrator._approval_tokens)
+
+    def test_68c_invalid_token_cannot_reopen_completed_execution(self) -> None:
+        """Un token inválido no altera ni reabre un plan ya completado."""
+        cfg = self.workspace_dir / "completed_invalid_token.ini"
+        cfg.write_text("[S]\nA=1\n", encoding="utf-8")
+        record = self.orchestrator.create_execution("exec-completed-invalid-token")
+        plan = self._build_custom_plan(
+            record.execution_id,
+            [self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S")],
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], input_fn=lambda _: "sí"
+        )
+        self.orchestrator.execute_approved_plan(
+            plan, approval_hash=sim["approval_hash"], authorization_token=token
+        )
+        self.assertEqual(record.state, ChainState.COMPLETED)
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan, approval_hash=sim["approval_hash"], authorization_token="invalid-token"
+            )
+        self.assertEqual(record.state, ChainState.COMPLETED)
+        self.assertEqual(plan.status, ChainState.COMPLETED.value)
+
+    def test_68d_rejected_partial_authorization_keeps_completed_state(self) -> None:
+        """Rechazo humano o hash erróneo no degrada una ejecución parcial COMPLETED."""
+        cfg = self.workspace_dir / "partial_authorization_reject.ini"
+        cfg.write_text("[S]\nA=1\nB=1\n", encoding="utf-8")
+        record = self.orchestrator.create_execution("exec-partial-auth-reject")
+        plan = self._build_custom_plan(
+            record.execution_id,
+            [
+                self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S"),
+                self._build_custom_ini_op("B", cfg, "B", "1", "2", section="S"),
+            ],
+        )
+        simulation = self.orchestrator.simulate_plan(plan)
+        token_a = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=simulation["approval_hash"], selected_operation_ids=["A"], input_fn=lambda _: "sí"
+        )
+        self.orchestrator.execute_approved_plan(
+            plan, approval_hash=simulation["approval_hash"], authorization_token=token_a,
+            approved_operation_ids=["A"],
+        )
+        self.assertEqual(record.state, ChainState.COMPLETED)
+        state_before = record.state
+        statuses_before = [op.status for op in record.plan.operations]
+        runtime_before = copy.deepcopy(record.operation_runtime_snapshot)
+        snapshot_before = json.loads(json.dumps(record.approved_plan_snapshot))
+        hash_before = record.approval_hash
+        bound_before = record.bound_operation_ids
+
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=simulation["approval_hash"],
+                selected_operation_ids=["B"], input_fn=lambda _: "n",
+            )
+        self.assertEqual(record.state, state_before)
+        self.assertEqual([op.status for op in record.plan.operations], statuses_before)
+        self.assertEqual(record.operation_runtime_snapshot, runtime_before)
+        self.assertEqual(record.approved_plan_snapshot, snapshot_before)
+        self.assertEqual(record.approval_hash, hash_before)
+        self.assertEqual(record.bound_operation_ids, bound_before)
+
+    def test_68e_wrong_hash_or_bound_selection_does_not_mutate_pending_record(self) -> None:
+        """Errores de hash o selección dejan estado, snapshots y binding sin cambios."""
+        cfg = self.workspace_dir / "invalid_authorization_inputs.ini"
+        cfg.write_text("[S]\nA=1\nB=1\n", encoding="utf-8")
+        record = self.orchestrator.create_execution("exec-invalid-auth-inputs")
+        plan = self._build_custom_plan(
+            record.execution_id,
+            [
+                self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S"),
+                self._build_custom_ini_op("B", cfg, "B", "1", "2", section="S"),
+            ],
+        )
+        simulation = self.orchestrator.simulate_plan(plan, selected_operation_ids=["A"])
+        state_before = record.state
+        snapshot_before = json.loads(json.dumps(record.approved_plan_snapshot))
+        hash_before = record.approval_hash
+        bound_before = record.bound_operation_ids
+        for bad_hash, bad_selection in (("0" * 64, ["A"]), (simulation["approval_hash"], ["B"])):
+            with self.assertRaises(ApprovalBindingError):
+                self.orchestrator.authorize_plan_interactively(
+                    plan, approval_hash=bad_hash,
+                    selected_operation_ids=bad_selection, input_fn=lambda _: "sí",
+                )
+            self.assertEqual(record.state, state_before)
+            self.assertEqual(record.approved_plan_snapshot, snapshot_before)
+            self.assertEqual(record.approval_hash, hash_before)
+            self.assertEqual(record.bound_operation_ids, bound_before)
+
+    def test_68f_valid_token_is_not_consumed_when_state_is_not_executable(self) -> None:
+        """Estado terminal se valida antes de consumir una autorización vigente."""
+        cfg = self.workspace_dir / "token_non_executable_state.ini"
+        cfg.write_text("[S]\nA=1\n", encoding="utf-8")
+        record = self.orchestrator.create_execution("exec-token-non-executable")
+        plan = self._build_custom_plan(
+            record.execution_id,
+            [self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S")],
+        )
+        simulation = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=simulation["approval_hash"], input_fn=lambda _: "sí"
+        )
+        self.orchestrator.transition_state(record.execution_id, ChainState.CANCELLED)
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.execute_approved_plan(
+                plan, approval_hash=simulation["approval_hash"], authorization_token=token
+            )
+        self.assertEqual(record.state, ChainState.CANCELLED)
+        self.assertIn(token, self.orchestrator._approval_tokens)
+
+    def test_69_independent_operation_omitted_by_policy_is_audited(self) -> None:
+        """Una operación independiente omitida tras fallo queda registrada con su motivo."""
+        failed_file = self.workspace_dir / "failed_before_skip.ini"
+        skipped_file = self.workspace_dir / "skipped_by_policy.ini"
+        failed_file.write_text("[S]\nA=1\n", encoding="utf-8")
+        skipped_file.write_text("[S]\nB=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-skipped-audit")
+        plan = self._build_custom_plan(
+            rec.execution_id,
+            [
+                self._build_custom_ini_op("A", failed_file, "A", "1", "2", section="S"),
+                self._build_custom_ini_op("B", skipped_file, "B", "1", "2", section="S"),
+            ],
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], input_fn=lambda _: "sí"
+        )
+        with patch.object(
+            self.editor, "modify_ini_or_text",
+            return_value={"status": "error", "errors": ["fallo controlado"]},
+        ):
+            with self.assertRaises(RuntimeError):
+                self.orchestrator.execute_approved_plan(
+                    plan, approval_hash=sim["approval_hash"], authorization_token=token,
+                    auto_rollback=False,
+                )
+        self.assertEqual(len(rec.skipped_operations), 1)
+        self.assertEqual(rec.skipped_operations[0]["operation_id"], "B")
+        self.assertIn("fallo previo", rec.skipped_operations[0]["reason"])
+        self.assertEqual(skipped_file.read_text(encoding="utf-8"), "[S]\nB=1\n")
+
+    def test_70_transitive_dependency_evidence_survives_later_same_file_edits(self) -> None:
+        """Una cadena A→B→C en ejecuciones sucesivas conserva evidencia al cambiar el hash del archivo."""
+        cfg = self.workspace_dir / "dependency_chain_same_file.ini"
+        cfg.write_text("[S]\nA=1\nB=1\nC=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-dependency-chain-file")
+        op_a = self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S")
+        op_b = self._build_custom_ini_op("B", cfg, "B", "1", "2", section="S", depends_on=["A"])
+        op_c = self._build_custom_ini_op("C", cfg, "C", "1", "2", section="S", depends_on=["B"])
+        plan = self._build_custom_plan(rec.execution_id, [op_a, op_b, op_c])
+        sim = self.orchestrator.simulate_plan(plan)
+
+        for selected_id in ("A", "B", "C"):
+            token = self.orchestrator.authorize_plan_interactively(
+                plan,
+                approval_hash=sim["approval_hash"],
+                selected_operation_ids=[selected_id],
+                input_fn=lambda _: "sí",
+            )
+            self.orchestrator.execute_approved_plan(
+                plan,
+                approval_hash=sim["approval_hash"],
+                authorization_token=token,
+                approved_operation_ids=[selected_id],
+            )
+        content = cfg.read_text(encoding="utf-8")
+        self.assertIn("A=2", content)
+        self.assertIn("B=2", content)
+        self.assertIn("C=2", content)
+        self.assertTrue(plan.is_fully_completed())
+
+    def test_71_partial_rollback_can_resume_only_remaining_verified_work(self) -> None:
+        """Si un rollback se interrumpe, conserva estados y permite restaurar solo lo pendiente."""
+        file_a = self.workspace_dir / "partial_rb_a.ini"
+        file_b = self.workspace_dir / "partial_rb_b.ini"
+        file_a.write_text("[S]\nA=1\n", encoding="utf-8")
+        file_b.write_text("[S]\nB=1\n", encoding="utf-8")
+        original_a, original_b = compute_sha256_file(file_a), compute_sha256_file(file_b)
+        rec = self.orchestrator.create_execution("exec-partial-rollback-resume")
+        plan = self._build_custom_plan(
+            rec.execution_id,
+            [
+                self._build_custom_ini_op("A", file_a, "A", "1", "2", section="S"),
+                self._build_custom_ini_op("B", file_b, "B", "1", "2", section="S"),
+            ],
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], input_fn=lambda _: "sí"
+        )
+        self.orchestrator.execute_approved_plan(
+            plan, approval_hash=sim["approval_hash"], authorization_token=token
+        )
+        real_rollback = self.editor.rollback
+        attempts = {"count": 0}
+
+        def fail_second_rollback(**kwargs: Any) -> bool:
+            attempts["count"] += 1
+            if attempts["count"] == 2:
+                self.editor.last_operation_result = {"errors": ["fallo controlado en segundo backup"]}
+                return False
+            return real_rollback(**kwargs)
+
+        with patch.object(self.editor, "rollback", side_effect=fail_second_rollback):
+            with self.assertRaises(RuntimeError):
+                self.orchestrator.rollback_execution(rec.execution_id)
+        self.assertEqual(plan.operations[0].status, OperationStatus.ROLLBACK_FAILED.value)
+        self.assertEqual(plan.operations[1].status, OperationStatus.ROLLED_BACK.value)
+        self.orchestrator.rollback_execution(rec.execution_id)
+        self.assertEqual(compute_sha256_file(file_a), original_a)
+        self.assertEqual(compute_sha256_file(file_b), original_b)
+        self.assertTrue(all(op.status == OperationStatus.ROLLED_BACK.value for op in plan.operations))
+
+    def test_72_plan_operation_limit_rejects_before_waiting_for_approval(self) -> None:
+        """El límite configurable invalida el plan durante la simulación, antes de editar."""
+        cfg = self.workspace_dir / "plan_limit.ini"
+        cfg.write_text("[S]\nK0=1\nK1=1\nK2=1\n", encoding="utf-8")
+        operations = [
+            self._build_custom_ini_op(f"op-{idx}", cfg, f"K{idx}", "1", "2", section="S")
+            for idx in range(3)
+        ]
+        rec = self.orchestrator.create_execution("exec-plan-limit")
+        plan = self._build_custom_plan(rec.execution_id, operations)
+        with patch("src.brain.chain_orchestrator.MAX_OPERATIONS_PER_PLAN", 2):
+            with self.assertRaises(PolicyValidationError):
+                self.orchestrator.simulate_plan(plan)
+        self.assertEqual(rec.state, ChainState.REJECTED)
+        self.assertEqual(cfg.read_text(encoding="utf-8"), "[S]\nK0=1\nK1=1\nK2=1\n")
+
+    def test_73_selection_order_is_normalized_by_operation_identity(self) -> None:
+        """[B, A] al confirmar equivale a [A, B] al ejecutar según el orden canónico del plan."""
+        cfg = self.workspace_dir / "selection_order.ini"
+        cfg.write_text("[S]\nA=1\nB=1\n", encoding="utf-8")
+        rec = self.orchestrator.create_execution("exec-selection-order")
+        plan = self._build_custom_plan(
+            rec.execution_id,
+            [
+                self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S"),
+                self._build_custom_ini_op("B", cfg, "B", "1", "2", section="S"),
+            ],
+        )
+        sim = self.orchestrator.simulate_plan(plan)
+        token = self.orchestrator.authorize_plan_interactively(
+            plan, approval_hash=sim["approval_hash"], selected_operation_ids=["B", "A"],
+            input_fn=lambda _: "sí",
+        )
+        result = self.orchestrator.execute_approved_plan(
+            plan, approval_hash=sim["approval_hash"], authorization_token=token,
+            approved_operation_ids=["A", "B"],
+        )
+        self.assertTrue(result["fully_completed"])
+
+    # ------------------------------------------------------------------
     # 43 a 62: Endurecimiento de Grafo de Dependencias, Estados, Hash y Aislamiento
     # ------------------------------------------------------------------
 
@@ -1218,6 +1789,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-B"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-B"],
                 )
             self.assertEqual(spy_mod.call_count, 0)
@@ -1235,6 +1811,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan2,
                 approval_hash=sim2["approval_hash"],
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan2, approval_hash=sim2["approval_hash"], selected_operation_ids=["op-B", "op-C"],
+                    input_fn=lambda _: "sí"
+                ),
+
                 approved_operation_ids=["op-B", "op-C"],
             )
         self.assertEqual(compute_sha256_file(cfg), orig_sha)
@@ -1263,6 +1844,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-A", "op-B"],
+                input_fn=lambda _: "sí"
+            ),
+
             approved_operation_ids=["op-A", "op-B"],
         )
         self.assertEqual(res["state"], ChainState.COMPLETED.value)
@@ -1364,6 +1950,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan,
                 approval_hash=sim["approval_hash"],
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-C", "op-B", "op-A"],
+                    input_fn=lambda _: "sí"
+                ),
+
                 approved_operation_ids=["op-C", "op-B", "op-A"],
             )
 
@@ -1406,6 +1997,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                 )
 
         # Solo se intentó ejecutar op-A; op-B fue bloqueada y nunca llegó a FileEditorSkill
@@ -1446,6 +2042,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                 )
             self.assertEqual(spy_mod.call_count, 1)
 
@@ -1472,13 +2073,18 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-999-inexistente"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-999-inexistente"],
                 )
             self.assertEqual(spy_mod.call_count, 0)
 
         self.assertIn("op-999-inexistente", str(ctx.exception))
-        # No debe quedar como CANCELLED silencioso, sino como REJECTED por validación fallida
-        self.assertEqual(rec.state, ChainState.REJECTED)
+        # Un intento de ejecución inválido no debe degradar el plan legítimo pendiente.
+        self.assertEqual(rec.state, ChainState.AWAITING_APPROVAL)
         self.assertNotEqual(rec.state, ChainState.CANCELLED)
 
     def test_50_mixed_valid_and_invalid_ids_rejected_atomically(self) -> None:
@@ -1499,6 +2105,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-001", "op-fantasma"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-001", "op-fantasma"],
                 )
             self.assertEqual(spy_mod.call_count, 0)
@@ -1525,10 +2136,15 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan_empty,
                 approval_hash=sim_empty["approval_hash"],
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan_empty, approval_hash=sim_empty["approval_hash"], selected_operation_ids=[],
+                    input_fn=lambda _: "sí"
+                ),
+
                 approved_operation_ids=[],
             )
         self.assertIn("vacía", str(ctx_empty.exception).lower())
-        self.assertEqual(rec_empty.state, ChainState.REJECTED)
+        self.assertEqual(rec_empty.state, ChainState.AWAITING_APPROVAL)
 
         # Caso B: Selección con string en blanco `[""]` -> PolicyValidationError
         rec_blank = self.orchestrator.create_execution("exec-51-blank")
@@ -1540,9 +2156,14 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan_blank,
                 approval_hash=sim_blank["approval_hash"],
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan_blank, approval_hash=sim_blank["approval_hash"], selected_operation_ids=["   "],
+                    input_fn=lambda _: "sí"
+                ),
+
                 approved_operation_ids=["   "],
             )
-        self.assertEqual(rec_blank.state, ChainState.REJECTED)
+        self.assertEqual(rec_blank.state, ChainState.AWAITING_APPROVAL)
 
         # Caso C: Cancelación explícita del usuario mediante cancel_plan() -> ChainState.CANCELLED
         rec_cancel = self.orchestrator.create_execution("exec-51-cancel")
@@ -1583,6 +2204,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-B"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-B"],
                 )
 
@@ -1616,18 +2242,33 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-A"],
+                input_fn=lambda _: "sí"
+            ),
+
             approved_operation_ids=["op-A"],
         )
         self.assertEqual(op_a.status, OperationStatus.APPLIED.value)
         self.assertEqual(op_b.status, OperationStatus.PENDING.value)
         self.assertFalse(res1["fully_completed"])
         self.assertIsNotNone(op_a.executed_file_hash)
+        backup_count_after_first_apply = len(list(self.backup_dir.glob("*.bak")))
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.simulate_plan(plan)
+        self.assertEqual(op_a.status, OperationStatus.APPLIED.value)
+        self.assertEqual(len(list(self.backup_dir.glob("*.bak"))), backup_count_after_first_apply)
 
         # Etapa 2: Ahora el usuario aprueba únicamente op-B (cuya dependencia op-A ya está APPLIED y verificada en disco)
         res2 = self.orchestrator.execute_approved_plan(
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-B"],
+                input_fn=lambda _: "sí"
+            ),
+
             approved_operation_ids=["op-B"],
         )
         self.assertEqual(res2["state"], ChainState.COMPLETED.value)
@@ -1639,6 +2280,40 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         self.assertIn("sg.ShadowQuality=1", final_text)
         self.assertIn("sg.TextureQuality=1", final_text)
         self.assertEqual(len(rec.applied_operations), 2)
+
+    def test_53b_plan_replacement_and_duplicate_execution_id_are_rejected(self) -> None:
+        """Una ejecución conserva su plan original y no se puede reemplazar por ID."""
+        cfg = self.workspace_dir / "plan_identity.ini"
+        cfg.write_text("[S]\nA=1\n", encoding="utf-8")
+        record = self.orchestrator.create_execution("exec-plan-identity")
+        original = self._build_custom_plan(
+            record.execution_id, [self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S")]
+        )
+        self.orchestrator.simulate_plan(original)
+        replacement = self._build_custom_plan(
+            record.execution_id,
+            [self._build_custom_ini_op("B", cfg, "A", "1", "3", section="S")],
+            plan_id="different-plan-id",
+        )
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.simulate_plan(replacement)
+        self.assertIs(record.plan, original)
+        self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
+        with self.assertRaises(ValueError):
+            self.orchestrator.create_execution(record.execution_id)
+
+    def test_53c_rollback_failed_state_cannot_be_resimulated(self) -> None:
+        """Un objeto externo en ROLLBACK_FAILED nunca se acepta como nuevo plan."""
+        cfg = self.workspace_dir / "rollback_failed_state.ini"
+        cfg.write_text("[S]\nA=1\n", encoding="utf-8")
+        record = self.orchestrator.create_execution("exec-rollback-failed-resim")
+        op = self._build_custom_ini_op("A", cfg, "A", "1", "2", section="S")
+        plan = self._build_custom_plan(record.execution_id, [op])
+        object.__setattr__(op, "status", OperationStatus.ROLLBACK_FAILED.value)
+        record.plan = plan
+        with self.assertRaises(ApprovalBindingError):
+            self.orchestrator.simulate_plan(plan)
+        self.assertEqual(op.status, OperationStatus.ROLLBACK_FAILED.value)
 
     def test_54_previously_executed_dependency_without_valid_evidence_rejected(self) -> None:
         """54. (Grupo 12) Rechaza dependencia marcada como APPLIED si carece de evidencia real en disco o en registro."""
@@ -1654,9 +2329,12 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
         plan = self._build_custom_plan(rec.execution_id, [op_a, op_b])
         sim = self.orchestrator.simulate_plan(plan)
 
-        # Manipulamos el estado de op-A a APPLIED sin haberla ejecutado realmente en disco
-        op_a.transition_status(OperationStatus.APPLIED, reason="Estado falso sin escritura")
-        object.__setattr__(op_a, "executed_file_hash", compute_sha256_file(cfg))
+        # Una asignación APPLIED sin evidencia debe fallar y dejar la operación pendiente.
+        with self.assertRaises(PolicyValidationError):
+            op_a.transition_status(OperationStatus.APPLIED, reason="Estado falso sin escritura")
+        with self.assertRaises(PolicyValidationError):
+            op_a.status = OperationStatus.APPLIED.value
+        self.assertEqual(op_a.status, OperationStatus.PENDING.value)
 
         with patch.object(self.editor, "modify_ini_or_text") as spy_mod:
             with self.assertRaises(PolicyValidationError) as ctx:
@@ -1664,11 +2342,16 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-B"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-B"],
                 )
             self.assertEqual(spy_mod.call_count, 0)
 
-        self.assertIn("evidencia", str(ctx.exception).lower())
+        self.assertIn("dependencia", str(ctx.exception).lower())
         self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
         self.assertEqual(list(self.backup_dir.glob("*.bak")), [])
 
@@ -1703,6 +2386,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     valid_plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        valid_plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-001", "op-001"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-001", "op-001"],
                 )
             self.assertEqual(spy_mod.call_count, 0)
@@ -1745,6 +2433,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan_a,
                 approval_hash=plan_a.approval_hash(),
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan_a, approval_hash=plan_a.approval_hash(), selected_operation_ids=None,
+                    input_fn=lambda _: "sí"
+                ),
+
             )
 
         # Subcaso B: Modificar las operaciones seleccionadas después de vincular la aprobación selectiva
@@ -1761,6 +2454,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                 plan_b,
                 approval_hash=sim_b["approval_hash"],
                 user_approved=True,
+                authorization_token=self.orchestrator.authorize_plan_interactively(
+                    plan_b, approval_hash=sim_b["approval_hash"], selected_operation_ids=["op-001", "op-002"],
+                    input_fn=lambda _: "sí"
+                ),
+
                 approved_operation_ids=["op-001", "op-002"],
             )
         self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
@@ -1788,10 +2486,15 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan2,
                     approval_hash=sim1["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan2, approval_hash=sim1["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                 )
             self.assertEqual(spy_mod.call_count, 0)
 
-        self.assertEqual(rec2.state, ChainState.REJECTED)
+        self.assertEqual(rec2.state, ChainState.AWAITING_APPROVAL)
         self.assertEqual(cfg.read_text(encoding="utf-8"), original_text)
 
     def test_59_accidental_reexecution_of_applied_operation_rejected(self) -> None:
@@ -1813,6 +2516,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
             plan,
             approval_hash=sim["approval_hash"],
             user_approved=True,
+            authorization_token=self.orchestrator.authorize_plan_interactively(
+                plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-A"],
+                input_fn=lambda _: "sí"
+            ),
+
             approved_operation_ids=["op-A"],
         )
         self.assertEqual(op_a.status, OperationStatus.APPLIED.value)
@@ -1825,6 +2533,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=["op-A", "op-B"],
+                        input_fn=lambda _: "sí"
+                    ),
+
                     approved_operation_ids=["op-A", "op-B"],
                 )
             self.assertEqual(spy_mod.call_count, 0)
@@ -1866,6 +2579,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                     continue_independent=True,
                     auto_rollback=False,
                 )
@@ -1917,10 +2635,15 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                 )
 
-        # 1. op-001 conserva su estado APPLIED y su evidencia en record.applied_operations
-        self.assertEqual(op_1.status, OperationStatus.APPLIED.value)
+        # 1. op-001 conserva la evidencia aplicada y registra que su rollback falló.
+        self.assertEqual(op_1.status, OperationStatus.ROLLBACK_FAILED.value)
         self.assertEqual(len(rec.applied_operations), 1)
         self.assertEqual(rec.applied_operations[0]["operation_id"], "op-001")
         # 2. op-002 queda como FAILED y no se registra como aplicada
@@ -1961,6 +2684,11 @@ class TestFileEditorAndChainOrchestrator(unittest.TestCase):
                     plan,
                     approval_hash=sim["approval_hash"],
                     user_approved=True,
+                    authorization_token=self.orchestrator.authorize_plan_interactively(
+                        plan, approval_hash=sim["approval_hash"], selected_operation_ids=None,
+                        input_fn=lambda _: "sí"
+                    ),
+
                 )
 
         self.assertIn("inconsistencia", str(ctx.exception).lower())

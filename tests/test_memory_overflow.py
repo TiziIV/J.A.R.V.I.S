@@ -1,4 +1,6 @@
+import os
 import unittest
+os.environ["JARVIS_ENV"] = "test"
 
 from src.brain.memory import ConversationMemory
 

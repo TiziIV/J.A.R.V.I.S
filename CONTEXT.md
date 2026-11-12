@@ -858,3 +858,39 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 - Suite global (`$env:JARVIS_ENV='test'; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"`): **533 pruebas ejecutadas en 87.151s — OK (0 fallos, 0 errores)**.
 - `.\venv\Scripts\python.exe main.py --help`: **OK (código 0)**.
 - `data/memory_store.json`: intacto (**1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`).
+
+---
+
+## Cierre Final de N5 — Hardening Transaccional, Autorización Interactiva, Aislamiento de Memoria y Auditoría (2026-11-12)
+
+### 1. Arquitectura Consolidada y Decisiones de Seguridad
+
+- **Motor transaccional WAL-First (`src/brain/transaction_manager.py`):**
+  - `GlobalTransactionLock` con cerrojo entre hilos y bloqueo exclusivo interproceso en Windows (`msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)`) y timeout configurable (`TRANSACTION_LOCK_TIMEOUT_SEC`).
+  - Bitácora secuencial encadenada por SHA-256 (`.wal.jsonl` con `flush()` + `os.fsync()`) previa a instantáneas atómicas (`.tx.json` vía temporal + `os.replace()`).
+  - Cadena criptográfica por archivo (`H0 -> H1 -> H2 -> H3`), reversión idempotente estrictamente LIFO, detección de línea final truncada (`TRUNCATED_FINAL_WAL_LINE`) vs corrupción interna (`INTERIOR_WAL_CORRUPTION`), bloqueo automático si existen transacciones `CORRUPTED` o `RECOVERY_FAILED`, y rechazo explícito contra accesos a `data/memory_store.json`.
+- **Orquestación y Autorización Interactiva Criptográfica (`src/brain/chain_orchestrator.py`, `skills/file_editor_skill.py`):**
+  - Eliminada la aprobación meramente booleana: `authorize_plan_interactively()` genera tokens efímeros de un solo uso ligados a `(plan_id, execution_id, approval_hash, normalized_selection)` con TTL configurable (`CHAIN_APPROVAL_TTL_SECONDS = 300`, `CHAIN_MAX_OPERATIONS = 5000`), consumo atómico bajo lock y no-mutación ante rechazo.
+  - `simulate_plan()` y `preflight_validate()` impiden re-simulaciones y duplicados sobre operaciones aplicadas/fallidas (`ApprovalBindingError`, `DuplicateExecutionError`); `_verify_completed_dependency_evidence()` exige evidencia física real en disco y hash SHA-256 verificable antes de dar por completada una dependencia.
+  - `PolicyEngine` valida rutas autorizadas, nombres reservados, symlinks/junctions, backups y límites antes de mutar disco; operaciones rechazadas no escriben en disco.
+  - `main.py`: `_ensure_orchestrator()` ejecuta `recover_pending_transactions()` de manera perezosa en consola al usar `/optimizar` o `/rollback` e integra `authorize_plan_interactively()`.
+- **Aislamiento Determinista de Memoria en Pruebas (`src/brain/memory.py`):**
+  - Sustituida la heurística basada en `sys.modules["unittest"]` por `_is_test_environment()` explícito (`JARVIS_ENV` en `{"test", "testing"}`), confinando toda escritura en tests dentro de `temp/jarvis_test_isolated/`.
+  - Bloqueo incondicional `_storage_blocked` ante almacenamiento corrupto o ilegible para evitar autoguardados destructivos y recuperación atómica verificada mediante `recover_from_file()` con backup `.corrupt.<uuid>` sincronizado y verificado por SHA-256.
+- **Auditoría Independiente N5:**
+  - Informe `docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md` verificando cierre de hallazgos **N1–N5** y los 20 escenarios adversariales **S01–S20** con dictamen **APROBADO / N6 AUTORIZADO**.
+
+### 2. Archivos Incorporados y Modificados en N5
+
+- Nuevos: `src/brain/transaction_manager.py`, `tests/test_transaction_recovery.py`, `tests/test_memory_isolation.py`, `docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md`.
+- Modificados: `config/settings.py` (parámetros `CHAIN_*` y `TRANSACTION_*`), `main.py` (`recover_pending_transactions` y `authorize_plan_interactively`), `skills/file_editor_skill.py`, `src/brain/chain_orchestrator.py`, `src/brain/memory.py`, `tests/test_file_editor_and_chain.py`, `tests/test_advanced_features_mission.py`, `tests/test_codex_integration.py`, `tests/test_concurrency_and_locks.py`, `tests/test_intent_router_chaos.py`, `tests/test_memory_overflow.py`, `tests/test_memory_persistence.py`, `tests/test_memory_window.py`, `CONTEXT.md`.
+
+### 3. Verificaciones Realmente Ejecutadas (N5)
+
+- `.\venv\Scripts\python.exe -m py_compile` sobre todos los módulos N5 modificados/nuevos: **0 errores**.
+- Suites core N5 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_transaction_recovery tests.test_file_editor_and_chain tests.test_memory_isolation tests.test_memory_persistence tests.test_memory_window tests.test_memory_overflow -v`): **161 pruebas en 65.178s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Verificación de aislamiento en memoria/WAL bajo `JARVIS_ENV=test`: rutas resueltas dentro de `temp/jarvis_test_isolated/` y `temp/tx_test_runs/`.
+- `data/memory_store.json`: intacto byte a byte (**1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`).
+- `GitSafetyGuard`: `find_tracked_sensitive_files() == []`, `scan_text_for_secrets == []`, candidatos N5 validados (`True`).
+- Limitación conocida de plataforma: Windows no expone `os.fsync()` sobre descriptores de directorio; la durabilidad se garantiza con `flush()` + `os.fsync()` en cada `.wal.jsonl`, `.snapshot.tmp` y `.jarvis_tmp` antes de `os.replace()`.
+- Estado Git y versionado: cierra el bloque de 3 fases completadas desde `v5.1.0` (Paso #3.A `DocumentExportSkill`, Paso #3.B `WebExtractionSkill` y Fase N5), precedido por el registro documental de la auditoría de Paso #3.B (`2d94d79`).

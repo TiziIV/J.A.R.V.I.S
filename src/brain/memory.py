@@ -6,8 +6,11 @@ en archivo JSON ('data/memory_store.json') para retener contexto y preferencias 
 
 from collections import deque
 import json
+import hashlib
 import os
-import sys
+import threading
+import uuid
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Literal, Optional, TypedDict
 
 
@@ -22,7 +25,48 @@ class ConversationMessage(TypedDict):
 
 
 # Ruta predeterminada para el almacenamiento persistente en disco
-DEFAULT_MEMORY_FILE: str = os.path.join("data", "memory_store.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MEMORY_FILE: str = str(PROJECT_ROOT / "data" / "memory_store.json")
+RUNTIME_ENV_ENV: str = "JARVIS_ENV"
+TEST_TEMP_ROOT_ENV: str = "JARVIS_TEST_TEMP_ROOT"
+_USE_DEFAULT_STORAGE = object()
+
+
+def _is_test_environment() -> bool:
+    """Solo habilita aislamiento cuando el despliegue lo declara explícitamente."""
+    configured_environment = os.environ.get(RUNTIME_ENV_ENV, "").strip().lower()
+    return (
+        configured_environment in {"test", "testing"}
+    )
+
+
+def _test_storage_root() -> Path:
+    """Resuelve la única raíz autorizada para persistencia cuando se ejecutan pruebas."""
+    authorized_root = (Path(__file__).resolve().parents[2] / "temp" / "jarvis_test_isolated").resolve()
+    configured_root = os.environ.get(TEST_TEMP_ROOT_ENV)
+    # La variable solo permite subdividir la raíz temporal del proyecto; no puede
+    # convertir otra carpeta (por ejemplo data/) en una raíz de escritura autorizada.
+    root = Path(configured_root).resolve() if configured_root else authorized_root
+    try:
+        root.relative_to(authorized_root)
+    except ValueError as error:
+        raise ValueError(
+            f"JARVIS_TEST_TEMP_ROOT debe permanecer dentro de {authorized_root}."
+        ) from error
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _validate_storage_path(path: str | os.PathLike[str], *, test_mode: bool) -> str:
+    """Rechaza escrituras fuera de la raíz temporal autorizada durante pruebas."""
+    resolved = Path(path).resolve()
+    if test_mode:
+        root = _test_storage_root()
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"La ruta de memoria en pruebas debe permanecer dentro de {root}.") from error
+    return str(resolved)
 
 
 class ConversationMemory:
@@ -35,7 +79,7 @@ class ConversationMemory:
     def __init__(
         self,
         max_turns: int = 8,
-        storage_file: Optional[str] = DEFAULT_MEMORY_FILE,
+        storage_file: Optional[str] | object = _USE_DEFAULT_STORAGE,
         auto_save: bool = True,
     ) -> None:
         """
@@ -60,19 +104,39 @@ class ConversationMemory:
         # Diccionario para almacenar preferencias y datos persistentes del usuario (nombre, gustos, etc.)
         self.preferences: Dict[str, Any] = {}
         self.auto_save: bool = auto_save
+        # Serializa guardados simultáneos de la misma instancia para Windows.
+        self._persistence_lock = threading.Lock()
+        self.storage_status: str = "not_configured"
+        self.storage_error: Optional[str] = None
+        self._storage_blocked: bool = False
 
-        # Control inteligente de aislamiento en entorno de pruebas unitarias:
-        # Si se ejecuta bajo 'unittest' y se pasó la ruta por defecto, se desactiva la persistencia
-        # para evitar contaminación entre pruebas independientes, a menos que se fuerce explícitamente.
-        is_unittest = "unittest" in sys.modules and any("unittest" in arg or "test" in arg for arg in sys.argv)
-        if storage_file == DEFAULT_MEMORY_FILE and is_unittest and not os.environ.get("JARVIS_FORCE_PERSISTENCE"):
-            self.storage_file: Optional[str] = None
+        # Cada instancia de prueba obtiene su propio archivo para que el orden de ejecución
+        # y las ejecuciones anteriores no filtren estado entre tests.
+        self._test_mode = _is_test_environment()
+        if storage_file is _USE_DEFAULT_STORAGE and self._test_mode:
+            # Nombre aleatorio evita estado compartido sin crear subdirectorios
+            # por instancia (algunos sandboxes restringen mkdir repetidos).
+            isolated_file = _test_storage_root() / f"memory-{uuid.uuid4().hex}.json"
+            self.storage_file: Optional[str] = str(isolated_file)
+        elif storage_file is _USE_DEFAULT_STORAGE:
+            self.storage_file = DEFAULT_MEMORY_FILE
+        elif storage_file is None:
+            self.storage_file = None
         else:
-            self.storage_file = storage_file
+            self.storage_file = _validate_storage_path(storage_file, test_mode=self._test_mode)
 
         # Si hay una ruta configurada, intentamos cargar los datos persistidos en disco
         if self.storage_file:
             self.load_from_disk()
+
+    @property
+    def last_storage_error(self) -> Optional[str]:
+        """Alias descriptivo del último error, conservando `storage_error` histórico."""
+        return self.storage_error
+
+    @last_storage_error.setter
+    def last_storage_error(self, error: Optional[str]) -> None:
+        self.storage_error = error
 
     @staticmethod
     def _looks_like_untrusted_web_output(content: str) -> bool:
@@ -353,6 +417,11 @@ class ConversationMemory:
             self.save_to_disk()
 
     def save_to_disk(self, file_path: Optional[str] = None) -> bool:
+        """Guarda de forma serializada para evitar reemplazos simultáneos en Windows."""
+        with self._persistence_lock:
+            return self._save_to_disk(file_path)
+
+    def _save_to_disk(self, file_path: Optional[str] = None) -> bool:
         """
         Serializa y guarda los mensajes y preferencias actuales en un archivo JSON en disco.
         Crea las carpetas necesarias de forma automática y utiliza guardado atómico.
@@ -363,10 +432,23 @@ class ConversationMemory:
         Returns:
             bool: True si el guardado fue exitoso, False en caso de error.
         """
-        target = file_path or self.storage_file
+        target = file_path if file_path is not None else self.storage_file
         if not target:
             return False
+        try:
+            target = _validate_storage_path(target, test_mode=self._test_mode)
+        except (OSError, ValueError) as error:
+            print(f"[Memory Persistence Warning] Ruta de guardado rechazada: {error}")
+            return False
 
+        is_primary_target = bool(
+            self.storage_file
+            and Path(target).resolve() == Path(self.storage_file).resolve()
+        )
+        if self._storage_blocked and is_primary_target:
+            self.storage_error = "Guardado bloqueado: el almacenamiento requiere recuperación explícita."
+            return False
+        temp_path: Optional[str] = None
         try:
             # Aseguramos que la carpeta contenedora exista
             dir_name = os.path.dirname(os.path.abspath(target))
@@ -379,22 +461,41 @@ class ConversationMemory:
                 "preferences": self.preferences,
             }
 
-            # Guardamos primero en archivo temporal para asegurar atomicidad
-            temp_path = f"{target}.tmp"
-            with open(temp_path, "w", encoding="utf-8") as f:
+            # Cada guardado usa un temporal exclusivo: dos hilos no compiten por
+            # el mismo nombre mientras Windows mantiene abierto un archivo.
+            temp_path = f"{target}.{uuid.uuid4().hex}.tmp"
+            with open(temp_path, "x", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
 
-            # Reemplazamos de forma atómica el archivo de destino
-            if os.path.exists(target):
-                os.replace(temp_path, target)
-            else:
-                os.rename(temp_path, target)
+            # os.replace cubre de forma atómica tanto el primer guardado como
+            # los siguientes, incluso si otro hilo crea el destino a la vez.
+            os.replace(temp_path, target)
+            if is_primary_target:
+                self.storage_status = "loaded"
+                self.storage_error = None
+                self._storage_blocked = False
+            if os.name != "nt":
+                # POSIX permite sincronizar el directorio para hacer durable el rename.
+                directory_fd = os.open(dir_name, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
 
             return True
 
-        except Exception as error:
+        except (OSError, TypeError, ValueError) as error:
             print(f"[Memory Persistence Warning] No se pudo guardar la memoria en disco: {error}")
+            self.storage_error = str(error)
             return False
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError as cleanup_error:
+                    self.storage_error = f"Temporal pendiente de limpieza '{temp_path}': {cleanup_error}"
 
     def load_from_disk(self, file_path: Optional[str] = None) -> bool:
         """
@@ -407,15 +508,30 @@ class ConversationMemory:
         Returns:
             bool: True si la carga fue exitosa, False si no se pudo cargar.
         """
-        target = file_path or self.storage_file
-        if not target or not os.path.exists(target):
+        target = file_path if file_path is not None else self.storage_file
+        if not target:
+            return False
+        try:
+            target = _validate_storage_path(target, test_mode=self._test_mode)
+        except (OSError, ValueError) as error:
+            print(f"[Memory Persistence Warning] Ruta de carga rechazada: {error}")
+            return False
+        is_primary_target = bool(
+            self.storage_file
+            and Path(target).resolve() == Path(self.storage_file).resolve()
+        )
+        if not os.path.exists(target):
+            if is_primary_target:
+                self.storage_status = "missing"
+                self.storage_error = None
+                self._storage_blocked = False
             return False
 
         try:
             with open(target, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            if isinstance(data, dict):
+            if isinstance(data, dict) and isinstance(data.get("messages", []), list) and isinstance(data.get("preferences", {}), dict):
                 # Cargamos la lista de mensajes
                 raw_messages = data.get("messages", [])
                 if isinstance(raw_messages, list):
@@ -445,6 +561,10 @@ class ConversationMemory:
                 if isinstance(raw_prefs, dict):
                     self.preferences = dict(raw_prefs)
 
+                if is_primary_target:
+                    self.storage_status = "loaded"
+                    self.storage_error = None
+                    self._storage_blocked = False
                 return True
 
             elif isinstance(data, list):
@@ -468,10 +588,77 @@ class ConversationMemory:
                                     "provenance": {},
                                 }
                             )
+                if is_primary_target:
+                    self.storage_status = "loaded"
+                    self.storage_error = None
+                    self._storage_blocked = False
                 return True
 
-        except Exception as error:
+            if is_primary_target:
+                self._storage_blocked = True
+                self.storage_status = "corrupt"
+                self.storage_error = "El almacenamiento no contiene un objeto JSON válido de memoria."
+            return False
+
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as error:
             print(f"[Memory Persistence Warning] Error al cargar memoria desde {target}: {error}")
+            if is_primary_target:
+                self.storage_status = "corrupt" if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError)) else "unreadable"
+                self.storage_error = str(error)
+                self._storage_blocked = True
             return False
 
         return False
+
+    def recover_from_file(self, replacement_path: str | os.PathLike[str]) -> bool:
+        """Recupera explícitamente desde un JSON válido, preservando el archivo dañado.
+
+        Antes de reemplazar el destino crea una copia `.corrupt.<uuid>` exclusiva,
+        sincroniza esa copia y compara su SHA-256 con el original. La recuperación
+        nunca elimina el original si la copia verificada o el guardado fallan.
+        """
+        target = self.storage_file
+        if not target or not self._storage_blocked:
+            self.storage_error = "La recuperación solo está disponible si el almacenamiento está bloqueado."
+            return False
+        source = _validate_storage_path(replacement_path, test_mode=self._test_mode)
+        target = _validate_storage_path(target, test_mode=self._test_mode)
+        candidate = ConversationMemory(
+            max_turns=self.max_turns,
+            storage_file=None,
+            auto_save=False,
+        )
+        if not candidate.load_from_disk(source):
+            self.storage_error = f"El archivo de recuperación no es válido: {candidate.storage_error or candidate.storage_status}."
+            return False
+        original_messages = deque(self._messages, maxlen=self.max_turns * 2)
+        original_preferences = dict(self.preferences)
+        original_blocked = self._storage_blocked
+        backup_path = f"{target}.corrupt.{uuid.uuid4().hex}"
+        try:
+            with open(target, "rb") as original_file:
+                original_bytes = original_file.read()
+            with open(backup_path, "xb") as backup_file:
+                backup_file.write(original_bytes)
+                backup_file.flush()
+                os.fsync(backup_file.fileno())
+            with open(backup_path, "rb") as backup_file:
+                backup_hash = hashlib.sha256(backup_file.read()).hexdigest()
+            if backup_hash != hashlib.sha256(original_bytes).hexdigest():
+                raise OSError("La copia de preservación no coincide con el archivo dañado.")
+            self._messages = deque(candidate.get_messages_list(), maxlen=self.max_turns * 2)
+            self.preferences = candidate.get_preferences()
+            self._storage_blocked = False
+            if not self.save_to_disk():
+                self._messages = original_messages
+                self.preferences = original_preferences
+                self._storage_blocked = original_blocked
+                return False
+            self.storage_status = "recovered"
+            return True
+        except OSError as error:
+            self._messages = original_messages
+            self.preferences = original_preferences
+            self._storage_blocked = original_blocked
+            self.last_storage_error = f"No se pudo preservar o recuperar el archivo: {error}"
+            return False

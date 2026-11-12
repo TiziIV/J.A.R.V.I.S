@@ -129,6 +129,11 @@ def run_console_session(
                 brain_manager=brain_manager,
                 skill_manager=sm,
             )
+            if hasattr(chain_orchestrator, "recover_pending_transactions"):
+                try:
+                    chain_orchestrator.recover_pending_transactions()
+                except Exception as rec_err:
+                    logger.warning(f"Advertencia al recuperar transacciones pendientes: {rec_err}")
         return chain_orchestrator
 
     def _ensure_tts() -> Any:
@@ -297,10 +302,16 @@ def run_console_session(
                     continue
 
                 try:
+                    auth_token = orch.authorize_plan_interactively(
+                        plan,
+                        approval_hash=approval_hash,
+                        selected_operation_ids=selected_ids,
+                        input_fn=input_fn,
+                    )
                     exec_res = orch.execute_approved_plan(
                         plan,
                         approval_hash=approval_hash,
-                        user_approved=True,
+                        authorization_token=auth_token,
                         approved_operation_ids=selected_ids,
                     )
                     summary_msg = (

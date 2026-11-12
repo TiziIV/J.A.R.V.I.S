@@ -349,12 +349,17 @@ class TestCodexClientUnit(unittest.TestCase):
         valid_sub = self.client.validate_workspace(BASE_DIR / "src")
         self.assertTrue(valid_sub.is_relative_to(BASE_DIR.resolve()))
 
-        # Un directorio temporal fuera del proyecto es rechazado
-        with tempfile.TemporaryDirectory() as external_tmp:
+        # La raíz temporal del sistema ya existe y está fuera del proyecto.
+        # No hace falta crear/eliminar otra carpeta para probar la validación de ruta;
+        # así evitamos que la prueba dependa de permisos de limpieza del sandbox Windows.
+        external_root = Path(tempfile.gettempdir()).resolve()
+        self.assertTrue(external_root.is_dir())
+        with patch("src.brain.codex_client.subprocess.run") as subprocess_run:
             with self.assertRaises(BrainError) as ctx:
-                self.client.validate_workspace(external_tmp)
-            self.assertEqual(ctx.exception.kind, BrainErrorKind.INVALID_REQUEST)
-            self.assertIn("fuera del proyecto autorizado", ctx.exception.user_message)
+                self.client.validate_workspace(external_root)
+            subprocess_run.assert_not_called()
+        self.assertEqual(ctx.exception.kind, BrainErrorKind.INVALID_REQUEST)
+        self.assertIn("fuera del proyecto autorizado", ctx.exception.user_message)
 
     def test_codex_disabled_configuration_blocks_execution(self) -> None:
         """Comprueba que si `CODEX_ENABLED=False`, J.A.R.V.I.S. no ejecute Codex."""

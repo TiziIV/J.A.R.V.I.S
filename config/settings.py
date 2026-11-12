@@ -150,6 +150,12 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return value if value >= minimum else default
 
 
+# Límites locales del orquestador: evitan grafos desmedidos y fijan cuánto vive una
+# confirmación interactiva dentro del proceso antes de exigir al usuario que confirme otra vez.
+CHAIN_MAX_OPERATIONS: int = _env_int("CHAIN_MAX_OPERATIONS", 5000, minimum=1)
+CHAIN_APPROVAL_TTL_SECONDS: int = _env_int("CHAIN_APPROVAL_TTL_SECONDS", 300, minimum=1)
+
+
 def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
     """
     Lee una opción cerrada (p. ej. un modo) normalizando mayúsculas, espacios y guiones.
@@ -335,6 +341,8 @@ AUTHORIZED_FILE_ROOTS: tuple[str, ...] = _build_authorized_file_roots()
 # Directorio local (ignorado por Git en `data/`) para almacenar metadatos de auditoría y backups centrales opcionales.
 BACKUP_STORAGE_DIR: Path = BASE_DIR / "data" / "backups"
 AUDIT_LOG_FILE: Path = BASE_DIR / "data" / "file_editor_audit.jsonl"
+TRANSACTION_JOURNAL_DIR: Path = BASE_DIR / "data" / "transactions"
+TRANSACTION_LOCK_TIMEOUT_SEC: float = _env_float("TRANSACTION_LOCK_TIMEOUT_SEC", 5.0, minimum=0.5)
 
 # Límites de seguridad y reintentos ante bloqueos transitorios de Windows (WinError 32 / PermissionError).
 FILE_EDITOR_MAX_RETRIES: int = _env_int("FILE_EDITOR_MAX_RETRIES", 3, minimum=1)

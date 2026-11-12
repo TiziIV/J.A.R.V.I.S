@@ -9,8 +9,15 @@ Suite de pruebas unitarias para las nuevas capacidades de J.A.R.V.I.S.:
 import json
 import os
 import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
+
+# Este módulo importa componentes que pueden crear ConversationMemory.
+TEST_TEMP_ROOT = Path(__file__).resolve().parents[1] / "temp" / "jarvis_test_isolated"
+TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["JARVIS_TEST_TEMP_ROOT"] = str(TEST_TEMP_ROOT)
+os.environ["JARVIS_ENV"] = "test"
 
 from config.tools_schema import TOOLS_SCHEMA
 from skills.windows_skills import (
@@ -22,6 +29,7 @@ from skills.windows_skills import (
 from src.audio.tts import TextToSpeech
 from src.brain.intent_router import IntentRouter
 from src.brain.memory import ConversationMemory
+
 from src.tools.skill_manager import SkillManager
 
 
@@ -136,10 +144,12 @@ class TestMemoryPersistenceToDisk(unittest.TestCase):
     """Pruebas para persistencia automática de ConversationMemory a disco."""
 
     def test_save_and_reload_from_custom_file(self):
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, dir=TEST_TEMP_ROOT) as tf:
             temp_path = tf.name
-
         try:
+            # El constructor distingue un almacén inexistente de un JSON vacío/corrupto;
+            # borrar solo este archivo único deja que la memoria cree su primer guardado.
+            os.remove(temp_path)
             mem = ConversationMemory(max_turns=4, storage_file=temp_path, auto_save=True)
             mem.add_message("user", "Recuerda que mi nombre es Tiziano")
             mem.add_message("assistant", "Entendido, señor Tiziano.")

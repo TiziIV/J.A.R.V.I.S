@@ -6,6 +6,13 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
+
+# Todos los archivos persistentes de esta suite quedan bajo una raíz desechable dedicada.
+TEST_TEMP_ROOT = Path(__file__).resolve().parents[1] / "temp" / "jarvis_test_isolated"
+TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["JARVIS_TEST_TEMP_ROOT"] = str(TEST_TEMP_ROOT)
+os.environ["JARVIS_ENV"] = "test"
 from src.brain.memory import ConversationMemory
 
 
@@ -165,7 +172,7 @@ class TestMemoryJSONPersistence(unittest.TestCase):
         mem.add_message("user", "¿Cuál es mi nombre?")
         mem.add_message("assistant", "Su nombre es Tiziano.")
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", dir=TEST_TEMP_ROOT) as f:
             path = f.name
 
         try:
@@ -185,7 +192,7 @@ class TestMemoryJSONPersistence(unittest.TestCase):
             mem.add_message("user", f"pregunta_{i}")
             mem.add_message("assistant", f"respuesta_{i}")
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", dir=TEST_TEMP_ROOT) as f:
             path = f.name
 
         try:
@@ -200,7 +207,7 @@ class TestMemoryJSONPersistence(unittest.TestCase):
 
     def test_recuperacion_ante_json_corrupto(self):
         """Archivo JSON corrupto → la carga falla silenciosamente sin crash."""
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", dir=TEST_TEMP_ROOT) as f:
             f.write("{json_corrupto: [sin_comillas, true, null, }")
             path = f.name
 
@@ -216,7 +223,7 @@ class TestMemoryJSONPersistence(unittest.TestCase):
 
     def test_recuperacion_ante_json_vacio(self):
         """Archivo JSON con string vacío → JSONDecodeError controlado."""
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", dir=TEST_TEMP_ROOT) as f:
             f.write("")
             path = f.name
         mem = ConversationMemory()
@@ -234,7 +241,7 @@ class TestMemoryJSONPersistence(unittest.TestCase):
 
     def test_json_con_mensajes_vacios_no_rompe_memoria(self):
         """JSON con lista de mensajes vacía → memoria se mantiene vacía."""
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", dir=TEST_TEMP_ROOT) as f:
             json.dump({"messages": []}, f)
             path = f.name
         mem = ConversationMemory()
@@ -266,7 +273,7 @@ class TestMemoryJSONPersistence(unittest.TestCase):
         mem.add_message("user", "Ñoño cañón 日本語 Ελληνικά 🎵")
         mem.add_message("assistant", "Entendido señor ✓")
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8", dir=TEST_TEMP_ROOT) as f:
             path = f.name
 
         try:

@@ -1183,6 +1183,9 @@ class FileEditorSkill(BaseSkill):
         execution_id: Optional[str] = None,
         expected_file_hash: Optional[str] = None,
         separator: str = "=",
+        on_intent_prepared: Optional[Callable[[str, str, str], None]] = None,
+        on_backup_verified: Optional[Callable[[BackupRecord], None]] = None,
+        on_after_atomic_replace: Optional[Callable[[str, Path], None]] = None,
     ) -> dict[str, Any]:
         """
         Modifica de manera segura un archivo de configuración autorizado (`.ini`, `.cfg`, `.txt`, `.json`, `.xml`):
@@ -1291,9 +1294,23 @@ class FileEditorSkill(BaseSkill):
                     raise ValueError(f"Formato de archivo '{ext}' no soportado para actualización por claves.")
 
             new_bytes = _encode_text_strict(new_text, codec, bom)
+            planned_new_hash = compute_sha256_bytes(new_bytes)
+            in_tx_callback = False
+
+            if on_intent_prepared is not None:
+                in_tx_callback = True
+                on_intent_prepared(original_hash, planned_new_hash, str(validated_target))
+                in_tx_callback = False
 
             # Solo después de validar que el nuevo contenido es válido y codificable creamos el backup
             backup_path = self.create_backup(validated_target, execution_id=exec_id)
+
+            if on_backup_verified is not None:
+                bkp_rec = self.backup_manager.get_record_by_backup(backup_path)
+                if bkp_rec is not None:
+                    in_tx_callback = True
+                    on_backup_verified(bkp_rec)
+                    in_tx_callback = False
 
             def _validate_temp_bytes(raw_b: bytes) -> None:
                 txt, _, _ = _decode_bytes_strict(raw_b)
@@ -1311,6 +1328,11 @@ class FileEditorSkill(BaseSkill):
                 format_validator=_validate_temp_bytes,
             )
             self.backup_manager.update_post_edit_hash(backup_path, final_hash)
+
+            if on_after_atomic_replace is not None:
+                in_tx_callback = True
+                on_after_atomic_replace(final_hash, backup_path)
+                in_tx_callback = False
 
             if attempts > 1:
                 warnings.append(f"El reemplazo atómico requirió {attempts} intentos por bloqueo transitorio.")
@@ -1331,6 +1353,8 @@ class FileEditorSkill(BaseSkill):
             return result
 
         except BufferError as conflict_exc:
+            if locals().get("in_tx_callback", False):
+                raise
             result = {
                 "status": "conflict",
                 "file_path": str(file_path),
@@ -1347,6 +1371,8 @@ class FileEditorSkill(BaseSkill):
             return result
 
         except Exception as exc:
+            if locals().get("in_tx_callback", False):
+                raise
             errors.append(redact_secrets(str(exc)))
             result = {
                 "status": "error",
@@ -1491,7 +1517,11 @@ class FileEditorSkill(BaseSkill):
         merged.update(kwargs)
 
         action = str(merged.get("action") or "").strip().lower()
-        exec_id = str(merged.get("execution_id") or generate_execution_id())
+
+        # Las escrituras solo se ejecutan desde las APIs internas tras la aprobación
+        # del ChainOrchestrator; el despacho general de skills no crea autorizaciones.
+        if action in {"modify", "rollback", "backup"}:
+            return "Acción rechazada. Las únicas acciones públicas permitidas son discover y read."
 
         if action == "discover":
             app_name = str(merged.get("game_or_app_name") or "")
@@ -1509,62 +1539,6 @@ class FileEditorSkill(BaseSkill):
                 )
             return f"No encontré el archivo '{target_file}' para '{app_name}' dentro de las zonas autorizadas, señor."
 
-        if action == "backup":
-            raw_path = merged.get("file_path")
-            if not raw_path:
-                return "Por favor indique el archivo objetivo para crear el respaldo, señor."
-            try:
-                bak_path = self.create_backup(str(raw_path), execution_id=exec_id)
-                rec = self.backup_manager.get_record_by_backup(bak_path)
-                short_hash = rec.backup_sha256[:12] if rec else "verificado"
-                return (
-                    f"Respaldo '{bak_path.name}' creado y verificado con éxito "
-                    f"(SHA-256: {short_hash}..., ID: {exec_id}), señor."
-                )
-            except Exception as exc:
-                return f"No se pudo crear el respaldo solicitado, señor: {redact_secrets(str(exc))}"
-
-        if action == "modify":
-            raw_path = merged.get("file_path")
-            if not raw_path:
-                return "Por favor indique el archivo que desea modificar, señor."
-            res = self.modify_ini_or_text(
-                file_path=str(raw_path),
-                key_values=merged.get("key_values"),
-                replacement_content=merged.get("replacement_content"),
-                section=merged.get("section"),
-                execution_id=exec_id,
-                expected_file_hash=merged.get("expected_file_hash"),
-            )
-            if res["status"] == "success":
-                fname = Path(str(res["file_path"])).name
-                bak_name = Path(str(res["backup_path"])).name if res.get("backup_path") else "N/A"
-                short_final = str(res["final_hash"])[:12]
-                count = len(res.get("applied_changes") or [])
-                return (
-                    f"Se aplicaron y verificaron {count} cambio(s) en '{fname}' "
-                    f"(respaldo: '{bak_name}', SHA-256 final: {short_final}..., ID: {res['execution_id']}), señor."
-                )
-            err_summary = "; ".join(res.get("errors") or ["Operación rechazada por política de seguridad."])
-            return f"No se modificó el archivo, señor: {err_summary} (ID: {res['execution_id']})."
-
-        if action == "rollback":
-            bak = merged.get("backup_path")
-            tgt = merged.get("file_path") or merged.get("target_path")
-            if not bak or not tgt:
-                return "Para restaurar un archivo necesito la ruta del backup y la del archivo objetivo, señor."
-            ok = self.rollback(
-                backup_path=str(bak),
-                target_path=str(tgt),
-                expected_current_hash=merged.get("expected_current_hash"),
-                execution_id=exec_id,
-            )
-            if ok:
-                fname = Path(str(tgt)).name
-                return f"El archivo '{fname}' fue restaurado y verificado exitosamente desde su respaldo (ID: {exec_id}), señor."
-            err_list = self.last_operation_result.get("errors") or ["No fue posible verificar la restauración segura."]
-            return f"Restauración detenida por seguridad, señor: {'; '.join(err_list)} (ID: {exec_id})."
-
         if action == "read":
             raw_path = merged.get("file_path")
             if not raw_path:
@@ -1579,7 +1553,7 @@ class FileEditorSkill(BaseSkill):
 
         return (
             f"Acción '{action}' no reconocida en FileEditorSkill, señor. "
-            "Las acciones válidas son: discover, read, backup, modify y rollback."
+            "Las acciones válidas son: discover y read."
         )
 
 

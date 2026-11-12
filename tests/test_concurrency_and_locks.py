@@ -5,7 +5,9 @@ Tests de concurrencia: race conditions y deadlocks entre JarvisTray, TTS y Audio
 import threading
 import time
 import unittest
+import os
 from unittest.mock import MagicMock, patch
+os.environ["JARVIS_ENV"] = "test"
 from src.brain.memory import ConversationMemory
 
 

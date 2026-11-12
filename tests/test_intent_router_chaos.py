@@ -5,7 +5,9 @@ Garantiza que ninguna excepción no controlada escape de analyze_intent().
 
 import json
 import unittest
+import os
 from unittest.mock import MagicMock, patch
+os.environ["JARVIS_ENV"] = "test"
 from src.brain.intent_router import IntentRouter
 from src.brain.memory import ConversationMemory
 
