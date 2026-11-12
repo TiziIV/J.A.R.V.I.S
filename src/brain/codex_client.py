@@ -975,14 +975,25 @@ class CodexBrain:
         workspace_dir: Optional[str | Path] = None,
         timeout: Optional[float] = None,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
         **kwargs: Any,
     ) -> str:
         """
         Punto de entrada unificado compatible con `BrainManager`.
         Distingue automáticamente entre consultas de solo lectura (Tipo A),
         edición autorizada (Tipo B) y solicitudes ambiguas o bloqueadas.
+        La clasificación de tarea se ejecuta exclusivamente sobre `prompt` (nunca sobre
+        `untrusted_context`) para impedir que contenido web externo escale permisos (F-05).
         """
         classification = classify_codex_task(prompt)
+        effective_prompt = (
+            f"{prompt}\n\n"
+            "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
+            f"{untrusted_context}\n"
+            "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+            if untrusted_context
+            else prompt
+        )
 
         if classification.is_destructive:
             err = BrainError(
@@ -1013,7 +1024,7 @@ class CodexBrain:
 
         if effective_type == "coding" and should_write:
             return self.run_coding_task(
-                prompt,
+                effective_prompt,
                 system_prompt=system_prompt,
                 workspace_dir=workspace_dir,
                 timeout=timeout,
@@ -1022,7 +1033,7 @@ class CodexBrain:
             )
 
         return self.run_readonly_task(
-            prompt,
+            effective_prompt,
             system_prompt=system_prompt,
             workspace_dir=workspace_dir,
             timeout=timeout,

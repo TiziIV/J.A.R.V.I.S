@@ -164,7 +164,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 },
                 "output_format": {
                     "type": "string",
-                    "description": "Formato de retorno: 'summary', 'json' o 'markdown'."
+                    "description": "Formato de retorno: 'summary', 'json', 'markdown' o 'envelope'."
                 },
                 "max_results": {
                     "type": "integer",

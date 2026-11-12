@@ -121,3 +121,42 @@ class SkillManager:
             print(f"[X] Error al ejecutar la skill '{skill_name}': {e}")
             traceback.print_exc()
             return f"Lo siento señor, ocurrió un error interno al ejecutar la habilidad {skill_name}."
+
+    def execute_skill_with_envelope(
+        self,
+        skill_name: str,
+        params: dict | None = None,
+        **kwargs,
+    ) -> tuple[str, dict | None]:
+        """
+        Ejecuta una skill registrada y devuelve `(texto_respuesta, envelope_aislado)`.
+        Para skills que manejan datos externos no confiables (como `web_extraction`),
+        el segundo elemento contiene el sobre `build_llm_envelope` con nivel de confianza
+        `untrusted_external_content` y procedencia explícita (F-05).
+        """
+        if skill_name not in self.skills:
+            return (
+                f"Lo siento señor, la habilidad '{skill_name}' no está registrada en mis sistemas.",
+                None,
+            )
+
+        skill_instance = self.skills[skill_name]
+        exec_args: dict = {}
+        if isinstance(params, dict):
+            exec_args.update(params)
+        exec_args.update(kwargs)
+
+        try:
+            print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {exec_args}")
+            if hasattr(skill_instance, "execute_with_envelope"):
+                text_out, envelope, _report = skill_instance.execute_with_envelope(exec_args)
+                return text_out, envelope
+            result = skill_instance.execute(**exec_args)
+            return result, None
+        except Exception as e:
+            print(f"[X] Error al ejecutar la skill '{skill_name}': {e}")
+            traceback.print_exc()
+            return (
+                f"Lo siento señor, ocurrió un error interno al ejecutar la habilidad {skill_name}.",
+                None,
+            )

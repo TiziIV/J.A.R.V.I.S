@@ -218,10 +218,12 @@ class GeminiBrain:
         model_override: str | None = None,
         max_output_tokens: int | None = None,
         raise_on_error: bool = False,
+        untrusted_context: str | None = None,
     ) -> str:
         """
         Genera una respuesta con Gemini y reintenta con un modelo alternativo solo ante un 404.
         No cambia de modelo ante errores de autenticación, cuota agotada o fallos de red.
+        Mantiene `system_instruction` estrictamente separado de `untrusted_context` (F-05).
         """
         self.last_error = None
         self.last_fallback_note = None
@@ -239,6 +241,11 @@ class GeminiBrain:
             return unconfigured_err.user_message
 
         active_system_prompt: str = system_prompt or JARVIS_SYSTEM_PROMPT
+        effective_prompt: str = (
+            f"[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n{untrusted_context}\n[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n\n{prompt}"
+            if untrusted_context
+            else prompt
+        )
         primary_model: str = (model_override or self.model_name).strip() or self.model_name
         token_limit: int = max_output_tokens if isinstance(max_output_tokens, int) and max_output_tokens > 0 else 300
 
@@ -261,13 +268,13 @@ class GeminiBrain:
             try:
                 if token_limit == 300:
                     answer: str = self._generate_with_model(
-                        prompt=prompt,
+                        prompt=effective_prompt,
                         system_prompt=active_system_prompt,
                         model_name=candidate,
                     )
                 else:
                     answer = self._generate_with_model(
-                        prompt=prompt,
+                        prompt=effective_prompt,
                         system_prompt=active_system_prompt,
                         model_name=candidate,
                         max_output_tokens=token_limit,

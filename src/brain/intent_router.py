@@ -118,7 +118,9 @@ class IntentRouter:
         if not isinstance(user_text, str) or not user_text.strip():
             return None
 
-        raw = user_text.strip()
+        raw = self._strip_untrusted_web_blocks(user_text).strip()
+        if not raw or self._is_untrusted_web_payload(raw):
+            return None
         norm = self._normalize_text(raw)
         if not norm:
             return None
@@ -263,12 +265,9 @@ class IntentRouter:
 
         # 9. WebExtractionSkill ('web_extraction') — fast-path determinista para URLs HTTP/HTTPS explícitas (F-06).
         if "web_extraction" in self._tools_by_name:
-            if re.search(
-                r"\b(?:extrae|extraer|extraeme|analiza|analizar|lee|leer|raspa|raspar|scrapea|scrapear|resume|resumir|obten|obtener)\b",
-                norm,
-            ):
+            if self._is_explicit_web_extraction_command(norm):
                 urls_found = [
-                    u.rstrip(".,;:!?)]\"'")
+                    self._clean_extracted_url_token(u)
                     for u in re.findall(r"https?://[^\s\"'<>]+", raw, flags=re.IGNORECASE)
                 ]
                 urls_found = [u for u in urls_found if u]
@@ -291,12 +290,102 @@ class IntentRouter:
             )
             if app_match:
                 candidate_app = app_match.group(1).strip()
-                # Evitamos capturar frases que son de otra categoría (ej. "inicia protocolo de trabajo" ya se filtró arriba)
-                ignored_targets = ("sesion", "conversacion", "selector", "modo")
-                if candidate_app and not any(candidate_app.startswith(t) for t in ignored_targets):
+                raw_lower = raw.lower()
+                # Evitamos capturar frases que son de otra categoría o URLs HTTP/HTTPS
+                ignored_targets = ("sesion", "conversacion", "selector", "modo", "http", "https")
+                if (
+                    candidate_app
+                    and "http://" not in raw_lower
+                    and "https://" not in raw_lower
+                    and not any(candidate_app.startswith(t) for t in ignored_targets)
+                ):
                     return _make_tool_call("app_launcher", {"app_name": candidate_app})
 
         return None
+
+    @staticmethod
+    def _clean_extracted_url_token(raw_token: str) -> str:
+        """
+        Limpia signos de puntuación finales de una frase sin truncar paréntesis,
+        corchetes o llaves balanceados que pertenecen legítimamente a la URL (ej. Wikipedia) (F-06).
+        """
+        token = str(raw_token or "").strip()
+        if not token:
+            return ""
+        # Quitar paréntesis/corchetes envolventes si la URL fue escrita como `(https://...)`
+        while token.startswith(("(", "[", "{")):
+            token = token[1:].strip()
+
+        pairs = {")": "(", "]": "[", "}": "{"}
+        while token:
+            last = token[-1]
+            if last in ".,;:!?\"'»”’":
+                token = token[:-1]
+                continue
+            if last in pairs:
+                opener = pairs[last]
+                if token.count(last) > token.count(opener):
+                    token = token[:-1]
+                    continue
+            break
+        return token
+
+    @staticmethod
+    def _is_explicit_web_extraction_command(norm: str) -> bool:
+        """
+        Determina si el texto normalizado expresa una orden imperativa de extracción web
+        y no una mención conversacional o condicional de verbos genéricos ('lee', 'analiza') (F-06).
+        """
+        # Excluir oraciones condicionales, negativas o interrogativas sobre fallos
+        if re.match(r"^(?:jarvis\s+)?(?:si|cuando|aunque|no|nunca|jam[aá]s|por\s+que|porque)\b", norm):
+            return False
+        if re.search(r"\b(?:analiza|lee|resume|obten)\s+(?:por\s+que|como|cuando|si\b)", norm):
+            return False
+
+        # Verbos específicos de extracción/scraping en posición de comando
+        if re.match(
+            r"^(?:jarvis\s+)?(?:por\s+favor\s+)?(?:necesito\s+que\s+|quiero\s+que\s+|puedes\s+|podrias\s+)?"
+            r"(?:extrae(?:r|me|s)?|raspa(?:r)?|scrapea(?:r)?)\b",
+            norm,
+        ):
+            return True
+
+        # Verbos generales ('analiza', 'lee', 'resume', 'obten') solo cuando van seguidos de una URL
+        # o de un sustantivo web explícito ('el contenido', 'la página', 'la web', 'la url', 'el artículo', etc.)
+        if re.match(
+            r"^(?:jarvis\s+)?(?:por\s+favor\s+)?(?:necesito\s+que\s+|quiero\s+que\s+|puedes\s+|podrias\s+)?"
+            r"(?:analiza(?:r|me)?|lee(?:r|me)?|resume|resumir|resumeme|obten(?:er|me)?)\s+"
+            r"(?:(?:el\s+contenido|la\s+pagina|las\s+paginas|la\s+web|las\s+webs|el\s+sitio|los\s+sitios|"
+            r"el\s+articulo|los\s+articulos|la\s+url|las\s+urls|el\s+enlace|los\s+enlaces|la\s+fuente|las\s+fuentes|"
+            r"el\s+documento)\b|https?[a-z0-9])",
+            norm,
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _strip_untrusted_web_blocks(text: str) -> str:
+        """Elimina bloques delimitados de evidencia externa no confiable antes de enrutar intenciones (F-05)."""
+        if not isinstance(text, str):
+            return ""
+        cleaned = re.sub(
+            r"\[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA\][\s\S]*?\[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA\]",
+            "",
+            text,
+        )
+        return cleaned
+
+    @staticmethod
+    def _is_untrusted_web_payload(text: str) -> bool:
+        """Detecta sobres o resúmenes de extracción web para impedir que disparen herramientas (F-05)."""
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        if stripped.startswith("Extracción web (") and "Aviso de seguridad: contenido externo NO confiable" in stripped:
+            return True
+        if '"trust_level": "untrusted_external_content"' in stripped or '"trust_level":"untrusted_external_content"' in stripped:
+            return True
+        return False
 
     @staticmethod
     def _normalize_tools(tools: Sequence[object]) -> list[dict[str, Any]]:
@@ -340,18 +429,22 @@ class IntentRouter:
         if not isinstance(user_text, str) or not user_text.strip():
             return fallback
 
+        sanitized_user_text = self._strip_untrusted_web_blocks(user_text).strip()
+        if not sanitized_user_text or self._is_untrusted_web_payload(sanitized_user_text):
+            return fallback
+
         system_prompt = self._build_system_prompt()
         raw_response: str | None = None
         try:
             # Separamos las instrucciones del texto para reducir la posibilidad de mezclar roles.
-            raw_response = self.llm.generate_response(user_text, system_prompt=system_prompt)
+            raw_response = self.llm.generate_response(sanitized_user_text, system_prompt=system_prompt)
             if is_provider_error(raw_response):
                 raise RuntimeError("LLM primario no disponible o devolvió respuesta no válida.")
         except Exception as primary_error:
             if self.fallback_llm is not None:
                 print(f"[IntentRouter] Primario falló ({primary_error}). Derivando a fallback...")
                 try:
-                    raw_response = self.fallback_llm.generate_response(user_text, system_prompt=system_prompt)
+                    raw_response = self.fallback_llm.generate_response(sanitized_user_text, system_prompt=system_prompt)
                 except Exception as fallback_error:
                     print(f"[IntentRouter] Fallback también falló ({fallback_error}). Retornando chat por defecto.")
                     return fallback

@@ -94,25 +94,53 @@ class OpenAIBrain:
         system_prompt: str,
         model_name: str,
         max_tokens: int,
+        untrusted_context: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Construye el payload compatible con el endpoint configurado (`/v1/chat/completions`
-        o `/v1/responses`).
+        o `/v1/responses`). Mantiene `system_prompt` / `instructions` separado de `untrusted_context` (F-05).
         """
         if self.endpoint.rstrip("/").endswith("/v1/responses"):
+            input_payload: Any = (
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
+                            f"{untrusted_context}\n"
+                            "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+                if untrusted_context
+                else prompt
+            )
             return {
                 "model": model_name,
                 "instructions": system_prompt,
-                "input": prompt,
+                "input": input_payload,
                 "max_output_tokens": max_tokens,
             }
         # En /v1/chat/completions usamos max_completion_tokens (compatible con GPT-5.x y GPT-4o).
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+        ]
+        if untrusted_context:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
+                        f"{untrusted_context}\n"
+                        "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+                    ),
+                }
+            )
+        messages.append({"role": "user", "content": prompt})
         return {
             "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "max_completion_tokens": max_tokens,
         }
 
@@ -340,6 +368,7 @@ class OpenAIBrain:
         model_override: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
     ) -> str:
         """
         Genera una respuesta con OpenAI GPT.
@@ -364,6 +393,9 @@ class OpenAIBrain:
         active_system_prompt = system_prompt or JARVIS_SYSTEM_PROMPT
         token_limit = int(max_output_tokens) if isinstance(max_output_tokens, int) and max_output_tokens > 0 else VOICE_MAX_TOKENS
         candidate_models = list(dict.fromkeys([primary_model, self.fallback_model_name]))
+        extra_kw: dict[str, Any] = (
+            {"untrusted_context": untrusted_context} if untrusted_context is not None else {}
+        )
 
         for index, candidate in enumerate(candidate_models):
             payload = self._build_payload(
@@ -371,6 +403,7 @@ class OpenAIBrain:
                 system_prompt=active_system_prompt,
                 model_name=candidate,
                 max_tokens=token_limit,
+                **extra_kw,
             )
             try:
                 response_data = self._send_request(payload, candidate)

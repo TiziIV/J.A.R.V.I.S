@@ -76,15 +76,30 @@ class ClaudeBrain:
         system_prompt: str,
         model_name: str,
         max_tokens: int,
+        untrusted_context: Optional[str] = None,
     ) -> dict[str, Any]:
         """Construye el cuerpo JSON conforme al esquema oficial de `/v1/messages`."""
+        if untrusted_context:
+            user_content: Any = [
+                {
+                    "type": "text",
+                    "text": (
+                        "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
+                        f"{untrusted_context}\n"
+                        "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+                    ),
+                },
+                {"type": "text", "text": prompt},
+            ]
+        else:
+            user_content = prompt
         return {
             "model": model_name,
             "max_tokens": max_tokens,
             "temperature": 0.3,
             "system": system_prompt,
             "messages": [
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": user_content},
             ],
         }
 
@@ -260,6 +275,7 @@ class ClaudeBrain:
         model_override: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
     ) -> str:
         """
         Genera una respuesta utilizando Anthropic Claude.
@@ -283,11 +299,15 @@ class ClaudeBrain:
 
         active_system_prompt = system_prompt or JARVIS_SYSTEM_PROMPT
         token_limit = int(max_output_tokens) if isinstance(max_output_tokens, int) and max_output_tokens > 0 else VOICE_MAX_TOKENS
+        extra_kw: dict[str, Any] = (
+            {"untrusted_context": untrusted_context} if untrusted_context is not None else {}
+        )
         payload = self._build_payload(
             prompt=prompt,
             system_prompt=active_system_prompt,
             model_name=target_model,
             max_tokens=token_limit,
+            **extra_kw,
         )
 
         try:

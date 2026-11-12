@@ -211,17 +211,43 @@ _META_CHARSET_RE = re.compile(
     r"""<meta\b[^>]*?(?:charset\s*=\s*["']?\s*([A-Za-z0-9._-]+)|content\s*=\s*["'][^"']*?charset\s*=\s*([A-Za-z0-9._-]+))""",
     re.IGNORECASE,
 )
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_ESCAPE_RE = re.compile(r"\\([0-9a-fA-F]{1,6}\s?|.)")
+_CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.DOTALL)
 _HIDDEN_STYLE_RE = re.compile(
     r"(?:^|;)\s*(?:"
     r"display\s*:\s*none"
     r"|visibility\s*:\s*(?:hidden|collapse)"
-    r"|opacity\s*:\s*0(?:\.0+)?"
-    r"|font-size\s*:\s*0(?:px|pt|em|rem|%)?"
-    r"|clip-path\s*:\s*inset\(\s*100%\s*\)"
-    r"|clip\s*:\s*rect\(\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*\)"
+    r"|content-visibility\s*:\s*hidden"
+    r"|opacity\s*:\s*(?:0+(?:\.0+)?|\.0+)(?:%)?"
+    r"|filter\s*:\s*opacity\(\s*(?:0+(?:\.0+)?|\.0+)(?:%)?\s*\)"
+    r"|font-size\s*:\s*(?:0+(?:\.0+)?|\.0+)(?:px|pt|em|rem|%|vh|vw)?"
+    r"|line-height\s*:\s*0(?:px|pt|em|rem|%)?(?=\s*;.*?\boverflow\s*:\s*hidden\b)"
+    r"|color\s*:\s*(?:transparent|rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(?:0+(?:\.0+)?|\.0+)\s*\)|hsla\(\s*\d+(?:deg)?\s*,\s*\d+%\s*,\s*\d+%\s*,\s*(?:0+(?:\.0+)?|\.0+)\s*\)|#(?:0000|00000000)\b)"
+    r"|transform\s*:\s*scale(?:[XY3d])?\(\s*(?:0+(?:\.0+)?|\.0+)(?:\s*,\s*(?:0+(?:\.0+)?|\.0+))*\s*\)"
+    r"|(?:left|right|top|bottom|text-indent|margin-left|margin-top)\s*:\s*-\d{3,}(?:\.\d+)?(?:px|em|rem|vw|vh|pt|%)"
+    r"|clip-path\s*:\s*(?:inset\(\s*(?:50%|100%)[^)]*\)|circle\(\s*0[^)]*\)|polygon\(\s*0\s+0[^)]*\))"
+    r"|clip\s*:\s*rect\(\s*0(?:px)?[\s,]+0(?:px)?[\s,]+0(?:px)?[\s,]+0(?:px)?\s*\)"
     r")\s*(?:!important)?\s*(?:;|$)",
     re.IGNORECASE,
 )
+_HIDDEN_CLASS_TOKENS: frozenset[str] = frozenset(
+    {
+        "sr-only",
+        "visually-hidden",
+        "visually-hidden-focusable",
+        "screen-reader-text",
+        "screen-reader-only",
+        "d-none",
+        "u-hidden",
+        "is-hidden",
+        "offscreen",
+        "a11y-hidden",
+        "assistive-text",
+        "clip-hide",
+    }
+)
+_MAX_EXTRACTED_URL_LEN: int = 1024
 
 _URL_UNSAFE_CHAR_MAP: dict[str, str] = {
     " ": "%20",
@@ -349,7 +375,7 @@ def normalize_extracted_url(raw_href: str, base_url: str = "") -> str | None:
     if not raw_href or not isinstance(raw_href, str):
         return None
     cleaned = raw_href.strip()
-    if not cleaned or cleaned.startswith("#"):
+    if not cleaned or cleaned.startswith("#") or len(cleaned) > _MAX_EXTRACTED_URL_LEN:
         return None
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned):
         return None
@@ -379,7 +405,20 @@ def normalize_extracted_url(raw_href: str, base_url: str = "") -> str | None:
     if not hostname or any(ch in hostname for ch in " ()[]<>\"'`\\"):
         return None
 
-    norm_host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
+    raw_host = hostname.strip().rstrip(".")
+    if not raw_host:
+        return None
+    if ":" in raw_host:
+        norm_host = f"[{raw_host.lower()}]"
+    else:
+        try:
+            ascii_host = raw_host.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return None
+        if not ascii_host or any(ch in ascii_host for ch in " /?#@\\"):
+            return None
+        norm_host = ascii_host
+
     if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         netloc = f"{norm_host}:{port}"
     else:
@@ -389,7 +428,10 @@ def normalize_extracted_url(raw_href: str, base_url: str = "") -> str | None:
     safe_path = "".join(_URL_UNSAFE_CHAR_MAP.get(ch, ch) for ch in raw_path)
     safe_query = "".join(_URL_UNSAFE_CHAR_MAP.get(ch, ch) for ch in parts.query)
     # Conservamos ruta y query codificados de forma segura, removiendo fragmentos visuales.
-    return urlunsplit((scheme, netloc, safe_path, safe_query, ""))
+    normalized = urlunsplit((scheme, netloc, safe_path, safe_query, ""))
+    if len(normalized) > _MAX_EXTRACTED_URL_LEN:
+        return None
+    return normalized
 
 
 def _has_same_origin(url_a: str, url_b: str) -> bool:
@@ -401,14 +443,18 @@ def _has_same_origin(url_a: str, url_b: str) -> bool:
         sb = pb.scheme.lower()
         if sa not in ("http", "https") or sa != sb:
             return False
-        ha = (pa.hostname or "").lower().rstrip(".")
-        hb = (pb.hostname or "").lower().rstrip(".")
-        if not ha or ha != hb:
+        ha_raw = (pa.hostname or "").strip().rstrip(".")
+        hb_raw = (pb.hostname or "").strip().rstrip(".")
+        if not ha_raw or not hb_raw:
+            return False
+        ha = ha_raw.lower() if ":" in ha_raw else ha_raw.encode("idna").decode("ascii").lower()
+        hb = hb_raw.lower() if ":" in hb_raw else hb_raw.encode("idna").decode("ascii").lower()
+        if ha != hb:
             return False
         port_a = pa.port or (443 if sa == "https" else 80)
         port_b = pb.port or (443 if sb == "https" else 80)
         return port_a == port_b
-    except ValueError:
+    except (ValueError, UnicodeError):
         return False
 
 
@@ -450,9 +496,21 @@ class _StructuredHTMLParser(HTMLParser):
     buffers de texto para extraer encabezados, párrafos, listas, enlaces y metadatos reales.
     """
 
-    def __init__(self, *, max_jsonld_bytes: int = 131072) -> None:
+    def __init__(
+        self,
+        *,
+        max_jsonld_bytes: int = 131072,
+        max_style_bytes: int = 65536,
+        max_blocks: int = 4096,
+        max_raw_links: int = 2048,
+        max_meta_field_chars: int = 8192,
+    ) -> None:
         super().__init__(convert_charrefs=True)
         self._max_jsonld_bytes = max_jsonld_bytes
+        self._max_style_bytes = max_style_bytes
+        self._max_blocks = max_blocks
+        self._max_raw_links = max_raw_links
+        self._max_meta_field_chars = max_meta_field_chars
 
         # Pila de control: cada elemento guarda (tag, is_ignored_subtree, is_main_landmark, is_head).
         self._stack: list[tuple[str, bool, bool, bool]] = []
@@ -466,6 +524,7 @@ class _StructuredHTMLParser(HTMLParser):
         self.base_href: str | None = None
         self.title_text: str | None = None
         self.meta_values: dict[str, str] = {}
+        self.meta_truncated: bool = False
         self.canonical_href: str | None = None
         self.author_link_text: str | None = None
         self.time_candidates: list[str] = []
@@ -477,6 +536,11 @@ class _StructuredHTMLParser(HTMLParser):
         self._in_jsonld: bool = False
         self._jsonld_parts: list[str] = []
         self._jsonld_size: int = 0
+        self._in_style: bool = False
+        self._style_parts: list[str] = []
+        self._style_size: int = 0
+        self._css_hidden_classes: set[str] = set()
+        self._css_hidden_ids: set[str] = set()
 
         # Buffers de contenido visible.
         self._heading_tag: str | None = None
@@ -502,6 +566,8 @@ class _StructuredHTMLParser(HTMLParser):
 
         self.blocks: list[_RawBlock] = []
         self.links: list[_RawLink] = []
+        self.blocks_capped: bool = False
+        self.links_capped: bool = False
 
     @staticmethod
     def _attrs_dict(attrs: list[tuple[str, str | None]]) -> dict[str, str]:
@@ -512,25 +578,63 @@ class _StructuredHTMLParser(HTMLParser):
         return result
 
     @staticmethod
-    def _is_hidden_style(style_raw: str) -> bool:
+    def _clean_css_text(style_raw: str) -> str:
+        """Elimina comentarios CSS y secuencias de escape simples para evitar evasión léxica."""
+        cleaned = _CSS_COMMENT_RE.sub("", style_raw)
+        if "\\" in cleaned:
+            cleaned = _CSS_ESCAPE_RE.sub(lambda m: m.group(1).strip(), cleaned)
+        return cleaned
+
+    @classmethod
+    def _is_hidden_style(cls, style_raw: str) -> bool:
         if not style_raw:
             return False
-        if _HIDDEN_STYLE_RE.search(style_raw):
+        cleaned = cls._clean_css_text(style_raw)
+        if not cleaned:
+            return False
+        if _HIDDEN_STYLE_RE.search(cleaned):
             return True
-        if re.search(r"\boverflow\s*:\s*hidden\b", style_raw, re.IGNORECASE) and re.search(
-            r"(?:^|[;\s])(?:max-)?(?:width|height)\s*:\s*0(?:px|em|rem|%|pt|vh|vw)?(?=\s*(?:;|!important|$))",
-            style_raw,
+        if re.search(r"\boverflow(?:-[xy])?\s*:\s*(?:hidden|clip)\b", cleaned, re.IGNORECASE) and re.search(
+            r"(?:^|[;\s])(?:max-)?(?:width|height)\s*:\s*(?:0+(?:\.0+)?|\.0+)(?:px|em|rem|%|pt|vh|vw)?(?=\s*(?:;|!important|$))",
+            cleaned,
             re.IGNORECASE,
         ):
             return True
         return False
 
+    def _parse_style_rules(self, css_raw: str) -> None:
+        """Detecta selectores `.clase` o `#id` definidos como ocultos en bloques `<style>`."""
+        cleaned = self._clean_css_text(css_raw)
+        for match in _CSS_RULE_RE.finditer(cleaned):
+            selectors_raw, body_raw = match.group(1), match.group(2)
+            if not self._is_hidden_style(body_raw):
+                continue
+            for sel in selectors_raw.split(","):
+                sel_s = sel.strip()
+                if not sel_s or ":" in sel_s or ">" in sel_s or "+" in sel_s or "~" in sel_s:
+                    continue
+                class_m = re.match(r"^(?:[a-zA-Z0-9_-]+)?\.\s*([a-zA-Z0-9_-]+)$", sel_s)
+                if class_m:
+                    self._css_hidden_classes.add(class_m.group(1).lower())
+                    continue
+                id_m = re.match(r"^(?:[a-zA-Z0-9_-]+)?#\s*([a-zA-Z0-9_-]+)$", sel_s)
+                if id_m:
+                    self._css_hidden_ids.add(id_m.group(1).lower())
+
     def _has_hidden_attrs(self, attr_map: dict[str, str]) -> bool:
-        if "hidden" in attr_map:
+        if "hidden" in attr_map or "inert" in attr_map:
             return True
         if attr_map.get("aria-hidden", "").strip().lower() == "true":
             return True
         if self._is_hidden_style(attr_map.get("style", "")):
+            return True
+        class_raw = attr_map.get("class", "").strip().lower()
+        if class_raw:
+            tokens = set(class_raw.split())
+            if tokens & _HIDDEN_CLASS_TOKENS or (self._css_hidden_classes and (tokens & self._css_hidden_classes)):
+                return True
+        elem_id = attr_map.get("id", "").strip().lower()
+        if elem_id and (elem_id in _HIDDEN_CLASS_TOKENS or elem_id in self._css_hidden_ids):
             return True
         return False
 
@@ -564,7 +668,10 @@ class _StructuredHTMLParser(HTMLParser):
         self._loose_parts.clear()
         if not text or _is_obvious_noise_text(text):
             return
-        self.blocks.append(_RawBlock(kind="paragraph", in_main=in_main, text=text))
+        if len(self.blocks) < self._max_blocks:
+            self.blocks.append(_RawBlock(kind="paragraph", in_main=in_main, text=text))
+        else:
+            self.blocks_capped = True
 
     def _append_visible_text(self, text: str) -> None:
         if self._ignored_depth > 0 or self._head_depth > 0 or self._in_loose_time:
@@ -657,6 +764,11 @@ class _StructuredHTMLParser(HTMLParser):
             self._jsonld_parts.clear()
             self._jsonld_size = 0
 
+        if tag_l == "style" and not has_hidden:
+            self._in_style = True
+            self._style_parts.clear()
+            self._style_size = 0
+
         if is_void:
             if tag_l == "br":
                 self._append_visible_text(" ")
@@ -736,6 +848,13 @@ class _StructuredHTMLParser(HTMLParser):
             if raw_json:
                 self._parse_jsonld(raw_json)
 
+        if tag_l == "style" and self._in_style:
+            self._in_style = False
+            raw_css = "".join(self._style_parts).strip()
+            self._style_parts.clear()
+            if raw_css:
+                self._parse_style_rules(raw_css)
+
         was_ignored_before_pop = self._ignored_depth > 0 or self._head_depth > 0
 
         if not was_ignored_before_pop:
@@ -748,7 +867,10 @@ class _StructuredHTMLParser(HTMLParser):
                 if self._link_stack:
                     href, in_main, link_parts = self._link_stack.pop()
                     link_text = normalize_text("".join(link_parts))
-                    self.links.append(_RawLink(href=href, text=link_text, in_main=in_main))
+                    if len(self.links) < self._max_raw_links:
+                        self.links.append(_RawLink(href=href, text=link_text, in_main=in_main))
+                    else:
+                        self.links_capped = True
                 self._pending_inline_sep = True
             elif tag_l in _INLINE_TAGS:
                 if tag_l == "time" and self._in_loose_time:
@@ -764,7 +886,10 @@ class _StructuredHTMLParser(HTMLParser):
                 self._pending_inline_sep = False
                 self._heading_parts.clear()
                 if heading_text and not _is_obvious_noise_text(heading_text):
-                    self.blocks.append(_RawBlock(kind="heading", in_main=in_main, level=level, text=heading_text))
+                    if len(self.blocks) < self._max_blocks:
+                        self.blocks.append(_RawBlock(kind="heading", in_main=in_main, level=level, text=heading_text))
+                    else:
+                        self.blocks_capped = True
             elif tag_l == self._paragraph_tag:
                 para_text = normalize_text("".join(self._paragraph_parts))
                 in_main = self._paragraph_in_main
@@ -772,7 +897,10 @@ class _StructuredHTMLParser(HTMLParser):
                 self._pending_inline_sep = False
                 self._paragraph_parts.clear()
                 if para_text and not _is_obvious_noise_text(para_text):
-                    self.blocks.append(_RawBlock(kind="paragraph", in_main=in_main, text=para_text))
+                    if len(self.blocks) < self._max_blocks:
+                        self.blocks.append(_RawBlock(kind="paragraph", in_main=in_main, text=para_text))
+                    else:
+                        self.blocks_capped = True
             elif tag_l == "li" and self._in_li:
                 li_text = normalize_text("".join(self._li_parts))
                 self._in_li = False
@@ -783,14 +911,17 @@ class _StructuredHTMLParser(HTMLParser):
             elif tag_l in ("ul", "ol") and self._list_stack:
                 frame = self._list_stack.pop()
                 if frame.items:
-                    self.blocks.append(
-                        _RawBlock(
-                            kind="list",
-                            in_main=frame.in_main,
-                            ordered=frame.ordered,
-                            items=tuple(frame.items),
+                    if len(self.blocks) < self._max_blocks:
+                        self.blocks.append(
+                            _RawBlock(
+                                kind="list",
+                                in_main=frame.in_main,
+                                ordered=frame.ordered,
+                                items=tuple(frame.items),
+                            )
                         )
-                    )
+                    else:
+                        self.blocks_capped = True
             elif tag_l in _CONTAINER_TAGS:
                 self._flush_loose_text()
 
@@ -815,6 +946,12 @@ class _StructuredHTMLParser(HTMLParser):
         if self._in_title:
             self._title_parts.append(data)
             return
+        if self._in_style:
+            if self._style_size < self._max_style_bytes:
+                chunk = data[: self._max_style_bytes - self._style_size]
+                self._style_parts.append(chunk)
+                self._style_size += len(chunk)
+            return
         if self._in_jsonld:
             if self._jsonld_size < self._max_jsonld_bytes:
                 chunk = data[: self._max_jsonld_bytes - self._jsonld_size]
@@ -833,7 +970,11 @@ class _StructuredHTMLParser(HTMLParser):
         self._flush_loose_text()
 
     def _handle_meta(self, attr_map: dict[str, str]) -> None:
-        content = normalize_text(attr_map.get("content", ""))
+        raw_content = attr_map.get("content", "")
+        if len(raw_content) > self._max_meta_field_chars:
+            raw_content = raw_content[: self._max_meta_field_chars]
+            self.meta_truncated = True
+        content = normalize_text(raw_content)
         if not content:
             return
         for key_attr in ("property", "name", "itemprop", "http-equiv"):
@@ -958,16 +1099,49 @@ class WebContentExtractor:
         max_budget = max(1, int(self.config.max_normalized_chars))
         text_parts: list[str] = []
         used_chars: int = 0
-        truncated: bool = False
+        truncated: bool = bool(parser.meta_truncated or parser.blocks_capped or parser.links_capped)
+
+        # Acotación de metadatos dentro del presupuesto global (F-04).
+        max_title_chars = min(300, max(40, max_budget // 3))
+        max_desc_chars = min(600, max(40, max_budget // 5))
+        max_meta_short = min(160, max(32, max_budget // 5))
+
+        if explicit_title and len(explicit_title) > max_title_chars:
+            explicit_title = explicit_title[:max_title_chars].rstrip()
+            truncated = True
+
+        raw_description = (
+            meta.get("description")
+            or meta.get("og:description")
+            or meta.get("twitter:description")
+            or _extract_jsonld_field(parser.jsonld_blocks, "description")
+        )
+        description: str | None = raw_description
+        if description:
+            if len(description) > max_desc_chars:
+                description = description[:max_desc_chars].rstrip()
+                truncated = True
+            # Contabilizar la descripción dentro del presupuesto global compartido.
+            used_chars += len(description)
+
+        raw_links = parser.links
+        if any(b.in_main for b in selected_blocks) and any(lk.in_main for lk in parser.links):
+            raw_links = [lk for lk in parser.links if lk.in_main]
+
+        # Si el documento incluye enlaces candidatos y el presupuesto es reducido, reservamos una fracción
+        # acotada para que cuerpo, metadatos y enlaces compartan `max_budget` sin excederlo.
+        links_reserve = min(len(raw_links) * 60, max_budget // 5) if raw_links and max_budget >= 250 else 0
+        body_budget = max(1, max_budget - links_reserve)
 
         if explicit_title and (not first_selected_heading or first_selected_heading.casefold() != explicit_title.casefold()):
             title_part = explicit_title
-            if len(title_part) > max_budget:
-                title_part = title_part[:max_budget].rstrip()
+            avail_title = max(0, body_budget - used_chars)
+            if len(title_part) > avail_title:
+                title_part = title_part[:avail_title].rstrip()
                 truncated = True
             if title_part:
                 text_parts.append(title_part)
-                used_chars = len(title_part)
+                used_chars += len(title_part)
 
         # Deduplicación, estructuración ordenada y presupuesto compartido de caracteres (F-04).
         headings: list[WebHeading] = []
@@ -999,22 +1173,26 @@ class WebContentExtractor:
             current_sec_paragraphs.clear()
             current_sec_lists.clear()
 
+        body_truncated = False
         for blk in selected_blocks:
-            if truncated:
+            if body_truncated:
+                truncated = True
                 break
             if blk.kind == "heading":
                 # Evitar encabezados duplicados inmediatamente consecutivos.
                 if current_heading and current_heading.text.casefold() == blk.text.casefold():
                     continue
                 sep_cost = 2 if text_parts else 0
-                avail = max_budget - used_chars - sep_cost
+                avail = body_budget - used_chars - sep_cost
                 if avail <= 0:
                     truncated = True
+                    body_truncated = True
                     break
                 h_text = blk.text
                 if len(h_text) > avail:
                     h_text = h_text[:avail].rstrip()
                     truncated = True
+                    body_truncated = True
                     if not h_text:
                         break
                 flush_section()
@@ -1030,14 +1208,16 @@ class WebContentExtractor:
                     continue
                 seen_paragraphs.add(dedup_key)
                 sep_cost = 2 if text_parts else 0
-                avail = max_budget - used_chars - sep_cost
+                avail = body_budget - used_chars - sep_cost
                 if avail <= 0:
                     truncated = True
+                    body_truncated = True
                     break
                 p_text = blk.text
                 if len(p_text) > avail:
                     p_text = p_text[:avail].rstrip()
                     truncated = True
+                    body_truncated = True
                     if not p_text:
                         break
                 para_obj = WebParagraph(
@@ -1062,22 +1242,24 @@ class WebContentExtractor:
                 for idx, item in enumerate(dedup_items, start=1):
                     prefix = f"{idx}." if blk.ordered else "-"
                     sep_cost = 2 if text_parts else 0
-                    avail = max_budget - used_chars - sep_cost
+                    avail = body_budget - used_chars - sep_cost
                     min_needed = len(prefix) + 1
                     if avail <= min_needed:
                         truncated = True
+                        body_truncated = True
                         break
                     max_item_chars = avail - min_needed
                     item_text = item
                     if len(item_text) > max_item_chars:
                         item_text = item_text[:max_item_chars].rstrip()
                         truncated = True
+                        body_truncated = True
                     if item_text:
                         bounded_items.append(item_text)
                         part_str = f"{prefix} {item_text}"
                         text_parts.append(part_str)
                         used_chars += sep_cost + len(part_str)
-                    if truncated:
+                    if body_truncated:
                         break
                 if bounded_items:
                     list_obj = WebList(
@@ -1092,7 +1274,7 @@ class WebContentExtractor:
 
         flush_section()
 
-        # Enlaces relevantes normalizados, deduplicados y acotados por max_links.
+        # Enlaces relevantes normalizados, deduplicados y acotados por max_links y presupuesto global (F-04).
         # <base href> solo se aplica si fue declarado en <head> y pertenece al mismo origen (F-02).
         base_for_links = source_url
         if parser.base_href:
@@ -1110,49 +1292,69 @@ class WebContentExtractor:
                 )
         page_host = (urlsplit(source_url).hostname or "").lower()
 
-        raw_links = parser.links
-        if any(b.in_main for b in selected_blocks) and any(lk.in_main for lk in parser.links):
-            raw_links = [lk for lk in parser.links if lk.in_main]
+        max_link_text_chars = min(200, max(24, max_budget // 6))
+        remaining_link_budget = min(4000, max(0, max_budget - used_chars))
+        links_used_chars = 0
 
         links_map: dict[str, WebLink] = {}
         for raw_lk in raw_links:
+            if raw_lk.href and len(raw_lk.href.strip()) > _MAX_EXTRACTED_URL_LEN:
+                truncated = True
+                continue
             norm_url = normalize_extracted_url(raw_lk.href, base_for_links)
             if not norm_url:
                 continue
             link_host = (urlsplit(norm_url).hostname or "").lower()
             is_external = bool(link_host and page_host and link_host != page_host)
+            cand_text = raw_lk.text or norm_url
+            if len(cand_text) > max_link_text_chars:
+                cand_text = cand_text[:max_link_text_chars].rstrip()
+                truncated = True
             existing = links_map.get(norm_url)
             if existing is None:
                 if len(links_map) >= self.config.max_links:
+                    truncated = True
+                    continue
+                link_cost = len(norm_url) + (len(cand_text) if cand_text != norm_url else 0)
+                if links_used_chars + link_cost > remaining_link_budget:
+                    truncated = True
                     continue
                 links_map[norm_url] = WebLink(
                     url=norm_url,
-                    text=raw_lk.text or norm_url,
+                    text=cand_text or norm_url,
                     source_url=source_url,
                     is_external=is_external,
                 )
+                links_used_chars += link_cost
+                used_chars += link_cost
             elif existing.text == existing.url and raw_lk.text:
-                links_map[norm_url] = WebLink(
-                    url=norm_url,
-                    text=raw_lk.text,
-                    source_url=source_url,
-                    is_external=is_external,
-                )
+                extra_cost = len(cand_text)
+                if links_used_chars + extra_cost <= remaining_link_budget:
+                    links_map[norm_url] = WebLink(
+                        url=norm_url,
+                        text=cand_text,
+                        source_url=source_url,
+                        is_external=is_external,
+                    )
+                    links_used_chars += extra_cost
+                    used_chars += extra_cost
+                else:
+                    truncated = True
 
-        # Construcción honesta de metadatos (sin inventar campos ausentes).
+        # Construcción honesta y acotada de metadatos (sin inventar campos ausentes).
         title = explicit_title or (headings[0].text if headings else None)
-        description = (
-            meta.get("description")
-            or meta.get("og:description")
-            or meta.get("twitter:description")
-            or _extract_jsonld_field(parser.jsonld_blocks, "description")
-        )
+        if title and len(title) > max_title_chars:
+            title = title[:max_title_chars].rstrip()
+            truncated = True
         author = (
             meta.get("author")
             or meta.get("article:author")
             or _extract_jsonld_field(parser.jsonld_blocks, "author")
             or parser.author_link_text
         )
+        if author and len(author) > max_meta_short:
+            author = author[:max_meta_short].rstrip()
+            truncated = True
         published_at = (
             meta.get("article:published_time")
             or meta.get("datepublished")
@@ -1162,6 +1364,9 @@ class WebContentExtractor:
             or _extract_jsonld_field(parser.jsonld_blocks, "datePublished")
             or (parser.time_candidates[0] if parser.time_candidates else None)
         )
+        if published_at and len(published_at) > 64:
+            published_at = published_at[:64].rstrip()
+            truncated = True
         language = (
             parser.html_lang
             or fetch_result.content_language
@@ -1169,12 +1374,18 @@ class WebContentExtractor:
             or meta.get("og:locale")
             or _extract_jsonld_field(parser.jsonld_blocks, "inLanguage")
         )
+        if language and len(language) > 32:
+            language = language[:32].rstrip()
+            truncated = True
         canonical_url = (
             normalize_extracted_url(parser.canonical_href, source_url)
             if parser.canonical_href
             else None
         )
         site_name = meta.get("og:site_name") or _extract_jsonld_field(parser.jsonld_blocks, "publisher")
+        if site_name and len(site_name) > max_meta_short:
+            site_name = site_name[:max_meta_short].rstrip()
+            truncated = True
 
         metadata = WebMetadata(
             title=title,

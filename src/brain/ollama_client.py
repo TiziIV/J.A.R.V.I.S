@@ -244,6 +244,7 @@ class OllamaBrain:
         num_predict: Optional[int] = None,
         temperature: float = 0.3,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
     ) -> Generator[str, None, None]:
         """
         Genera texto en streaming desde Ollama (`stream=True`), acumulando tokens y
@@ -255,10 +256,21 @@ class OllamaBrain:
         `self.model_name` una sola vez, siempre que no se haya emitido ya una respuesta parcial.
         """
         effective_system_prompt = self._compose_system_prompt(system_prompt, context_prompt)
-        messages = [
+        messages: list[dict[str, str]] = [
             {"role": "system", "content": effective_system_prompt},
-            {"role": "user", "content": prompt},
         ]
+        if untrusted_context:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
+                        f"{untrusted_context}\n"
+                        "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+                    ),
+                }
+            )
+        messages.append({"role": "user", "content": prompt})
         predict_limit = int(num_predict) if isinstance(num_predict, int) and num_predict > 0 else 300
         options: dict[str, Any] = {
             "temperature": temperature,
@@ -368,13 +380,23 @@ class OllamaBrain:
         num_predict: Optional[int] = None,
         temperature: float = 0.3,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
     ) -> str:
         """
         Genera una respuesta completa consolidando el stream en un único texto continuo.
         """
-        if model_override is None and context_prompt is None and num_predict is None and not raise_on_error:
+        if (
+            model_override is None
+            and context_prompt is None
+            and num_predict is None
+            and not raise_on_error
+            and untrusted_context is None
+        ):
             chunks = list(self.generate_response_stream(prompt, system_prompt=system_prompt))
         else:
+            extra_kw: dict[str, Any] = (
+                {"untrusted_context": untrusted_context} if untrusted_context is not None else {}
+            )
             chunks = list(
                 self.generate_response_stream(
                     prompt,
@@ -384,6 +406,7 @@ class OllamaBrain:
                     num_predict=num_predict,
                     temperature=temperature,
                     raise_on_error=raise_on_error,
+                    **extra_kw,
                 )
             )
         return " ".join(chunks).strip()

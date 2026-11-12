@@ -826,3 +826,35 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 - `.\venv\Scripts\python.exe main.py --help`: **OK (código 0)**.
 - `data/memory_store.json`: verificado solo por metadatos (**1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`, intacto).
 - Los 16 archivos preexistentes sucios/no rastreados de N5/memoria y los módulos cerrados del Paso #3.A permanecen intactos.
+
+---
+
+## Hardening Integral Definitivo del Paso #3.B (`WebExtractionSkill`) — Cierre Post-Auditoría Independiente (2026-11-12)
+
+### 1. Hallazgos Cerrados y Arquitectura de Confianza End-to-End
+
+- Prompt registrado íntegramente en `prompts_history.txt` (`HARDENING INTEGRAL DEFINITIVO DEL PASO #3.B`).
+- Informe técnico completo generado en `docs/audits/REMEDIATION_PASO_3B_FINAL.md` (conservando `docs/audits/AUDIT_PASO_3B_WEB_EXTRACTION_SKILL.md`, `docs/audits/REMEDIATION_PASO_3B_WEB_EXTRACTION_SKILL.md` y `docs/audits/INDEPENDENT_SECURITY_AUDIT_PASO_3B_POST_REMEDIATION.md`).
+- **Cierre de `F-05` (HIGH — P0, Frontera estructural de confianza end-to-end y evasiones CSS):**
+  - `skills/web_extraction_skill.py` y `config/tools_schema.py`: exposición de `'envelope'` en el esquema de herramientas, método `execute_with_envelope()` y ampliación de `build_llm_envelope()` con `trust_level="untrusted_external_content"`, `source_type="external_web"`, `origin_skill="web_extraction"`, `allow_tool_execution_from_content=False`, `allow_system_prompt_promotion=False`, `allow_memory_assistant_promotion=False` y `provenance`.
+  - `src/tools/skill_manager.py`: método `execute_skill_with_envelope()` preservando `execute_skill()`.
+  - `src/brain/memory.py`: contenedor aislado `_external_references` (`add_external_reference`, `get_external_references`, `format_untrusted_context_for_llm`, `compose_prompt_with_untrusted_data`); bloqueo automático de promoción a `"assistant"` si se intenta pasar un volcado o sobre web a `add_message()`; exclusión total de `_external_references` en `get_context_prompt()` e `inject_context(system_prompt)`; saneamiento de registros históricos en `load_from_disk()` sin tocar ni migrar `data/memory_store.json`.
+  - `src/brain/brain_manager.py` y adaptadores (`src/brain/ollama_client.py`, `src/brain/gemini_client.py`, `src/brain/claude_client.py`, `src/brain/openai_client.py`, `src/brain/codex_client.py`): canal `untrusted_context` separado de `system_prompt` en los 5 cerebros; en `CodexBrain.generate_response()`, `classify_codex_task(prompt)` evalúa únicamente el `prompt` del usuario y nunca `untrusted_context`.
+  - `src/brain/intent_router.py`: descarte de bloques `[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]` y sobres `untrusted_external_content` antes de enrutar intenciones.
+  - `skills/web_parser.py`: limpieza de comentarios/escapes CSS (`_clean_css_text`), detección de `opacity: .0`, `color: transparent`, `rgba(...,0)`, `hsla(...,0)`, `#0000`/`#00000000`, `transform: scale(0)`, posicionamiento negativo fuera de pantalla, `content-visibility: hidden`, clases `sr-only`/`visually-hidden` (`_HIDDEN_CLASS_TOKENS`) y selectores ocultos definidos en `<style>` (`_parse_style_rules`).
+- **Cierre de `F-01` (MEDIUM — P1, Citation URL Hijack, proveedores e IDN):**
+  - `skills/web_document_converter.py`: `_sanitize_citation_label()` neutraliza esquemas URL dentro de títulos de citas para impedir que `RE_URL` en `DocumentParser` secuestre `Citation.url`; `_sanitize_inline_code()` sanea `search_provider`, `sr.provider`, códigos y timestamps; `_sanitize_markdown_url()` y `normalize_extracted_url()` rechazan esquemas no HTTP/HTTPS y credenciales, acotan longitud a `1024` chars y normalizan dominios IDN a punycode ASCII (`xn--...`); protección contra líneas `|` y barras invertidas finales `\`.
+- **Cierre de `F-04` (MEDIUM — P1, Presupuesto global compartido):**
+  - `skills/web_parser.py` y `skills/web_document_converter.py`: presupuesto compartido `max_normalized_chars` aplicado simultáneamente a `metadata` (`description`, `title`, `author`, `site_name`), bloques de cuerpo (`headings`, `paragraphs`, `lists`, `normalized_text`) y `links`, garantizando `len(description) + len(normalized_text) + sum(len(l.url) + len(l.text)) <= max_normalized_chars` y marcando `truncated=True` / `ExtractionStatus.PARTIAL` ante cualquier recorte.
+- **Cierre de `F-06` (LOW — P1, Fast-path de `IntentRouter` y deduplicación):**
+  - `src/brain/intent_router.py`: `_clean_extracted_url_token()` preserva paréntesis/corchetes/llaves balanceados en URLs (ej. Wikipedia `Python_(lenguaje)`) y `_is_explicit_web_extraction_command()` evita falsos positivos en oraciones condicionales o de diagnóstico con `"lee"` o `"analiza"`; exclusión de URLs en `AppLauncherSkill`.
+  - `skills/web_extraction_skill.py`: normalización porcentual RFC 3986 en `_canonical_url_dedup_key()`.
+
+### 2. Verificación Realmente Ejecutada
+
+- `.\venv\Scripts\python.exe -m py_compile` sobre los 19 módulos y tests: **0 errores**.
+- `.\venv\Scripts\python.exe -m unittest tests.test_web_extraction_skill -v`: **26 pruebas ejecutadas en 6.426s — OK (0 fallos, 0 errores)**.
+- Suites de regresión (`test_intent_router_chaos`, `test_document_export_skill`, `test_memory_isolation`, `test_transaction_recovery`, `test_file_editor_and_chain`, `test_memory_persistence`, `test_memory_window`, `test_memory_overflow`): **236 pruebas ejecutadas en 69.174s — OK (0 fallos, 0 errores)**.
+- Suite global (`$env:JARVIS_ENV='test'; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"`): **533 pruebas ejecutadas en 87.151s — OK (0 fallos, 0 errores)**.
+- `.\venv\Scripts\python.exe main.py --help`: **OK (código 0)**.
+- `data/memory_store.json`: intacto (**1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`).
