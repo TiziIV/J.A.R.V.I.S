@@ -21,6 +21,7 @@ SKILL_CLASS_BY_TOOL_NAME: dict[str, str] = {
     "clipboard_manager": "ClipboardSkill",
     "system_power": "SystemPowerSkill",
     "file_editor": "FileEditorSkill",
+    "web_extraction": "WebExtractionSkill",
 }
 
 # Mensajes degradados que devuelven los cerebros locales o cloud cuando no pueden responder.

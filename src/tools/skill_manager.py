@@ -2,6 +2,7 @@ import traceback
 from skills.base_skill import BaseSkill
 from skills.file_editor_skill import FileEditorSkill
 from skills.document_export_skill import DocumentExportSkill
+from skills.web_extraction_skill import WebExtractionSkill
 from skills.system_skills import (
     TimeSkill,
     AppLauncherSkill,
@@ -64,6 +65,8 @@ class SkillManager:
         self.register_skill(FileEditorSkill())
         # Exportación documental y Modo Estudio para Markdown y Word (.docx):
         self.register_skill(DocumentExportSkill())
+        # Extracción web segura, estructurada y normalizada:
+        self.register_skill(WebExtractionSkill())
 
     def get_skills_manifest(self) -> list[dict]:
         """

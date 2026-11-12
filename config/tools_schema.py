@@ -142,6 +142,36 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             },
             "required": ["action"]
         }
+    },
+    {
+        "name": "web_extraction",
+        "description": "Extrae y normaliza contenido web estructurado (título, encabezados, párrafos, listas, enlaces y metadatos) desde una URL o lista de URLs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL HTTP o HTTPS individual para extraer contenido estructurado."
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Colección de URLs HTTP/HTTPS para extracción múltiple acotada."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Consulta de investigación cuando exista un proveedor de búsqueda configurado."
+                },
+                "output_format": {
+                    "type": "string",
+                    "description": "Formato de retorno: 'summary', 'json' o 'markdown'."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Límite máximo de páginas a extraer."
+                }
+            }
+        }
     }
 ]
 
