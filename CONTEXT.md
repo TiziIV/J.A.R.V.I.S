@@ -894,3 +894,41 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 - `GitSafetyGuard`: `find_tracked_sensitive_files() == []`, `scan_text_for_secrets == []`, candidatos N5 validados (`True`).
 - Limitación conocida de plataforma: Windows no expone `os.fsync()` sobre descriptores de directorio; la durabilidad se garantiza con `flush()` + `os.fsync()` en cada `.wal.jsonl`, `.snapshot.tmp` y `.jarvis_tmp` antes de `os.replace()`.
 - Estado Git y versionado: cierra el bloque de 3 fases completadas desde `v5.1.0` (Paso #3.A `DocumentExportSkill`, Paso #3.B `WebExtractionSkill` y Fase N5), precedido por el registro documental de la auditoría de Paso #3.B (`2d94d79`).
+
+---
+
+## Fase N6 — Autonomous Goal & Planning Engine (2026-11-12)
+
+### 1. Capacidades Implementadas y Responsabilidades de Módulos
+
+- Prompt completo registrado en `prompts_history.txt` (`PROYECTO J.A.R.V.I.S. — N6: AUTONOMOUS GOAL & PLANNING ENGINE`).
+- Documentación técnica creada en `docs/N6_AUTONOMOUS_GOAL_ENGINE.md` con diagramas de arquitectura y ciclo de vida.
+- Archivos nuevos creados:
+  - `src/brain/goal_models.py`: modelos de dominio (`Goal`, `GoalTask`, `GoalPlan`, `GoalEngineLimits`, `SuccessCriteria`, `Constraints`, `RequiredCapabilities`, `GoalContext`, `ExecutionHistoryEntry`, `ReplanDecision`), enumeraciones y máquinas de estado estrictas (`ALLOWED_GOAL_TRANSITIONS`, `ALLOWED_TASK_TRANSITIONS`), hashing estructural SHA-256 (`plan_hash`) e invariantes de evidencia en `COMPLETED`.
+  - `src/brain/goal_skill_selector.py`: validación contra `SkillManager`, chequeo de compatibilidad de parámetros y clasificación en 3 categorías (`SAFE_PLANNING`, `LOW_RISK_EXECUTION`, `SENSITIVE_OPERATION`). Bloquea herramientas inexistentes y respeta `read_only` / `allow_network` / `forbidden_actions`.
+  - `src/brain/goal_understanding.py`: comprensión de lenguaje natural, detección de ambigüedad (`AWAITING_CLARIFICATION` + `clarification_questions`), extracción de restricciones explícitas e información faltante, con enriquecimiento opcional vía Multi-Brain (`query_raw`) y fallback determinista completo.
+  - `src/brain/goal_planner.py`: `TaskDecomposer` + `GoalPlanningEngine` con validación DAG por algoritmo de Kahn (detección de ciclos, dependencias faltantes, `max_tasks`, `max_depth`). Planificar nunca otorga permiso automático de ejecución.
+  - `src/brain/goal_persistence.py`: `GoalStore` aislado con bitácora WAL (`.wal.jsonl`) + snapshots atómicos (`.goal.json` con `flush` + `os.fsync` + `os.replace`), redacción de secretos y confinamiento obligatorio bajo `temp/jarvis_test_isolated/` cuando `JARVIS_ENV` es `test`/`testing`. Nunca accede ni modifica `data/memory_store.json`.
+  - `src/brain/goal_supervisor.py`: `PlanEvaluator` + `ExecutionSupervisor` con orden por `depends_on`, prevención de duplicados en tareas completadas, aprobación explícita vinculada a `plan_hash`, delegación obligatoria de edición de archivos a `ChainOrchestrator` + `PolicyEngine`, timeouts por tarea y globales, reintentos acotados, cancelación y replanificación controlada preservando historial y resultados previos.
+  - `src/brain/goal_engine.py`: fachada unificada `GoalEngine` libre de dependencias de voz/audio.
+  - `src/brain/goal_console.py`: adaptador de comandos `/goal`, `/plan`, `/plan ejecutar`, `/plan estado`, `/plan cancelar`, `/plan aclarar` con confirmación `default-deny`.
+  - `tests/test_goal_engine.py`: suite integral de 27 pruebas unitarias, funcionales y adversariales para N6.
+- Archivos modificados:
+  - `config/settings.py`: límites configurables `GOAL_MAX_TASKS`, `GOAL_MAX_DEPTH`, `GOAL_MAX_TASK_RETRIES`, `GOAL_TASK_TIMEOUT_SEC`, `GOAL_TOTAL_TIMEOUT_SEC`, `GOAL_MAX_REPLANS` y ruta `GOAL_STORE_DIR`.
+  - `src/brain/brain_manager.py`: nuevo método no intrusivo `query_raw(...)` reutilizando `plan_request` y `_generate_with_fallback_policy` sin mutar `ConversationMemory`.
+  - `main.py`: hook perezoso hacia `GoalConsoleHandler` para `/goal` y `/plan*` sin inicializar STT/TTS en consola de texto y sin alterar `/modo`, `/voz`, `/optimizar`, `/rollback`, `/limpiar` o `salir`.
+
+### 2. Verificaciones Realmente Ejecutadas y Estado Git (N6)
+
+- `.\venv\Scripts\python.exe -m py_compile` sobre todos los módulos y pruebas de N5 y N6: **0 errores**.
+- `$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_goal_engine -v`: **27 pruebas ejecutadas en 14.157s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite global (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **560 pruebas ejecutadas en 99.901s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- `.\venv\Scripts\python.exe main.py --help`: **OK (código 0)**.
+- Verificación estática de importaciones perezosas y dependencias circulares: `main.py`, `GoalEngine` y `GoalConsoleHandler` no importan `src.audio.*`, `faster_whisper`, `sounddevice`, `edge_tts` ni `pygame`; cero ciclos de importación y 100% type hints públicos / cero `TODO` o `except:` desnudos.
+- Persistencia aislada bajo `JARVIS_ENV=test`: `GoalStore` confinado a `temp/jarvis_test_isolated/goals`.
+- Integridad de `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (intacto).
+- `GitSafetyGuard`: cero secretos y cero rutas sensibles candidatas.
+- Estado Git base de N6: separado en commit independiente inmediatamente posterior al cierre N5 (`2738393`, etiqueta anotada `v5.2.0`) y al registro de auditoría Paso #3.B (`2d94d79`); N6 inicia el bloque hacia el siguiente hito etiquetado cada 3 fases (`N6 -> N7 -> N8`).
+- Limitaciones conocidas y riesgos pendientes: hardware físico (micrófono/TTS real) no probado en esta sesión; `GoalConsoleHandler` instancia `GoalEngine(..., use_ai=False)` por defecto para mantener determinismo y cero costos imprevistos en consola; la ejecución de operaciones sensibles exige confirmación explícita humano-en-el-bucle y `ExecutionSupervisor` sigue acotado por los timeouts de sesión actuales (`GOAL_TASK_TIMEOUT_SEC` / `GOAL_TOTAL_TIMEOUT_SEC`).
+- Próxima fase recomendada: **N7** (extensión avanzada de autonomía/ejecución tras mantener N6 como primera de las 3 fases rumbo al siguiente hito etiquetado).
+

@@ -116,6 +116,7 @@ def run_console_session(
     tts_active: bool = bool(enable_tts)
     tts_engine: Any = None
     chain_orchestrator: Any = orchestrator
+    goal_console_handler: Any = None
 
     def _ensure_orchestrator() -> Any:
         nonlocal chain_orchestrator
@@ -135,6 +136,20 @@ def run_console_session(
                 except Exception as rec_err:
                     logger.warning(f"Advertencia al recuperar transacciones pendientes: {rec_err}")
         return chain_orchestrator
+
+    def _ensure_goal_handler() -> Any:
+        nonlocal goal_console_handler
+        if goal_console_handler is None:
+            from src.brain.goal_console import GoalConsoleHandler
+
+            goal_console_handler = GoalConsoleHandler(
+                skill_manager=getattr(brain_manager, "skill_manager", None),
+                brain_manager=brain_manager,
+                ensure_orchestrator_fn=_ensure_orchestrator,
+                input_fn=input_fn,
+                output_fn=output_fn,
+            )
+        return goal_console_handler
 
     def _ensure_tts() -> Any:
         nonlocal tts_engine
@@ -156,7 +171,7 @@ def run_console_session(
 
     output_fn("=======================================================")
     output_fn(" J.A.R.V.I.S. — Consola Interactiva Multi-Brain")
-    output_fn(" Comandos: /modo | /voz | /optimizar <juego> | /rollback <id> | /limpiar | salir")
+    output_fn(" Comandos: /modo | /voz | /goal <objetivo> | /plan | /optimizar <juego> | /rollback <id> | /limpiar | salir")
     output_fn("=======================================================")
 
     try:
@@ -354,6 +369,17 @@ def run_console_session(
                     output_fn(
                         f"JARVIS: No fue posible completar el rollback para '{exec_id_arg}', señor: {rb_err}"
                     )
+                continue
+
+            # 4.5 Comandos N6 (/goal y /plan) -> motor autónomo de objetivos con confirmación explícita
+            if lowered == "/goal" or lowered.startswith("/goal ") or lowered == "/plan" or lowered.startswith("/plan "):
+                handler = _ensure_goal_handler()
+                goal_reply = handler.handle_command(text, input_fn=input_fn, output_fn=output_fn)
+                if tts_active and tts_engine is not None and goal_reply:
+                    try:
+                        _speak_blocking(tts_engine, goal_reply)
+                    except Exception:
+                        pass
                 continue
 
             # 5. Procesamiento del turno mediante BrainManager (selector -> skills locales -> LLM)

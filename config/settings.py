@@ -354,6 +354,30 @@ FILE_EDITOR_MAX_FILE_BYTES: int = _env_int("FILE_EDITOR_MAX_FILE_BYTES", 2 * 102
 # Versión de política de validación aplicada por `PolicyEngine` y `ChainOrchestrator`.
 CHAIN_POLICY_VERSION: str = "2.0.0"
 
+# --- Configuración de N6: Autonomous Goal & Planning Engine ---
+# Límite máximo de subtareas por plan: evita planes desbordados que consuman memoria,
+# contexto o tiempo excesivo en la GTX 1660 y mantiene supervisión humana manejable.
+GOAL_MAX_TASKS: int = _env_int("JARVIS_GOAL_MAX_TASKS", 12, minimum=1)
+
+# Profundidad máxima del grafo de dependencias (DAG): previene cadenas excesivamente largas
+# o difíciles de auditar al depurar objetivos complejos.
+GOAL_MAX_DEPTH: int = _env_int("JARVIS_GOAL_MAX_DEPTH", 5, minimum=1)
+
+# Reintentos máximos por tarea ante fallos recuperables: evita bucles infinitos de reintento.
+GOAL_MAX_TASK_RETRIES: int = _env_int("JARVIS_GOAL_MAX_TASK_RETRIES", 1, minimum=0)
+
+# Tiempo límite por subtarea individual (en segundos): protege la sesión contra bloqueos.
+GOAL_TASK_TIMEOUT_SEC: float = _env_float("JARVIS_GOAL_TASK_TIMEOUT_SEC", 30.0, minimum=1.0)
+
+# Tiempo límite global de ejecución de un objetivo completo (en segundos).
+GOAL_TOTAL_TIMEOUT_SEC: float = _env_float("JARVIS_GOAL_TOTAL_TIMEOUT_SEC", 180.0, minimum=5.0)
+
+# Cantidad máxima de replanificaciones automáticas permitidas ante obstáculos parciales.
+GOAL_MAX_REPLANS: int = _env_int("JARVIS_GOAL_MAX_REPLANS", 2, minimum=0)
+
+# Directorio dedicado para persistencia de objetivos N6 en producción (separado de memory_store.json).
+GOAL_STORE_DIR: Path = BASE_DIR / "data" / "goals"
+
 # Si una variable inválida generó advertencias, se informan una vez al importar (sin secretos).
 for _warning in CONFIG_WARNINGS:
     print(f"[Config] Aviso: {_warning}", file=sys.stderr)

@@ -1028,3 +1028,41 @@ class BrainManager:
             f"(Motores verificados: {attempted}. Las habilidades locales siguen operativas, señor.)"
         )
         return redact_secrets(controlled_msg), None, None, self.fallback_info, True
+
+    def query_raw(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = "",
+        voice_mode: bool = False,
+        mode_override: Optional[str] = None,
+        untrusted_context: Optional[str] = None,
+    ) -> tuple[str, Optional[str], Optional[str], Optional[str], bool]:
+        """Ejecuta una consulta técnica directa usando Multi-Brain sin mutar `ConversationMemory`.
+
+        Pensado para subsistemas internos como el motor N6 (comprensión de objetivos y
+        propuesta de planes), respetando el modo activo, las políticas de fallback y la
+        redacción automática de secretos.
+        """
+        cleaned_prompt = (prompt or "").strip()
+        if not cleaned_prompt:
+            return "", None, None, None, True
+
+        if mode_override:
+            target_mode = self._resolve_mode_alias(mode_override)
+            effective_prompt = cleaned_prompt
+        else:
+            target_mode, effective_prompt, _source, _reason = self.plan_request(cleaned_prompt)
+
+        effective_system = (system_prompt or "").strip() or (
+            "Eres el módulo analítico interno de J.A.R.V.I.S. "
+            "Responde exclusivamente con datos técnicos estructurados y precisos."
+        )
+        return self._generate_with_fallback_policy(
+            primary_mode=target_mode,
+            prompt=effective_prompt,
+            system_prompt=effective_system,
+            voice_mode=voice_mode,
+            untrusted_context=untrusted_context,
+        )
+
