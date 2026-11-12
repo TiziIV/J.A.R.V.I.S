@@ -52,11 +52,15 @@ class WebFetchError(RuntimeError):
         code: str = "FETCH_ERROR",
         http_status: int | None = None,
         retryable: bool = False,
+        final_url: str | None = None,
+        redirect_chain: tuple[str, ...] = (),
     ) -> None:
         super().__init__(redact_secrets(message))
         self.code: str = code
         self.http_status: int | None = http_status
         self.retryable: bool = retryable
+        self.final_url: str | None = final_url
+        self.redirect_chain: tuple[str, ...] = tuple(redirect_chain)
 
 
 class WebTimeoutError(WebFetchError):
@@ -381,6 +385,16 @@ class _IncrementalBoundedDecompressor:
             raise DecompressionBombError(
                 f"Posible bomba de descompresión al vaciar buffers: límite de {self.max_decompressed_bytes} bytes superado."
             )
+        # Verificar que el flujo comprimido haya cerrado formalmente su bloque final y trailer
+        # (CRC32/ISIZE en gzip, Adler32/BFINAL en deflate) sin dejar datos inconclusos.
+        if (
+            not getattr(self._decompressor, "eof", False)
+            or getattr(self._decompressor, "unused_data", b"")
+            or getattr(self._decompressor, "unconsumed_tail", b"")
+        ):
+            raise UnsupportedEncodingError(
+                f"Flujo comprimido {self.encoding} truncado o incompleto (EOF de compresión no alcanzado)."
+            )
         self.total_decompressed += len(tail)
         return [tail] if tail else []
 
@@ -415,58 +429,75 @@ class WebFetcher:
         original_url = current_target.normalized_url
         redirect_chain: list[str] = [original_url]
         connected_ips: list[str] = []
+        current_url = original_url
 
-        for hop in range(self.config.max_redirects + 1):
-            remaining_total = deadline - time.monotonic()
-            if remaining_total <= 0:
-                raise WebTimeoutError(
-                    f"Tiempo límite total agotado ({self.config.total_timeout_sec}s) antes de completar la descarga."
+        try:
+            for hop in range(self.config.max_redirects + 1):
+                remaining_total = deadline - time.monotonic()
+                if remaining_total <= 0:
+                    raise WebTimeoutError(
+                        f"Tiempo límite total agotado ({self.config.total_timeout_sec}s) antes de completar la descarga."
+                    )
+
+                hop_result = self._fetch_single_hop_with_retries(
+                    current_target,
+                    deadline=deadline,
                 )
 
-            hop_result = self._fetch_single_hop_with_retries(
-                current_target,
-                deadline=deadline,
+                if hop_result["connected_ip"]:
+                    connected_ips.append(hop_result["connected_ip"])
+
+                status = hop_result["status"]
+                if status in REDIRECT_STATUS_CODES:
+                    location = hop_result["location"]
+                    if not location:
+                        raise WebFetchError(
+                            f"Respuesta de redirección HTTP {status} sin encabezado 'Location'.",
+                            code="INVALID_REDIRECT",
+                            http_status=status,
+                        )
+                    next_raw_url = urljoin(current_target.normalized_url, location).strip()
+                    if hop >= self.config.max_redirects:
+                        if next_raw_url and (not redirect_chain or redirect_chain[-1] != next_raw_url):
+                            redirect_chain.append(next_raw_url)
+                        current_url = next_raw_url or current_url
+                        raise TooManyRedirectsError(
+                            f"Se superó el máximo de {self.config.max_redirects} redirecciones permitidas."
+                        )
+                    # Registrar el destino del salto antes de validar para preservar trazabilidad
+                    # incluso cuando el salto redirigido sea bloqueado por SSRF o puerto prohibido.
+                    current_url = next_raw_url
+                    if not redirect_chain or redirect_chain[-1] != next_raw_url:
+                        redirect_chain.append(next_raw_url)
+                    # Validación completa del nuevo destino ANTES de abrir la siguiente conexión.
+                    current_target = self.network_policy.validate_url(next_raw_url)
+                    current_url = current_target.normalized_url
+                    redirect_chain[-1] = current_url
+                    continue
+
+                return FetchResult(
+                    original_url=original_url,
+                    final_url=current_target.normalized_url,
+                    http_status=status,
+                    content_type=hop_result["content_type"],
+                    declared_charset=hop_result["declared_charset"],
+                    content_language=hop_result["content_language"],
+                    body_bytes=hop_result["body_bytes"],
+                    bytes_received=hop_result["bytes_received"],
+                    bytes_decompressed=hop_result["bytes_decompressed"],
+                    redirect_chain=tuple(redirect_chain),
+                    connected_ips=tuple(connected_ips),
+                )
+
+            raise TooManyRedirectsError(
+                f"Se superó el máximo de {self.config.max_redirects} redirecciones permitidas."
             )
-
-            if hop_result["connected_ip"]:
-                connected_ips.append(hop_result["connected_ip"])
-
-            status = hop_result["status"]
-            if status in REDIRECT_STATUS_CODES:
-                if hop >= self.config.max_redirects:
-                    raise TooManyRedirectsError(
-                        f"Se superó el máximo de {self.config.max_redirects} redirecciones permitidas."
-                    )
-                location = hop_result["location"]
-                if not location:
-                    raise WebFetchError(
-                        f"Respuesta de redirección HTTP {status} sin encabezado 'Location'.",
-                        code="INVALID_REDIRECT",
-                        http_status=status,
-                    )
-                next_raw_url = urljoin(current_target.normalized_url, location)
-                # Validación completa del nuevo destino ANTES de abrir la siguiente conexión.
-                current_target = self.network_policy.validate_url(next_raw_url)
-                redirect_chain.append(current_target.normalized_url)
-                continue
-
-            return FetchResult(
-                original_url=original_url,
-                final_url=current_target.normalized_url,
-                http_status=status,
-                content_type=hop_result["content_type"],
-                declared_charset=hop_result["declared_charset"],
-                content_language=hop_result["content_language"],
-                body_bytes=hop_result["body_bytes"],
-                bytes_received=hop_result["bytes_received"],
-                bytes_decompressed=hop_result["bytes_decompressed"],
-                redirect_chain=tuple(redirect_chain),
-                connected_ips=tuple(connected_ips),
-            )
-
-        raise TooManyRedirectsError(
-            f"Se superó el máximo de {self.config.max_redirects} redirecciones permitidas."
-        )
+        except (WebSecurityError, WebFetchError) as exc:
+            if not getattr(exc, "final_url", None):
+                exc.final_url = current_url
+            if not getattr(exc, "redirect_chain", ()):
+                exc.redirect_chain = tuple(redirect_chain)
+            raise
 
     def _fetch_single_hop_with_retries(
         self,
@@ -495,12 +526,16 @@ class WebFetcher:
                 raise
             except WebFetchError as exc:
                 last_error = exc
-                if not exc.retryable or attempt >= attempts - 1:
+                if not exc.retryable or attempt >= attempts - 1 or (deadline - time.monotonic()) <= 0:
                     raise
             except Exception as exc:
-                last_error = exc
-                if attempt >= attempts - 1:
-                    raise WebFetchError(f"Error de transporte al conectar con '{target.hostname}': {exc}") from exc
+                # Las excepciones no tipadas corresponden a errores permanentes o de validación interna,
+                # nunca a fallos transitorios de red: no se reintentan.
+                raise WebFetchError(
+                    f"Error no recuperable al conectar con '{target.hostname}': {exc}",
+                    code="FETCH_ERROR",
+                    retryable=False,
+                ) from exc
 
         assert last_error is not None
         raise last_error

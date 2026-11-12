@@ -171,19 +171,76 @@ _INLINE_TAGS: frozenset[str] = frozenset(
 _CONTAINER_TAGS: frozenset[str] = frozenset(
     {"html", "body", "main", "article", "section", "div", "header", "figure", "details", "summary", "td", "th"}
 )
+_BODY_INITIATOR_TAGS: frozenset[str] = frozenset(
+    {
+        "body",
+        "main",
+        "article",
+        "section",
+        "div",
+        "header",
+        "footer",
+        "nav",
+        "aside",
+        "p",
+        "ul",
+        "ol",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "blockquote",
+        "pre",
+        "table",
+        "figure",
+    }
+)
 
-_INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Caracteres invisibles, marcas/aislamientos/overrides bidireccionales Unicode (U+202A..U+202E,
+# U+2066..U+2069, U+200E, U+200F, U+061C) y bloque Unicode Tags (U+E0000..U+E007F) usados en
+# ofuscación visual e inyección indirecta de prompts.
+_INVISIBLE_CHARS_RE = re.compile(
+    r"[\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\ufff9-\ufffb\U000e0000-\U000e007f]+"
+)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _META_CHARSET_RE = re.compile(
     r"""<meta\b[^>]*?(?:charset\s*=\s*["']?\s*([A-Za-z0-9._-]+)|content\s*=\s*["'][^"']*?charset\s*=\s*([A-Za-z0-9._-]+))""",
     re.IGNORECASE,
 )
+_HIDDEN_STYLE_RE = re.compile(
+    r"(?:^|;)\s*(?:"
+    r"display\s*:\s*none"
+    r"|visibility\s*:\s*(?:hidden|collapse)"
+    r"|opacity\s*:\s*0(?:\.0+)?"
+    r"|font-size\s*:\s*0(?:px|pt|em|rem|%)?"
+    r"|clip-path\s*:\s*inset\(\s*100%\s*\)"
+    r"|clip\s*:\s*rect\(\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*\)"
+    r")\s*(?:!important)?\s*(?:;|$)",
+    re.IGNORECASE,
+)
+
+_URL_UNSAFE_CHAR_MAP: dict[str, str] = {
+    " ": "%20",
+    "(": "%28",
+    ")": "%29",
+    "[": "%5B",
+    "]": "%5D",
+    "<": "%3C",
+    ">": "%3E",
+    '"': "%22",
+    "'": "%27",
+    "`": "%60",
+}
 
 
 def normalize_text(raw: str) -> str:
     """
-    Normaliza Unicode (NFC), elimina caracteres invisibles o de control y colapsa espacios.
+    Normaliza Unicode (NFC), elimina caracteres invisibles, controles bidireccionales o Tags
+    y colapsa espacios preservando texto multilingüe, acentos y símbolos legítimos.
     """
     if not raw:
         return ""
@@ -283,15 +340,18 @@ def decode_html_bytes(
     return body_bytes.decode(fallback_codec, errors="replace"), fallback_codec, warnings
 
 
-def normalize_extracted_url(raw_href: str, base_url: str) -> str | None:
+def normalize_extracted_url(raw_href: str, base_url: str = "") -> str | None:
     """
     Resuelve y normaliza un enlace relativo/absoluto conservando únicamente esquemas http/https.
-    Descarta enlaces internos `#fragment`, `javascript:`, `mailto:`, `tel:` y esquemas no web.
+    Descarta enlaces internos `#fragment`, `javascript:`, `mailto:`, `tel:`, caracteres de control
+    y codifica caracteres que romperían la sintaxis de enlaces Markdown (espacios, paréntesis, etc.).
     """
-    if not raw_href:
+    if not raw_href or not isinstance(raw_href, str):
         return None
     cleaned = raw_href.strip()
     if not cleaned or cleaned.startswith("#"):
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned):
         return None
     lower = cleaned.lower()
     if lower.startswith(("javascript:", "mailto:", "tel:", "data:", "vbscript:", "file:", "ftp:")):
@@ -316,7 +376,7 @@ def normalize_extracted_url(raw_href: str, base_url: str) -> str | None:
         hostname = parts.hostname
     except ValueError:
         return None
-    if not hostname:
+    if not hostname or any(ch in hostname for ch in " ()[]<>\"'`\\"):
         return None
 
     norm_host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
@@ -325,9 +385,31 @@ def normalize_extracted_url(raw_href: str, base_url: str) -> str | None:
     else:
         netloc = norm_host
 
-    path = parts.path or "/"
-    # Conservamos ruta y query, removiendo fragmentos puramente visuales para deduplicar enlaces.
-    return urlunsplit((scheme, netloc, path, parts.query, ""))
+    raw_path = parts.path or "/"
+    safe_path = "".join(_URL_UNSAFE_CHAR_MAP.get(ch, ch) for ch in raw_path)
+    safe_query = "".join(_URL_UNSAFE_CHAR_MAP.get(ch, ch) for ch in parts.query)
+    # Conservamos ruta y query codificados de forma segura, removiendo fragmentos visuales.
+    return urlunsplit((scheme, netloc, safe_path, safe_query, ""))
+
+
+def _has_same_origin(url_a: str, url_b: str) -> bool:
+    """Comprueba si dos URLs HTTP/HTTPS comparten exactamente el mismo origen (scheme, host, port)."""
+    try:
+        pa = urlsplit(url_a)
+        pb = urlsplit(url_b)
+        sa = pa.scheme.lower()
+        sb = pb.scheme.lower()
+        if sa not in ("http", "https") or sa != sb:
+            return False
+        ha = (pa.hostname or "").lower().rstrip(".")
+        hb = (pb.hostname or "").lower().rstrip(".")
+        if not ha or ha != hb:
+            return False
+        port_a = pa.port or (443 if sa == "https" else 80)
+        port_b = pb.port or (443 if sb == "https" else 80)
+        return port_a == port_b
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -372,10 +454,12 @@ class _StructuredHTMLParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._max_jsonld_bytes = max_jsonld_bytes
 
-        # Pila de control: cada elemento guarda (tag, is_ignored_subtree, is_main_landmark).
-        self._stack: list[tuple[str, bool, bool]] = []
+        # Pila de control: cada elemento guarda (tag, is_ignored_subtree, is_main_landmark, is_head).
+        self._stack: list[tuple[str, bool, bool, bool]] = []
         self._ignored_depth: int = 0
         self._main_depth: int = 0
+        self._head_depth: int = 0
+        self._body_started: bool = False
 
         # Metadatos recolectados.
         self.html_lang: str | None = None
@@ -427,12 +511,33 @@ class _StructuredHTMLParser(HTMLParser):
                 result[key.lower()] = val or ""
         return result
 
-    def _is_noise_element(self, tag: str, attr_map: dict[str, str]) -> bool:
-        if tag in _IGNORED_TAGS or tag in _CHROME_TAGS:
+    @staticmethod
+    def _is_hidden_style(style_raw: str) -> bool:
+        if not style_raw:
+            return False
+        if _HIDDEN_STYLE_RE.search(style_raw):
             return True
+        if re.search(r"\boverflow\s*:\s*hidden\b", style_raw, re.IGNORECASE) and re.search(
+            r"(?:^|[;\s])(?:max-)?(?:width|height)\s*:\s*0(?:px|em|rem|%|pt|vh|vw)?(?=\s*(?:;|!important|$))",
+            style_raw,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
+
+    def _has_hidden_attrs(self, attr_map: dict[str, str]) -> bool:
         if "hidden" in attr_map:
             return True
         if attr_map.get("aria-hidden", "").strip().lower() == "true":
+            return True
+        if self._is_hidden_style(attr_map.get("style", "")):
+            return True
+        return False
+
+    def _is_noise_element(self, tag: str, attr_map: dict[str, str]) -> bool:
+        if tag in _IGNORED_TAGS or tag in _CHROME_TAGS:
+            return True
+        if self._has_hidden_attrs(attr_map):
             return True
         role = attr_map.get("role", "").strip().lower()
         if role in _NOISE_ROLES:
@@ -441,6 +546,15 @@ class _StructuredHTMLParser(HTMLParser):
         if class_id and _NOISE_ATTR_RE.search(class_id):
             return True
         return False
+
+    def _close_open_title(self) -> None:
+        if not self._in_title:
+            return
+        self._in_title = False
+        cleaned = normalize_text("".join(self._title_parts))
+        if cleaned and self.title_text is None:
+            self.title_text = cleaned
+        self._title_parts.clear()
 
     def _flush_loose_text(self) -> None:
         if not self._loose_parts:
@@ -453,7 +567,7 @@ class _StructuredHTMLParser(HTMLParser):
         self.blocks.append(_RawBlock(kind="paragraph", in_main=in_main, text=text))
 
     def _append_visible_text(self, text: str) -> None:
-        if self._ignored_depth > 0 or self._in_loose_time:
+        if self._ignored_depth > 0 or self._head_depth > 0 or self._in_loose_time:
             return
 
         active_buf: list[str] | None = None
@@ -495,26 +609,50 @@ class _StructuredHTMLParser(HTMLParser):
         attr_map = self._attrs_dict(attrs)
         is_void = tag_l in _VOID_TAGS
 
-        # Metadatos globales independientes de si están en <head>.
-        if tag_l == "html" and not self.html_lang:
+        # Si ya estamos dentro de un subárbol ignorado (<template>, <noscript>, hidden, nav, footer, etc.),
+        # apilar solo para balancear cierre y no procesar ningún metadato ni contenido (F-02 / F-05).
+        if self._ignored_depth > 0:
+            if not is_void:
+                self._stack.append((tag_l, False, False, False))
+            return
+
+        has_hidden = self._has_hidden_attrs(attr_map)
+
+        # Transición implícita o explícita a cuerpo del documento (cierra <title> o <head> mal cerrados).
+        if tag_l in _BODY_INITIATOR_TAGS:
+            self._close_open_title()
+            if self._head_depth > 0:
+                self._head_depth = 0
+                self._stack = [(t, ign, mn, False) for (t, ign, mn, _hd) in self._stack if t != "head"]
+            self._body_started = True
+
+        in_head_metadata_ctx = (self._head_depth > 0 or not self._body_started) and not has_hidden
+
+        if tag_l == "html" and not self.html_lang and not has_hidden:
             lang = normalize_text(attr_map.get("lang") or attr_map.get("xml:lang") or "")
             if lang:
                 self.html_lang = lang
         elif tag_l == "base" and not self.base_href:
-            href = attr_map.get("href", "").strip()
-            if href:
-                self.base_href = href
-        elif tag_l == "meta":
+            # <base href> se acepta exclusivamente dentro de <head> explícito y antes de <body> (F-02).
+            if self._head_depth > 0 and not self._body_started and not has_hidden:
+                href = attr_map.get("href", "").strip()
+                if href:
+                    self.base_href = href
+        elif tag_l == "meta" and in_head_metadata_ctx:
             self._handle_meta(attr_map)
-        elif tag_l == "link":
+        elif tag_l == "link" and in_head_metadata_ctx:
             rel_tokens = set(attr_map.get("rel", "").lower().split())
             if "canonical" in rel_tokens and not self.canonical_href:
                 href = attr_map.get("href", "").strip()
                 if href:
                     self.canonical_href = href
 
-        # Captura segura de JSON-LD sin emitir texto visible.
-        if tag_l == "script" and attr_map.get("type", "").strip().lower() == "application/ld+json":
+        # Captura segura de JSON-LD únicamente en contexto de metadatos y fuera de subárboles ignorados/ocultos.
+        if (
+            tag_l == "script"
+            and in_head_metadata_ctx
+            and attr_map.get("type", "").strip().lower() == "application/ld+json"
+        ):
             self._in_jsonld = True
             self._jsonld_parts.clear()
             self._jsonld_size = 0
@@ -524,24 +662,32 @@ class _StructuredHTMLParser(HTMLParser):
                 self._append_visible_text(" ")
             return
 
-        if tag_l == "title" and not self._in_title and self.title_text is None:
+        if tag_l == "title" and in_head_metadata_ctx and not self._in_title and self.title_text is None:
             self._in_title = True
             self._title_parts.clear()
 
-        # Determinar ignorado / landmark principal antes de apilar.
-        becomes_ignored = self._is_noise_element(tag_l, attr_map)
-        if tag_l == "head":
-            becomes_ignored = True
+        # Determinar ignorado / landmark principal / head antes de apilar.
+        becomes_head = tag_l == "head" and not self._body_started and not has_hidden
+        becomes_ignored = self._is_noise_element(tag_l, attr_map) if tag_l != "head" else has_hidden
         becomes_main = tag_l in ("main", "article") or attr_map.get("role", "").strip().lower() == "main"
 
+        if becomes_head:
+            self._head_depth += 1
         if becomes_ignored:
             self._ignored_depth += 1
-        if becomes_main and self._ignored_depth == 0:
+        if becomes_main and self._ignored_depth == 0 and self._head_depth == 0:
             self._main_depth += 1
 
-        self._stack.append((tag_l, becomes_ignored, becomes_main and self._ignored_depth == 0))
+        self._stack.append(
+            (
+                tag_l,
+                becomes_ignored,
+                becomes_main and self._ignored_depth == 0 and self._head_depth == 0,
+                becomes_head,
+            )
+        )
 
-        if self._ignored_depth > 0:
+        if self._ignored_depth > 0 or self._head_depth > 0:
             return
 
         # Al abrir bloques estructurales mayores, vaciar texto suelto previo para mantener el orden.
@@ -580,12 +726,8 @@ class _StructuredHTMLParser(HTMLParser):
         if tag_l in _VOID_TAGS:
             return
 
-        if tag_l == "title" and self._in_title:
-            self._in_title = False
-            cleaned = normalize_text("".join(self._title_parts))
-            if cleaned and self.title_text is None:
-                self.title_text = cleaned
-            self._title_parts.clear()
+        if tag_l in ("title", "head") and self._in_title:
+            self._close_open_title()
 
         if tag_l == "script" and self._in_jsonld:
             self._in_jsonld = False
@@ -594,7 +736,7 @@ class _StructuredHTMLParser(HTMLParser):
             if raw_json:
                 self._parse_jsonld(raw_json)
 
-        was_ignored_before_pop = self._ignored_depth > 0
+        was_ignored_before_pop = self._ignored_depth > 0 or self._head_depth > 0
 
         if not was_ignored_before_pop:
             if tag_l == "a":
@@ -652,17 +794,19 @@ class _StructuredHTMLParser(HTMLParser):
             elif tag_l in _CONTAINER_TAGS:
                 self._flush_loose_text()
 
-        # Desapilar estado de ignorado y main landmark incluso si HTML viene desbalanceado.
+        # Desapilar estado de ignorado, main landmark y head incluso si HTML viene desbalanceado.
         for idx in range(len(self._stack) - 1, -1, -1):
-            stacked_tag, started_ignored, started_main = self._stack[idx]
+            stacked_tag, started_ignored, started_main, started_head = self._stack[idx]
             if stacked_tag == tag_l:
                 removed = self._stack[idx:]
                 del self._stack[idx:]
-                for _, ign, mn in removed:
+                for _, ign, mn, hd in removed:
                     if ign:
                         self._ignored_depth = max(0, self._ignored_depth - 1)
                     if mn:
                         self._main_depth = max(0, self._main_depth - 1)
+                    if hd:
+                        self._head_depth = max(0, self._head_depth - 1)
                 break
 
     def handle_data(self, data: str) -> None:
@@ -670,6 +814,7 @@ class _StructuredHTMLParser(HTMLParser):
             return
         if self._in_title:
             self._title_parts.append(data)
+            return
         if self._in_jsonld:
             if self._jsonld_size < self._max_jsonld_bytes:
                 chunk = data[: self._max_jsonld_bytes - self._jsonld_size]
@@ -684,6 +829,7 @@ class _StructuredHTMLParser(HTMLParser):
 
     def close(self) -> None:
         super().close()
+        self._close_open_title()
         self._flush_loose_text()
 
     def _handle_meta(self, attr_map: dict[str, str]) -> None:
@@ -800,7 +946,30 @@ class WebContentExtractor:
             else parser.blocks
         )
 
-        # Deduplicación y estructuración ordenada de encabezados, párrafos, listas y secciones.
+        meta = parser.meta_values
+        explicit_title = (
+            parser.title_text
+            or meta.get("og:title")
+            or meta.get("twitter:title")
+            or _extract_jsonld_field(parser.jsonld_blocks, "headline")
+        )
+        first_selected_heading = next((b.text for b in selected_blocks if b.kind == "heading"), None)
+
+        max_budget = max(1, int(self.config.max_normalized_chars))
+        text_parts: list[str] = []
+        used_chars: int = 0
+        truncated: bool = False
+
+        if explicit_title and (not first_selected_heading or first_selected_heading.casefold() != explicit_title.casefold()):
+            title_part = explicit_title
+            if len(title_part) > max_budget:
+                title_part = title_part[:max_budget].rstrip()
+                truncated = True
+            if title_part:
+                text_parts.append(title_part)
+                used_chars = len(title_part)
+
+        # Deduplicación, estructuración ordenada y presupuesto compartido de caracteres (F-04).
         headings: list[WebHeading] = []
         paragraphs: list[WebParagraph] = []
         lists: list[WebList] = []
@@ -831,28 +1000,56 @@ class WebContentExtractor:
             current_sec_lists.clear()
 
         for blk in selected_blocks:
+            if truncated:
+                break
             if blk.kind == "heading":
                 # Evitar encabezados duplicados inmediatamente consecutivos.
                 if current_heading and current_heading.text.casefold() == blk.text.casefold():
                     continue
+                sep_cost = 2 if text_parts else 0
+                avail = max_budget - used_chars - sep_cost
+                if avail <= 0:
+                    truncated = True
+                    break
+                h_text = blk.text
+                if len(h_text) > avail:
+                    h_text = h_text[:avail].rstrip()
+                    truncated = True
+                    if not h_text:
+                        break
                 flush_section()
-                heading_obj = WebHeading(level=blk.level, text=blk.text, source_url=source_url)
+                heading_obj = WebHeading(level=blk.level, text=h_text, source_url=source_url)
                 headings.append(heading_obj)
                 current_heading = heading_obj
                 current_level = blk.level
+                text_parts.append(h_text)
+                used_chars += sep_cost + len(h_text)
             elif blk.kind == "paragraph":
                 dedup_key = blk.text.casefold()
                 if dedup_key in seen_paragraphs:
                     continue
                 seen_paragraphs.add(dedup_key)
+                sep_cost = 2 if text_parts else 0
+                avail = max_budget - used_chars - sep_cost
+                if avail <= 0:
+                    truncated = True
+                    break
+                p_text = blk.text
+                if len(p_text) > avail:
+                    p_text = p_text[:avail].rstrip()
+                    truncated = True
+                    if not p_text:
+                        break
                 para_obj = WebParagraph(
-                    text=blk.text,
+                    text=p_text,
                     source_url=source_url,
                     section_heading=current_heading.text if current_heading else None,
                     index=len(paragraphs),
                 )
                 paragraphs.append(para_obj)
                 current_sec_paragraphs.append(para_obj)
+                text_parts.append(p_text)
+                used_chars += sep_cost + len(p_text)
             elif blk.kind == "list":
                 dedup_items = tuple(item for item in blk.items if item)
                 if not dedup_items:
@@ -861,21 +1058,56 @@ class WebContentExtractor:
                 if list_key in seen_lists:
                     continue
                 seen_lists.add(list_key)
-                list_obj = WebList(
-                    ordered=blk.ordered,
-                    items=dedup_items,
-                    source_url=source_url,
-                    section_heading=current_heading.text if current_heading else None,
-                    index=len(lists),
-                )
-                lists.append(list_obj)
-                current_sec_lists.append(list_obj)
+                bounded_items: list[str] = []
+                for idx, item in enumerate(dedup_items, start=1):
+                    prefix = f"{idx}." if blk.ordered else "-"
+                    sep_cost = 2 if text_parts else 0
+                    avail = max_budget - used_chars - sep_cost
+                    min_needed = len(prefix) + 1
+                    if avail <= min_needed:
+                        truncated = True
+                        break
+                    max_item_chars = avail - min_needed
+                    item_text = item
+                    if len(item_text) > max_item_chars:
+                        item_text = item_text[:max_item_chars].rstrip()
+                        truncated = True
+                    if item_text:
+                        bounded_items.append(item_text)
+                        part_str = f"{prefix} {item_text}"
+                        text_parts.append(part_str)
+                        used_chars += sep_cost + len(part_str)
+                    if truncated:
+                        break
+                if bounded_items:
+                    list_obj = WebList(
+                        ordered=blk.ordered,
+                        items=tuple(bounded_items),
+                        source_url=source_url,
+                        section_heading=current_heading.text if current_heading else None,
+                        index=len(lists),
+                    )
+                    lists.append(list_obj)
+                    current_sec_lists.append(list_obj)
 
         flush_section()
 
         # Enlaces relevantes normalizados, deduplicados y acotados por max_links.
-        base_for_links = normalize_extracted_url(parser.base_href, source_url) if parser.base_href else source_url
-        base_for_links = base_for_links or source_url
+        # <base href> solo se aplica si fue declarado en <head> y pertenece al mismo origen (F-02).
+        base_for_links = source_url
+        if parser.base_href:
+            candidate_base = normalize_extracted_url(parser.base_href, source_url)
+            if candidate_base and _has_same_origin(candidate_base, source_url):
+                base_for_links = candidate_base
+            else:
+                warnings.append(
+                    WebIssue(
+                        code="CROSS_ORIGIN_BASE_IGNORED",
+                        message="Se ignoró una etiqueta <base href> inválida o de distinto origen por seguridad.",
+                        source_url=source_url,
+                        severity="warning",
+                    )
+                )
         page_host = (urlsplit(source_url).hostname or "").lower()
 
         raw_links = parser.links
@@ -908,14 +1140,7 @@ class WebContentExtractor:
                 )
 
         # Construcción honesta de metadatos (sin inventar campos ausentes).
-        meta = parser.meta_values
-        title = (
-            parser.title_text
-            or meta.get("og:title")
-            or meta.get("twitter:title")
-            or _extract_jsonld_field(parser.jsonld_blocks, "headline")
-            or (headings[0].text if headings else None)
-        )
+        title = explicit_title or (headings[0].text if headings else None)
         description = (
             meta.get("description")
             or meta.get("og:description")
@@ -963,30 +1188,16 @@ class WebContentExtractor:
             content_type=fetch_result.content_type,
         )
 
-        # Texto normalizado completo respetando jerarquía y límite máximo configurado.
-        text_parts: list[str] = []
-        if metadata.title and (not headings or headings[0].text.casefold() != metadata.title.casefold()):
-            text_parts.append(metadata.title)
-        for sec in sections:
-            if sec.heading is not None:
-                text_parts.append(sec.heading.text)
-            for p in sec.paragraphs:
-                text_parts.append(p.text)
-            for lst in sec.lists:
-                for idx, item in enumerate(lst.items, start=1):
-                    prefix = f"{idx}." if lst.ordered else "-"
-                    text_parts.append(f"{prefix} {item}")
-
         full_normalized = "\n\n".join(part for part in text_parts if part)
-        truncated = False
-        if len(full_normalized) > self.config.max_normalized_chars:
-            full_normalized = full_normalized[: self.config.max_normalized_chars].rstrip()
+        if len(full_normalized) > max_budget:
+            full_normalized = full_normalized[:max_budget].rstrip()
             truncated = True
+        if truncated:
             warnings.append(
                 WebIssue(
                     code="NORMALIZED_TEXT_TRUNCATED",
                     message=(
-                        f"El texto normalizado se acotó a {self.config.max_normalized_chars} caracteres."
+                        f"El contenido estructurado y texto normalizado se acotaron a {max_budget} caracteres."
                     ),
                     source_url=source_url,
                     severity="warning",

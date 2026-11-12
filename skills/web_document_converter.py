@@ -29,8 +29,34 @@ if TYPE_CHECKING:
     from skills.document_export_skill import DocumentExportSkill
     from skills.document_models import Document
 
-# Detecta marcadores al inicio de línea que `DocumentParser` interpretaría como elementos especiales.
-_MD_BLOCK_SPOOF_RE = re.compile(r"^(#{1,6}\s|>\s?|```|~~~|\[\^[^\]]+\]:|[-*+]\s|\d+[.)]\s)")
+# Detecta marcadores al inicio de línea que `DocumentParser` interpretaría como elementos especiales
+# (incluyendo definiciones de referencia normales `[id]: url` y con circunflejo `[^id]: url`).
+_MD_BLOCK_SPOOF_RE = re.compile(r"^(#{1,6}\s|>\s?|```|~~~|\[\^?[^\]]+\]:|[-*+]\s|\d+[.)]\s)")
+
+_MD_UNSAFE_URL_CHARS: dict[str, str] = {
+    " ": "%20",
+    "\t": "%09",
+    "(": "%28",
+    ")": "%29",
+    "[": "%5B",
+    "]": "%5D",
+    "<": "%3C",
+    ">": "%3E",
+    '"': "%22",
+    "'": "%27",
+    "`": "%60",
+}
+
+
+def _sanitize_markdown_url(raw_url: str) -> str:
+    """
+    Normaliza y codifica caracteres que pueden romper la sintaxis `[label](url)` o
+    inyectar enlaces/definiciones adicionales en Markdown, preservando URLs válidas.
+    """
+    cleaned = "".join(ch for ch in (raw_url or "").strip() if ord(ch) >= 0x20 and ord(ch) != 0x7F)
+    if not cleaned:
+        return ""
+    return "".join(_MD_UNSAFE_URL_CHARS.get(ch, ch) for ch in cleaned)
 
 
 def _sanitize_markdown_text(text: str) -> str:
@@ -41,7 +67,7 @@ def _sanitize_markdown_text(text: str) -> str:
     clean = " ".join((text or "").splitlines()).strip()
     if not clean:
         return ""
-    # Evitar también etiquetas HTML crudas residuales en el Markdown generado.
+    # Evitar también etiquetas de imagen/alerta Markdown crudas residuales.
     clean = clean.replace("[!", "\\[!").replace("![", "\\![")
     if _MD_BLOCK_SPOOF_RE.match(clean):
         return f"\\{clean}"
@@ -49,13 +75,16 @@ def _sanitize_markdown_text(text: str) -> str:
 
 
 def _sanitize_markdown_heading(text: str) -> str:
-    """Limpia texto de encabezado para emitir una línea Markdown `#` válida."""
-    return " ".join((text or "").replace("\r", " ").replace("\n", " ").split()).strip()
+    """Limpia texto de encabezado o metadato para emitir una línea Markdown segura."""
+    clean = " ".join((text or "").replace("\r", " ").replace("\n", " ").split()).strip()
+    if _MD_BLOCK_SPOOF_RE.match(clean):
+        return f"\\{clean}"
+    return clean
 
 
 def _sanitize_link_label(text: str, fallback: str) -> str:
     """Escapa corchetes en etiquetas de enlace Markdown sin alterar el texto legible."""
-    base = _sanitize_markdown_heading(text) or fallback
+    base = _sanitize_markdown_heading(text) or _sanitize_markdown_url(fallback)
     return base.replace("[", "\\[").replace("]", "\\]")
 
 
@@ -65,19 +94,21 @@ def _append_source_provenance_lines(
     source_tag: str,
 ) -> None:
     """Agrega los metadatos reales y la procedencia de una fuente sin inventar campos ausentes."""
+    safe_orig_url = _sanitize_markdown_url(source.original_url)
+    safe_final_url = _sanitize_markdown_url(source.final_url)
     lines.append(f"- **Identificador de trazabilidad:** `[{source_tag}]`")
-    lines.append(f"- **URL original:** {source.original_url}")
-    if source.final_url and source.final_url != source.original_url:
-        lines.append(f"- **URL final tras redirecciones:** {source.final_url}")
+    lines.append(f"- **URL original:** {safe_orig_url}")
+    if safe_final_url and safe_final_url != safe_orig_url:
+        lines.append(f"- **URL final tras redirecciones:** {safe_final_url}")
         if source.redirect_chain:
-            chain_txt = " -> ".join(source.redirect_chain)
+            chain_txt = " -> ".join(_sanitize_markdown_url(u) for u in source.redirect_chain)
             lines.append(f"- **Cadena de redirecciones:** {chain_txt}")
     lines.append(f"- **Estado de extracción:** `{source.status.value}`")
     if source.http_status is not None:
         lines.append(f"- **Código HTTP:** {source.http_status}")
     lines.append(f"- **Fecha de extracción (UTC):** {source.metadata.extracted_at}")
     if source.metadata.published_at:
-        lines.append(f"- **Fecha de publicación declarada:** {source.metadata.published_at}")
+        lines.append(f"- **Fecha de publicación declarada:** {_sanitize_markdown_heading(source.metadata.published_at)}")
     if source.metadata.author:
         lines.append(f"- **Autor declarado:** {_sanitize_markdown_heading(source.metadata.author)}")
     if source.metadata.language:
@@ -85,7 +116,7 @@ def _append_source_provenance_lines(
     if source.metadata.site_name:
         lines.append(f"- **Sitio:** {_sanitize_markdown_heading(source.metadata.site_name)}")
     if source.metadata.canonical_url:
-        lines.append(f"- **URL canónica declarada:** {source.metadata.canonical_url}")
+        lines.append(f"- **URL canónica declarada:** {_sanitize_markdown_url(source.metadata.canonical_url)}")
     if source.metadata.description:
         lines.append(f"- **Descripción:** {_sanitize_markdown_text(source.metadata.description)}")
     lines.append("")
@@ -94,13 +125,15 @@ def _append_source_provenance_lines(
         lines.append("#### Incidencias de esta fuente")
         lines.append("")
         for err in source.errors:
+            err_url = _sanitize_markdown_url(err.source_url or source.final_url)
             lines.append(
-                f"- **Error [{err.code}]** ({err.source_url or source.final_url}): "
+                f"- **Error [{err.code}]** ({err_url}): "
                 f"{_sanitize_markdown_heading(err.message)}"
             )
         for warn in source.warnings:
+            warn_url = _sanitize_markdown_url(warn.source_url or source.final_url)
             lines.append(
-                f"- **Advertencia [{warn.code}]** ({warn.source_url or source.final_url}): "
+                f"- **Advertencia [{warn.code}]** ({warn_url}): "
                 f"{_sanitize_markdown_heading(warn.message)}"
             )
         lines.append("")
@@ -230,8 +263,9 @@ class WebDocumentConverter:
                 lines.append("")
                 for lk in data.links[:max_links_per_source]:
                     scope = "externo" if lk.is_external else "interno"
-                    label = _sanitize_link_label(lk.text, lk.url)
-                    lines.append(f"- [{label}]({lk.url}) ({scope}; fuente: `[{ 'src-1' }]`)")
+                    safe_lk_url = _sanitize_markdown_url(lk.url)
+                    label = _sanitize_link_label(lk.text, safe_lk_url)
+                    lines.append(f"- [{label}]({safe_lk_url}) ({scope}; fuente: `[{ 'src-1' }]`)")
                 lines.append("")
 
             # Se coloca al final para que `_extract_references()` del Paso #3.A capture
@@ -239,8 +273,9 @@ class WebDocumentConverter:
             lines.append("## Fuentes y Referencias")
             lines.append("")
             cite_title = _sanitize_markdown_heading(data.metadata.title or "Fuente principal")
+            safe_ref_url = _sanitize_markdown_url(data.original_url)
             lines.append(
-                f"[^src-1]: {cite_title} — {data.original_url} (extraído: {data.metadata.extracted_at})"
+                f"[^src-1]: {cite_title} — {safe_ref_url} (extraído: {data.metadata.extracted_at})"
             )
             lines.append("")
             return "\n".join(lines).strip() + "\n"
@@ -266,20 +301,21 @@ class WebDocumentConverter:
             lines.append("")
             for sr in data.search_results:
                 desc = f" — {_sanitize_markdown_text(sr.description)}" if sr.description else ""
-                label = _sanitize_link_label(sr.title, sr.url)
-                lines.append(f"{sr.rank}. [{label}]({sr.url}) (`{sr.provider}`){desc}")
+                safe_sr_url = _sanitize_markdown_url(sr.url)
+                label = _sanitize_link_label(sr.title, safe_sr_url)
+                lines.append(f"{sr.rank}. [{label}]({safe_sr_url}) (`{sr.provider}`){desc}")
             lines.append("")
 
         if data.errors or data.warnings:
             lines.append("## Incidencias Globales")
             lines.append("")
             for err in data.errors:
-                origin = f" ({err.source_url})" if err.source_url else ""
+                origin = f" ({_sanitize_markdown_url(err.source_url)})" if err.source_url else ""
                 lines.append(
                     f"- **Error [{err.code}]**{origin}: {_sanitize_markdown_heading(err.message)}"
                 )
             for warn in data.warnings:
-                origin = f" ({warn.source_url})" if warn.source_url else ""
+                origin = f" ({_sanitize_markdown_url(warn.source_url)})" if warn.source_url else ""
                 lines.append(
                     f"- **Advertencia [{warn.code}]**{origin}: {_sanitize_markdown_heading(warn.message)}"
                 )
@@ -302,8 +338,9 @@ class WebDocumentConverter:
             lines.append("")
             for src_tag, lk in all_links[: max_links_per_source * max(1, len(sources))]:
                 scope = "externo" if lk.is_external else "interno"
-                label = _sanitize_link_label(lk.text, lk.url)
-                lines.append(f"- `[{src_tag}]` [{label}]({lk.url}) ({scope})")
+                safe_lk_url = _sanitize_markdown_url(lk.url)
+                label = _sanitize_link_label(lk.text, safe_lk_url)
+                lines.append(f"- `[{src_tag}]` [{label}]({safe_lk_url}) ({scope})")
             lines.append("")
 
         # Sección final de citas/fuentes: contiene una sola URL (`original_url`) por definición `[^src-N]`.
@@ -313,8 +350,9 @@ class WebDocumentConverter:
             for idx, src in enumerate(sources, start=1):
                 src_tag = f"src-{idx}"
                 src_label = _sanitize_markdown_heading(src.metadata.title or "Fuente web")
+                safe_ref_url = _sanitize_markdown_url(src.original_url)
                 lines.append(
-                    f"[^{src_tag}]: {src_label} — {src.original_url} "
+                    f"[^{src_tag}]: {src_label} — {safe_ref_url} "
                     f"(estado: {src.status.value}; extraído: {src.metadata.extracted_at})"
                 )
         else:

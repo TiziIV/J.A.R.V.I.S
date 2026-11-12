@@ -98,9 +98,18 @@ DnsResolver = Callable[..., list[tuple[Any, ...]]]
 class WebSecurityError(ValueError):
     """Excepción base para rechazos por política de seguridad web o SSRF."""
 
-    def __init__(self, message: str, *, code: str = "SECURITY_BLOCKED") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "SECURITY_BLOCKED",
+        final_url: str | None = None,
+        redirect_chain: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.code: str = code
+        self.final_url: str | None = final_url
+        self.redirect_chain: tuple[str, ...] = tuple(redirect_chain)
 
 
 class InvalidURLError(WebSecurityError):
@@ -226,6 +235,18 @@ def _check_ip_recursive(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *
         if teredo is not None:
             _check_ip_recursive(teredo[0], depth=depth + 1)
             _check_ip_recursive(teredo[1], depth=depth + 1)
+
+        # Detección de direcciones IPv4 encapsuladas en ISATAP (RFC 5214, interfaz ::5efe:w.x.y.z
+        # o ::0200:5efe:w.x.y.z bajo cualquier prefijo unicast) y SIIT (::ffff:0:w.x.y.z).
+        raw_int = int(ip_obj)
+        isatap_marker = (raw_int >> 32) & 0xFFFFFFFF
+        if (isatap_marker & 0xFCFFFFFF) == 0x00005EFE:
+            embedded_v4 = ipaddress.IPv4Address(raw_int & 0xFFFFFFFF)
+            _check_ip_recursive(embedded_v4, depth=depth + 1)
+        elif (raw_int >> 32) == 0xFFFF0000:
+            # RFC 2765 SIIT IPv4-translated (::ffff:0:w.x.y.z/96)
+            embedded_v4 = ipaddress.IPv4Address(raw_int & 0xFFFFFFFF)
+            _check_ip_recursive(embedded_v4, depth=depth + 1)
 
     if unsafe_reasons:
         reasons_str = ", ".join(dict.fromkeys(unsafe_reasons))

@@ -253,6 +253,7 @@ class WebSourceDocument:
         """Serializa el resultado a tipos primitivos JSON-compatibles."""
         data = asdict(self)
         data["status"] = self.status.value
+        data["trust_level"] = "untrusted_external_content"
         return data
 
 
@@ -326,6 +327,7 @@ class WebExtractionReport:
         return {
             "mode": self.mode,
             "status": self.status.value,
+            "trust_level": "untrusted_external_content",
             "query": self.query,
             "search_provider": self.search_provider,
             "extracted_at": self.extracted_at,

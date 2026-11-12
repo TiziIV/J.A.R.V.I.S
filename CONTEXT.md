@@ -784,3 +784,45 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 - **Proveedor de búsqueda programático:** no existe uno configurado por defecto en el repositorio (`UnconfiguredSearchProvider`), por lo que el modo `query` requiere conectar una implementación concreta de `SearchProvider`.
 - **Interceptación TLS local del antivirus del host (observada empíricamente):** en este entorno Windows, Avast Web/Mail Shield intercepta conexiones TLS loopback en sockets OS sustituyendo CA efímeras desconocidas por `CN=Avast Web/Mail Shield Untrusted Root`. Por ello, las pruebas de socket TLS real verificaron la conexión a IP pinneada, el envío de SNI real y el rechazo estricto por verificación TLS (`TLS_ERROR`), mientras que la aceptación positiva de certificado bajo `CERT_REQUIRED` + `check_hostname=True` con la CA efímera de prueba se verificó en memoria mediante `ssl.SSLContext.wrap_bio` (`OpenSSL MemoryBIO`).
 - **Alcance de red externa:** todas las pruebas de transporte ejecutadas fueron reproducibles en red local controlada (servidores TCP/TLS locales efímeros), sin consultas hacia Internet público en vivo.
+
+---
+
+## Hardening de Seguridad del Paso #3.B (`WebExtractionSkill`) — Remediación F-01 a F-07 (2026-11-12)
+
+### 1. Hallazgos Resueltos y Archivos Modificados
+
+- Prompt completo registrado en `prompts_history.txt` (`HARDENING DE SEGURIDAD DEL PASO #3.B (WEB EXTRACTION SKILL)`).
+- Archivos modificados en este paso:
+  - `skills/web_document_converter.py`: remediación **F-01** (`_MD_BLOCK_SPOOF_RE` actualizado a `\[\^?[^\]]+\]:` para neutralizar definiciones de citas con y sin `^` sin afectar tablas Markdown; `_sanitize_markdown_url()` para percent-encoding de paréntesis, corchetes, espacios y delimitadores en URLs antes de interpolar en enlaces Markdown).
+  - `skills/web_parser.py`:
+    - Remediación **F-01**: percent-encoding de caracteres peligrosos para enlaces Markdown (`_URL_UNSAFE_CHAR_MAP`) y rechazo de caracteres de control en `normalize_extracted_url()`.
+    - Remediación **F-02**: separación de `_head_depth` y `_body_started` respecto de `_ignored_depth` en `_StructuredHTMLParser`; bloqueo de inyección/sobrescritura de `<title>`, `<meta>`, `<link rel="canonical">`, `<base href>` y JSON-LD desde `<template>`, `<noscript>`, nodos `hidden`/`aria-hidden`, zonas de ruido (`footer`, `nav`, `aside`) y `<body>`; restricción de `<base href>` a `<head>` con validación same-origin (`_has_same_origin` y advertencia `CROSS_ORIGIN_BASE_IGNORED`).
+    - Remediación **F-04 (Parte A)**: aplicación de `max_normalized_chars` como presupuesto compartido al construir `headings`, `paragraphs`, `lists`, `sections` y `normalized_text`.
+    - Remediación **F-05**: filtrado de elementos ocultos por CSS inline (`_HIDDEN_STYLE_RE`, `_is_hidden_style`) y limpieza de controles bidireccionales Unicode y bloque Unicode Tags (`\U000e0000-\U000e007f`).
+  - `skills/web_security.py`:
+    - Remediación **F-03 (Parte B)**: atributos `final_url` y `redirect_chain` en `WebSecurityError`.
+    - Remediación **F-04 (Parte B)**: desempaquetado y validación recursiva de direcciones IPv4 embebidas en IPv6 ISATAP (`::5efe:w.x.y.z` / `::0200:5efe:w.x.y.z`) y SIIT (`::ffff:0:w.x.y.z`).
+  - `skills/web_fetcher.py`:
+    - Remediación **F-03**: verificación de `_decompressor.eof` y ausencia de colas residuales tras `flush()` en `_IncrementalBoundedDecompressor.finish()`, rechazando streams `gzip`/`deflate` truncados con `UnsupportedEncodingError` sin rechazar respuestas vacías válidas; preservación de `final_url` y `redirect_chain` en `WebFetchError` y `WebSecurityError` tras redirecciones.
+    - Remediación **F-06 (Parte A)**: no reintentar excepciones genéricas no tipadas en `_fetch_single_hop_with_retries()` y verificar presupuesto de `deadline` antes de reintentar `WebFetchError` transitorios.
+  - `skills/web_models.py`: remediación **F-05** (`"trust_level": "untrusted_external_content"` en `WebSourceDocument.to_dict()` y `WebExtractionReport.to_dict()`).
+  - `skills/web_extraction_skill.py`:
+    - Remediación **F-03**: preservación de `final_url` y `redirect_chain` en `WebSourceDocument` y `WebIssue` cuando falla un salto posterior a redirección.
+    - Remediación **F-05**: neutralización de prefijos de suplantación de rol/acción JSON en `_format_human_summary()` y método `build_llm_envelope()` que separa directivas del sistema respecto de `untrusted_data`.
+    - Remediación **F-06 (Parte B)**: deduplicación canónica conservadora (`_canonical_url_dedup_key`) antes de aplicar `max_pages`.
+  - `src/brain/intent_router.py`:
+    - Remediación **F-05**: directiva explícita de aislamiento de datos externos en `_build_system_prompt()`.
+    - Remediación **F-06 (Parte C)**: fast-path determinista en `detect_local_skill()` para órdenes explícitas de extracción web con URLs `https?://`.
+  - `tests/test_web_extraction_skill.py`: clase `TestSecurityHardeningF01ToF06` con 6 pruebas integrales de regresión (`test_f01` a `test_f06`).
+  - `docs/audits/AUDIT_PASO_3B_WEB_EXTRACTION_SKILL.md` y `docs/audits/REMEDIATION_PASO_3B_WEB_EXTRACTION_SKILL.md`: informe de auditoría independiente e informe de remediación técnica (incluyendo **F-07** documentado como limitación del entorno Windows/Avast Web Shield sin debilitar TLS).
+
+### 2. Verificación Realmente Ejecutada
+
+- `.\venv\Scripts\python.exe -m py_compile` sobre todos los módulos modificados y pruebas: **0 errores**.
+- `.\venv\Scripts\python.exe -m unittest -v tests.test_web_extraction_skill`: **22 pruebas ejecutadas, 22 aprobadas (0 fallos, 0 errores)**.
+- `.\venv\Scripts\python.exe -m unittest -v tests.test_document_export_skill`: **41 pruebas ejecutadas, 38 aprobadas, 3 omitidas por privilegios de symlink en Windows (0 fallos, 0 errores)**.
+- Suites N5 (`tests.test_memory_isolation`, `tests.test_transaction_recovery`, `tests.test_file_editor_and_chain`, `tests.test_intent_router_chaos`): **100% OK**.
+- Suite global (`.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"`): **529 pruebas ejecutadas en 96.895s — OK (0 fallos, 0 errores, 3 omitidas)**.
+- `.\venv\Scripts\python.exe main.py --help`: **OK (código 0)**.
+- `data/memory_store.json`: verificado solo por metadatos (**1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`, intacto).
+- Los 16 archivos preexistentes sucios/no rastreados de N5/memoria y los módulos cerrados del Paso #3.A permanecen intactos.
