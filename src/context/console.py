@@ -110,7 +110,8 @@ class ContextConsoleHandler:
                         ContextCategory.HARDWARE,
                         ContextCategory.RESOURCES,
                         ContextCategory.STORAGE,
-                    ]
+                    ],
+                    refresh_resources=True,
                 )
                 report = self.format_snapshot(snap)
                 active_out(f"JARVIS:\n{report}")
@@ -188,7 +189,7 @@ class ContextConsoleHandler:
             active_out(f"JARVIS: {msg}")
             return msg
 
-        except ContextError as err:
+        except (ContextError, PermissionError, OSError) as err:
             msg = f"Consulta contextual rechazada o no disponible: {err}"
             active_out(f"JARVIS: {msg}")
             return msg
@@ -199,6 +200,10 @@ class ContextConsoleHandler:
             f"[Contexto N7 — Snapshot {snapshot.snapshot_id} | Solo lectura verificada]",
             f"Categorías consultadas: {', '.join(snapshot.requested_categories)}",
         ]
+        if snapshot.cached_categories:
+            lines.append(
+                f"Categorías servidas desde caché TTL: {', '.join(snapshot.cached_categories)}"
+            )
 
         if snapshot.system is not None:
             s = snapshot.system

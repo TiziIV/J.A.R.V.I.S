@@ -37,15 +37,32 @@ class BrainErrorKind(str, Enum):
     UNKNOWN = "unknown"                  # Cualquier otro error no clasificado.
 
 
-# Patrones de posibles claves API para asegurarnos de que jamás aparezcan en logs ni excepciones.
+# Patrones de posibles claves API, tokens, credenciales cloud y parámetros URL sensibles
+# para garantizar que jamás aparezcan en logs, snapshots de contexto ni excepciones.
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"sk-[A-Za-z0-9_\-]{12,}"),
-    re.compile(r"AIza[0-9A-Za-z_\-]{12,}"),
-    re.compile(r"AQ\.[0-9A-Za-z_\-]{16,}"),
-    re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    # Claves Anthropic y OpenAI (incluyendo sk-proj-*, sk-ant-*)
+    re.compile(r"(?i)\bsk-ant-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)\bsk-[A-Za-z0-9_\-]{12,}"),
+    # Claves Google Cloud / Gemini
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{12,}"),
+    re.compile(r"\bAQ\.[0-9A-Za-z_\-]{16,}"),
+    # Tokens de GitHub (PAT clásicos ghp_/gho_/ghu_/ghs_/ghr_ y fine-grained github_pat_)
+    re.compile(r"(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
+    # Access Key IDs de AWS (AKIA / ASIA, insensible a mayúsculas/minúsculas)
+    re.compile(r"(?i)\b(?:akia|asia)[0-9a-z]{12,20}\b"),
+    # Tokens de Slack, GitLab y Hugging Face
+    re.compile(r"(?i)\b(?:xox[baprs]-[A-Za-z0-9\-]{10,}|glpat-[A-Za-z0-9_\-]{10,}|hf_[A-Za-z0-9]{16,})\b"),
+    # Encabezados y esquemas Authorization: Bearer <token> o Bearer <token>
+    re.compile(r"(?i)\b(?:authorization\s*[:=]\s*)?bearer\s+[A-Za-z0-9_\-\.~+/]{6,}=*"),
+    # JSON Web Tokens (JWT eyJ... con tres segmentos base64url)
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{2,}\.[A-Za-z0-9_\-]{2,}\b"),
+    # Parámetros sensibles en query strings URL (?token=..., &access_token=..., ?api_key=...)
     re.compile(
-        r"(?i)(api[_\-]?key|x-api-key|authorization|bearer|access[_\-]?token|refresh[_\-]?token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_\-\.]{8,}['\"]?"
+        r"(?i)([?&](?:token|access[_\-]?token|refresh[_\-]?token|id[_\-]?token|api[_\-]?key|apikey|secret|password|passwd|pwd|auth[_\-]?token|client[_\-]?secret|sig|signature)\s*=\s*)[^&\s'\"<>]+"
+    ),
+    # Asignaciones clave=valor o clave: valor (api_key, token, secret, password, authorization, etc.)
+    re.compile(
+        r"(?i)\b(api[_\-]?key|apikey|x-api-key|authorization|access[_\-]?token|refresh[_\-]?token|id[_\-]?token|auth[_\-]?token|client[_\-]?secret|private[_\-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-\.~+/]{6,}['\"]?"
     ),
 )
 

@@ -54,13 +54,41 @@ FORBIDDEN_CONTEXT_FILENAMES: frozenset[str] = frozenset(
         ".env.development",
         ".env.production",
         ".env.test",
+        ".env.staging",
         "prompts_history.txt",
         "memory_store.json",
         "credentials.json",
         "token.json",
         "auth.json",
+        "secrets.json",
+        "secret.json",
+        "secrets.yaml",
+        "secrets.yml",
+        "secrets.toml",
+        "secrets.ini",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".git-credentials",
+        ".dockerconfigjson",
+        "file_editor_audit.jsonl",
+        "jarvis_system.log",
         "id_rsa",
         "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        "authorized_keys",
+        "known_hosts",
+        "login data",
+        "login data for account",
+        "cookies",
+        "web data",
+        "local state",
+        "key4.db",
+        "logins.json",
+        "cert9.db",
+        "vault.db",
+        "ntuser.dat",
     }
 )
 
@@ -70,6 +98,70 @@ FORBIDDEN_CONTEXT_EXTENSIONS: tuple[str, ...] = (
     ".pfx",
     ".p12",
     ".kdbx",
+    ".jks",
+    ".keystore",
+    ".ovpn",
+    ".gpg",
+    ".asc",
+    ".der",
+    ".cer",
+    ".crt",
+    ".log",
+)
+
+# Sufijos de respaldo/temporales que no deben permitir evadir la detección de archivos sensibles.
+_BACKUP_OR_TEMP_SUFFIXES: tuple[str, ...] = (
+    ".bak",
+    ".backup",
+    ".old",
+    ".orig",
+    ".tmp",
+    ".swp",
+    ".save",
+    ".copy",
+)
+
+# Nombres de directorios sensibles bloqueados en cualquier nivel para consultas N7 (F3).
+FORBIDDEN_CONTEXT_DIR_NAMES: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".gnupg",
+        ".password-store",
+        ".docker",
+        "credentials",
+        "secrets",
+        "keyrings",
+        "wallets",
+        "user data",
+    }
+)
+
+# Subárboles relativos o de perfil de usuario bloqueados específicamente en N7 (F3)
+# sin alterar las raíces autorizadas compartidas con N5 (`FileEditorSkill`).
+FORBIDDEN_CONTEXT_SUBTREES: tuple[str, ...] = (
+    "data/goals",
+    "data/transactions",
+    "data/backups",
+    "data/memory",
+    "backups",
+    "microsoft/credentials",
+    "microsoft/protect",
+    "microsoft/vault",
+    "microsoft/crypto",
+    "google/chrome/user data",
+    "microsoft/edge/user data",
+    "bravesoftware/brave-browser/user data",
+    "vivaldi/user data",
+    "opera software/opera stable",
+    "mozilla/firefox/profiles",
+    "1password",
+    "bitwarden",
+    "keepass",
+    "gcloud",
 )
 
 # Operaciones mutantes o administrativas estrictamente prohibidas en N7.
@@ -139,28 +231,111 @@ _CONTROL_AND_BIDI_RE: re.Pattern[str] = re.compile(
     r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\U000e0000-\U000e007f]+"
 )
 
-# Patrones de suplantación de rol o inyección de instrucciones en nombres del sistema.
+# Patrones de suplantación de rol, delimitadores o inyección de instrucciones en nombres del sistema (F4).
 _INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)\b(?:ignore|ignora|disregard|olvida)\s+(?:all\s+|todas\s+las\s+)?(?:previous\s+|anteriores\s+)?(?:instructions|instrucciones)"),
-    re.compile(r"(?i)\b(?:system|assistant|developer|user)\s*:"),
-    re.compile(r"(?i)\{\s*['\"]?(?:action|tool|skill_name|command)['\"]?\s*:"),
+    # Instrucciones de anulación o evasión en inglés y español (con variantes y sinónimos)
+    re.compile(
+        r"(?i)\b(?:ignore|ignora|ignorar|ignoren|disregard|forget|olvida|olvidar|omite|omitir|"
+        r"descarta|descartar|desobedece|desobedecer|anula|anular|bypass|override|salta|saltear|"
+        r"reemplaza|sobrescribe)\s+"
+        r"(?:all\s+|any\s+|todas\s+las\s+|todos\s+los\s+|las\s+|los\s+|cualquier\s+)?"
+        r"(?:previous\s+|prior\s+|above\s+|system\s+|safety\s+|security\s+|"
+        r"anteriores\s+|previas\s+|previos\s+|del\s+sistema\s+|de\s+seguridad\s+)?"
+        r"(?:instructions|instrucciones|rules|reglas|policies|pol[ií]ticas|constraints|"
+        r"restricciones|directives|directivas|orders|[oó]rdenes|prompts|guidelines|l[ií]mites)"
+    ),
+    # Etiquetas o delimitadores XML/HTML/corchetes de cierre o apertura de evidencia/sistema
+    re.compile(
+        r"(?i)<\s*/?\s*(?:evidencia[a-z0-9_]*|untrusted[a-z0-9_]*|system|assistant|developer|"
+        r"user|instruction[s]?|prompt|context[o]?|tool[a-z0-9_]*|function[a-z0-9_]*)\b[^>]*>"
+    ),
+    re.compile(
+        r"(?i)\[\s*/?\s*(?:evidencia[a-z0-9_]*|untrusted[a-z0-9_]*|system|assistant|developer|inst)\b[^\]]*\]"
+    ),
+    # Marcadores especiales de tokens de control de LLM (<|system|>, <|im_start|>, <<SYS>>, ### System:)
+    re.compile(
+        r"(?i)(?:<\|[a-z0-9_:\-]+\|>|<<\s*/?\s*sys\s*>>|###\s*(?:system|instruction[s]?|assistant|user|developer|sistema|instrucci[oó]n)\b\s*:?)"
+    ),
+    # Indicadores de rol directos en inglés y español
+    re.compile(r"(?i)\b(?:system|assistant|developer|user|sistema|asistente|desarrollador)\s*:"),
+    # Objetos o fragmentos JSON que simulan invocación de herramientas o comandos
+    re.compile(
+        r"(?i)\{\s*['\"]?(?:action|tool|tool_name|skill_name|command|function|function_call|tool_calls|arguments|skill_params)['\"]?\s*:"
+    ),
+    re.compile(
+        r"(?i)['\"]?(?:tool_name|skill_name|function_call|tool_calls)['\"]?\s*:\s*['\"][a-z0-9_.\-]+['\"]"
+    ),
+    # Órdenes directas de ejecución de herramientas críticas infiltradas en etiquetas
+    re.compile(
+        r"(?i)\b(?:ejecuta|ejecutar|invoca|invocar|run|execute|invoke|call)\s+"
+        r"(?:la\s+herramienta\s+|la\s+skill\s+|el\s+comando\s+|tool\s+|skill\s+|command\s+)?"
+        r"(?:file_editor|system_power|app_launcher|chain_orchestrator|policy_engine|powershell|cmd\.exe)\b"
+    ),
 )
 
 
+def _check_single_sensitive_basename(clean_name: str) -> bool:
+    """Evalúa si un nombre base normalizado (sin sufijos ADS ni puntos finales) es sensible."""
+    if not clean_name:
+        return False
+    if clean_name in FORBIDDEN_CONTEXT_FILENAMES:
+        return True
+    if clean_name.startswith(".env.") or clean_name.endswith(".env"):
+        if clean_name not in {".env.example", ".env.template", ".env.sample", ".env.dist"}:
+            return True
+    if any(clean_name.endswith(ext) for ext in FORBIDDEN_CONTEXT_EXTENSIONS):
+        return True
+    if clean_name.startswith(("client_secret", "service_account", "gcloud_credentials", "firebase-adminsdk")):
+        return True
+    if clean_name.endswith(
+        (
+            "_secret.json",
+            "_secrets.json",
+            "-secret.json",
+            "-secrets.json",
+            "_credentials.json",
+            "_token.json",
+            "_audit.jsonl",
+            ".wal.jsonl",
+            ".goal.json",
+            ".tx.json",
+        )
+    ):
+        return True
+    return False
+
+
 def is_sensitive_context_filename(filename: str) -> bool:
-    """Determina si un nombre de archivo corresponde a un secreto o almacén privado."""
-    name_low = (filename or "").strip().lower()
+    """Determina si un nombre de archivo corresponde a un secreto, ADS o almacén privado (F1, F3).
+
+    - Rechaza de forma conservadora cualquier nombre con sintaxis de Alternate Data Stream (`:`).
+    - Normaliza espacios y puntos finales de Windows antes de evaluar las listas de exclusión.
+    - Detecta copias de respaldo (`.bak`, `.old`, `.tmp`, etc.) de archivos sensibles.
+    """
+    raw_clean = (filename or "").strip().lower()
+    if not raw_clean:
+        return False
+
+    # F1: Cualquier presencia de ':' en un nombre de archivo indica un Alternate Data Stream (ADS)
+    # o sintaxis no permitida fuera del identificador de unidad; se rechaza conservadoramente.
+    if ":" in raw_clean:
+        return True
+
+    name_low = raw_clean.rstrip(". ")
     if not name_low:
         return False
-    if name_low in FORBIDDEN_CONTEXT_FILENAMES:
+
+    if _check_single_sensitive_basename(name_low):
         return True
-    if name_low.startswith(".env.") or name_low.endswith(".env"):
-        if name_low not in {".env.example", ".env.template", ".env.sample", ".env.dist"}:
-            return True
-    if any(name_low.endswith(ext) for ext in FORBIDDEN_CONTEXT_EXTENSIONS):
-        return True
-    if name_low.startswith("client_secret") and name_low.endswith(".json"):
-        return True
+
+    # Evitar evasión mediante sufijos de backup/temporales (ej. credentials.json.bak, .env.old)
+    stripped = name_low
+    for suffix in _BACKUP_OR_TEMP_SUFFIXES:
+        if stripped.endswith(suffix) and len(stripped) > len(suffix):
+            stripped = stripped[: -len(suffix)].rstrip(". ")
+            if _check_single_sensitive_basename(stripped):
+                return True
+
     return False
 
 
@@ -361,20 +536,131 @@ class ContextAccessPolicy:
         return tuple(result)
 
     @staticmethod
-    def is_reparse_point_or_symlink(path_obj: Path) -> bool:
-        """Comprueba sin seguir el destino si una ruta es symlink, junction NTFS o reparse point."""
+    def is_stat_reparse_or_symlink(st: Any, path_obj: Optional[Path] = None) -> bool:
+        """Evalúa sobre un `stat_result` de `lstat` si corresponde a symlink, junction o reparse point (F5)."""
         try:
-            if path_obj.is_symlink():
-                return True
-            st = os.lstat(path_obj)
-            if stat.S_ISLNK(st.st_mode):
+            mode = getattr(st, "st_mode", 0)
+            if isinstance(mode, int) and stat.S_ISLNK(mode):
                 return True
             file_attrs = getattr(st, "st_file_attributes", 0)
             if isinstance(file_attrs, int) and (file_attrs & FILE_ATTRIBUTE_REPARSE_POINT):
                 return True
+            if path_obj is not None:
+                if path_obj.is_symlink():
+                    return True
+                if hasattr(os.path, "isjunction") and os.path.isjunction(path_obj):
+                    return True
+        except OSError:
+            return True
+        return False
+
+    @classmethod
+    def is_reparse_point_or_symlink(cls, path_obj: Path) -> bool:
+        """Comprueba sin seguir el destino si una ruta es symlink, junction NTFS o reparse point."""
+        try:
+            if path_obj.is_symlink():
+                return True
+            if hasattr(os.path, "isjunction") and os.path.isjunction(path_obj):
+                return True
+            st = os.lstat(path_obj)
+            return cls.is_stat_reparse_or_symlink(st, path_obj)
         except OSError:
             return False
+
+    def is_forbidden_context_subpath(
+        self,
+        path_obj: Path,
+        auth_root: Optional[Path] = None,
+    ) -> bool:
+        """Determina si una ruta pertenece a un directorio o subárbol sensible excluido en N7 (F3)."""
+        try:
+            rel_parts = (
+                path_obj.relative_to(auth_root).parts
+                if auth_root is not None
+                else path_obj.parts[1:]
+            )
+        except ValueError:
+            rel_parts = path_obj.parts[1:]
+
+        norm_parts: list[str] = []
+        for raw_part in rel_parts:
+            clean_part = raw_part.strip().rstrip(". ").lower()
+            if not clean_part:
+                continue
+            norm_parts.append(clean_part)
+            if clean_part in FORBIDDEN_CONTEXT_DIR_NAMES:
+                return True
+            if is_sensitive_context_filename(raw_part):
+                return True
+
+        rel_posix = "/".join(norm_parts)
+        full_posix = "/".join(
+            p.strip().rstrip(". ").lower() for p in path_obj.parts[1:] if p.strip()
+        )
+        for subtree in FORBIDDEN_CONTEXT_SUBTREES:
+            sub_low = subtree.strip("/").lower()
+            if rel_posix == sub_low or rel_posix.startswith(sub_low + "/"):
+                return True
+            if (
+                full_posix == sub_low
+                or full_posix.startswith(sub_low + "/")
+                or full_posix.endswith("/" + sub_low)
+                or f"/{sub_low}/" in full_posix
+            ):
+                return True
+
         return False
+
+    def _assert_path_node_safe(self, path_obj: Path) -> None:
+        """Verifica con `lexists`/`lstat` que un nodo no sea symlink/junction ni lance PermissionError (F2, F5)."""
+        try:
+            if path_obj.is_symlink():
+                raise ContextAccessDeniedError(
+                    f"Ruta rechazada: se detectó un enlace simbólico en '{path_obj.name}'."
+                )
+            if hasattr(os.path, "isjunction") and os.path.isjunction(path_obj):
+                raise ContextAccessDeniedError(
+                    f"Ruta rechazada: se detectó un junction NTFS en '{path_obj.name}'."
+                )
+        except ContextAccessDeniedError:
+            raise
+        except PermissionError as exc:
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por permisos del sistema operativo en '{path_obj.name}'."
+            ) from exc
+        except OSError as exc:
+            raise ContextAccessDeniedError(
+                f"No fue posible verificar de forma segura '{path_obj.name}' ({type(exc).__name__})."
+            ) from exc
+
+        try:
+            st = os.lstat(path_obj)
+        except FileNotFoundError:
+            # Si lstat reporta FileNotFoundError pero lexists es True, se trata de un enlace/reparse roto.
+            try:
+                still_lexists = os.path.lexists(path_obj)
+            except OSError as exc:
+                raise ContextAccessDeniedError(
+                    f"Acceso denegado al comprobar existencia de '{path_obj.name}'."
+                ) from exc
+            if still_lexists:
+                raise ContextAccessDeniedError(
+                    f"Ruta rechazada: se detectó un enlace o junction NTFS roto en '{path_obj.name}'."
+                )
+            return
+        except PermissionError as exc:
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por permisos del sistema operativo en '{path_obj.name}'."
+            ) from exc
+        except OSError as exc:
+            raise ContextAccessDeniedError(
+                f"Error de acceso al inspeccionar '{path_obj.name}' ({type(exc).__name__})."
+            ) from exc
+
+        if self.is_stat_reparse_or_symlink(st, path_obj):
+            raise ContextAccessDeniedError(
+                f"Ruta rechazada: se detectó un enlace simbólico o junction NTFS en '{path_obj.name}'."
+            )
 
     def validate_read_path(
         self,
@@ -403,6 +689,13 @@ class ContextAccessPolicy:
                 "Ruta rechazada: no se permiten rutas de red UNC ni dispositivos directos."
             )
 
+        # F1: Rechazar Alternate Data Streams (ADS) o cualquier ':' fuera del prefijo de unidad ('C:\')
+        rest_after_drive = raw_str[2:] if re.match(r"^[A-Za-z]:[\\/]", raw_str) else raw_str
+        if ":" in rest_after_drive:
+            raise ContextAccessDeniedError(
+                "Ruta rechazada: no se permiten flujos de datos alternativos NTFS (ADS) ni ':' en segmentos."
+            )
+
         candidate = Path(raw_str)
         if ".." in candidate.parts:
             raise ContextAccessDeniedError(
@@ -414,31 +707,37 @@ class ContextAccessPolicy:
                 "Ruta rechazada: el proveedor de archivos exige rutas absolutas explícitas."
             )
 
-        for part in candidate.parts:
+        for idx, part in enumerate(candidate.parts):
+            if idx > 0 and ":" in part:
+                raise ContextAccessDeniedError(
+                    f"Ruta rechazada: se detectó sintaxis de Alternate Data Stream (ADS) en '{part}'."
+                )
             stem_upper = part.split(".")[0].strip().upper()
             if stem_upper in WINDOWS_RESERVED_NAMES:
                 raise ContextAccessDeniedError(
                     f"Ruta rechazada: '{part}' es un nombre de dispositivo reservado de Windows."
                 )
-            if is_sensitive_context_filename(part):
-                raise ContextAccessDeniedError(
-                    f"Acceso denegado por privacidad: '{part}' es un archivo sensible protegido."
-                )
+            if idx > 0:
+                clean_seg = part.strip().rstrip(". ").lower()
+                if clean_seg in FORBIDDEN_CONTEXT_DIR_NAMES:
+                    raise ContextAccessDeniedError(
+                        f"Acceso denegado por privacidad: el directorio '{part}' está excluido en N7."
+                    )
+                if is_sensitive_context_filename(part):
+                    raise ContextAccessDeniedError(
+                        f"Acceso denegado por privacidad: '{part}' es un archivo sensible protegido."
+                    )
 
-        # Inspeccionar enlaces simbólicos o junctions NTFS en la ruta y todos sus ancestros
+        # Inspeccionar enlaces simbólicos, junctions NTFS (incluyendo rotos) y permisos en la ruta y ancestros
         current_check: Path = candidate
         visited: set[str] = set()
         while True:
             key = str(current_check)
-            if key in visited:
+            if key in visited or current_check.parent == current_check:
                 break
             visited.add(key)
-            if current_check.exists() or current_check.is_symlink():
-                if self.is_reparse_point_or_symlink(current_check):
-                    raise ContextAccessDeniedError(
-                        f"Ruta rechazada: se detectó un enlace simbólico o junction NTFS en '{current_check.name}'."
-                    )
-            if current_check.parent == current_check:
+            self._assert_path_node_safe(current_check)
+            if current_check in self.authorized_roots:
                 break
             current_check = current_check.parent
 
@@ -446,6 +745,10 @@ class ContextAccessPolicy:
             resolved = candidate.resolve(strict=must_exist)
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"La ruta solicitada no existe: '{candidate.name}'.") from exc
+        except PermissionError as exc:
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por permisos al resolver la ruta '{candidate.name}'."
+            ) from exc
         except OSError as exc:
             raise ContextAccessDeniedError(
                 f"No fue posible resolver de forma segura la ruta solicitada ({type(exc).__name__})."
@@ -479,16 +782,34 @@ class ContextAccessPolicy:
                 "Acceso denegado: la ruta se encuentra fuera de las raíces autorizadas de J.A.R.V.I.S."
             )
 
+        # F3: Verificar exclusión de subárboles y directorios sensibles sobre la ruta canónica resuelta
+        if self.is_forbidden_context_subpath(resolved, matching_root):
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por privacidad: '{resolved.name}' pertenece a una ubicación sensible excluida en N7."
+            )
+
         # Segunda verificación de la cadena canónica entre matching_root y resolved
         chain_cursor: Path = resolved
         while chain_cursor != matching_root and chain_cursor.parent != chain_cursor:
-            if (chain_cursor.exists() or chain_cursor.is_symlink()) and self.is_reparse_point_or_symlink(chain_cursor):
-                raise ContextAccessDeniedError(
-                    f"Ruta rechazada: se detectó redirección o enlace simbólico en '{chain_cursor.name}'."
-                )
+            self._assert_path_node_safe(chain_cursor)
             chain_cursor = chain_cursor.parent
 
-        if must_exist and not resolved.exists():
-            raise FileNotFoundError(f"La ruta solicitada no existe: '{resolved.name}'.")
+        if must_exist:
+            try:
+                st_final = os.lstat(resolved)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"La ruta solicitada no existe: '{resolved.name}'.") from exc
+            except PermissionError as exc:
+                raise ContextAccessDeniedError(
+                    f"Acceso denegado por permisos en '{resolved.name}'."
+                ) from exc
+            except OSError as exc:
+                raise ContextAccessDeniedError(
+                    f"Error de sistema de archivos al verificar '{resolved.name}' ({type(exc).__name__})."
+                ) from exc
+            if self.is_stat_reparse_or_symlink(st_final, resolved):
+                raise ContextAccessDeniedError(
+                    f"Ruta rechazada: se detectó un enlace simbólico o junction NTFS en '{resolved.name}'."
+                )
 
         return resolved, matching_root

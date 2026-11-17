@@ -153,8 +153,14 @@ class GoalEngine:
         snapshot = self.context_engine.get_context_safe(
             categories=relevant_cats,
             target_paths=goal.context.target_paths or None,
+            target_app=goal.context.target_app or None,
+            include_windows=False,
+            refresh_resources=True,
         )
-        payload = self.context_engine.build_n6_context_payload(snapshot)
+        payload = self.context_engine.build_n6_context_payload(
+            snapshot,
+            target_app=goal.context.target_app or None,
+        )
 
         # Completa información real de hardware sin sobrescribir pistas explícitas del usuario.
         for hw_key, hw_val in (payload.get("hardware") or {}).items():

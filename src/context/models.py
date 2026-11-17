@@ -568,6 +568,7 @@ class ContextSnapshot:
     filesystem: Optional[FileSystemContextInfo] = None
     unavailable_fields: tuple[str, ...] = ()
     partial_errors: tuple[ProviderIssue, ...] = ()
+    cached_categories: tuple[str, ...] = ()
     read_only_verified: bool = True
 
     @property
@@ -589,5 +590,6 @@ class ContextSnapshot:
             "filesystem": self.filesystem.to_dict() if self.filesystem else None,
             "unavailable_fields": list(self.unavailable_fields),
             "partial_errors": [err.to_dict() for err in self.partial_errors],
+            "cached_categories": list(self.cached_categories),
             "read_only_verified": self.read_only_verified,
         }

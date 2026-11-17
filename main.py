@@ -411,8 +411,12 @@ def run_console_session(
                 or lowered == "/context"
                 or lowered.startswith("/context ")
             ):
-                ctx_handler = _ensure_context_handler()
-                ctx_reply = ctx_handler.handle_command(text, output_fn=output_fn)
+                try:
+                    ctx_handler = _ensure_context_handler()
+                    ctx_reply = ctx_handler.handle_command(text, output_fn=output_fn)
+                except Exception as ctx_err:
+                    ctx_reply = f"Consulta contextual rechazada o no disponible: {ctx_err}"
+                    output_fn(f"JARVIS: {ctx_reply}")
                 if tts_active and tts_engine is not None and ctx_reply:
                     try:
                         _speak_blocking(tts_engine, ctx_reply)

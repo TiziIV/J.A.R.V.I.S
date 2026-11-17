@@ -971,4 +971,45 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
   - **N7:** completada y verificada (2.ª fase del bloque actual; no se crea tag individual conforme a la regla de etiquetado cada 3 fases).
   - **N8:** no iniciada.
 
+---
+
+## Remediación de Auditoría de Seguridad N7 (Hallazgos F1–F6) y Actualización Documental (2026-11-17)
+
+### 1. Hallazgos Corregidos y Cambios Aplicados
+
+- Prompt completo registrado en `prompts_history.txt` (`PROYECTO J.A.R.V.I.S. — REMEDIACIÓN DE AUDITORÍA N7 (F1–F6) Y ACTUALIZACIÓN DOCUMENTAL`).
+- **F1 — Protección contra NTFS Alternate Data Streams (`src/context/policy.py`, `src/context/filesystem_provider.py`):**
+  - `is_sensitive_context_filename()` rechaza conservadoramente cualquier nombre que contenga `:` (como `.env:secretstream`, `credentials.json:backup`, `config.ini:stream`), normaliza puntos y espacios finales de Windows y detecta copias `.bak`/`.old`/`.tmp` de archivos sensibles.
+  - `ContextAccessPolicy.validate_read_path()` bloquea cualquier presencia de `:` fuera del especificador de unidad de Windows (`C:\`), impidiendo ADS tanto en el archivo hoja como en directorios intermedios.
+- **F2 — Junctions NTFS rotos y manejo resiliente de `PermissionError` / `OSError` (`src/context/policy.py`, `src/context/filesystem_provider.py`, `src/context/console.py`, `main.py`):**
+  - `_assert_path_node_safe()` reemplaza la comprobación previa basada en `exists()` por `is_symlink()`, `os.path.isjunction()`, `os.lstat()` y `os.path.lexists()`, detectando junctions NTFS rotos antes de `Path.resolve()` y convirtiendo `PermissionError` / `OSError` en `ContextAccessDeniedError`.
+  - `ContextConsoleHandler.handle_command()` y `main.py` capturan de forma controlada `(ContextError, PermissionError, OSError)` para que una ruta inaccesible jamás interrumpa el ciclo principal de consola, manteniendo el aislamiento de errores parciales entre proveedores.
+- **F3 — Exclusiones de subárboles y archivos sensibles específicas de N7 (`src/context/policy.py`, `src/context/filesystem_provider.py`):**
+  - Sin modificar las raíces compartidas de `FileEditorSkill` ni las políticas de N5, `ContextAccessPolicy` incorpora `FORBIDDEN_CONTEXT_DIR_NAMES`, `FORBIDDEN_CONTEXT_SUBTREES` y `is_forbidden_context_subpath()`, bloqueando en `inspect_path`, `list_directory` y `find_relevant_files` el acceso a `.git`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `data/goals`, `data/transactions`, `data/backups`, `file_editor_audit.jsonl`, `*.log`, `.npmrc`, `.netrc`, `secrets.json`, `secrets.yaml`, directorios `Credentials` y almacenes de navegadores (`User Data`, `Profiles`) así como cualquier ruta hija.
+- **F4 — Minimización en origen, no-persistencia de ventanas arbitrarias, redacción de secretos y anti-Prompt Injection (`src/context/engine.py`, `src/context/process_app_provider.py`, `src/context/policy.py`, `src/brain/exceptions.py`, `src/brain/goal_engine.py`, `src/brain/goal_persistence.py`):**
+  - `ApplicationAwarenessProvider.collect()` incorpora `include_windows` y `target_app`; cuando N6 solicita contexto para un objetivo (`_enrich_goal_with_n7_context`), pasa `include_windows=False` y `target_app` para no recolectar títulos de ventanas privadas desde el origen.
+  - `build_untrusted_envelope()` y `build_n6_context_payload()` eliminan la persistencia de `visible_windows`, `foreground_window` y `top_processes` en `.goal.json`, y `GoalStore` (`_VOLATILE_CONTEXT_KEYS`) los filtra defensivamente antes de guardar.
+  - `redact_secrets()` amplía `_SECRET_PATTERNS` para cubrir tokens `ghp_*` / `github_pat_*`, claves AWS `AKIA*` / `ASIA*` (insensible a mayúsculas/minúsculas), encabezados `Authorization: Bearer ...`, JWT (`eyJ...`), parámetros URL (`?token=`, `&access_token=`, `?api_key=`) y asignaciones `token=`.
+  - `sanitize_untrusted_label()` amplía `_INJECTION_PATTERNS` para neutralizar `</EVIDENCIA...>`, `<|system|>`, `<<SYS>>`, indicadores de rol en español e inglés, JSON con `"tool_name"` / `"function_call"` / `"skill_params"` y variantes en español (`omite/descarta/anula ... instrucciones/reglas/políticas`).
+- **F5 — Detección de reparse points sobre `stat_result` y mitigación TOCTOU (`src/context/policy.py`, `src/context/filesystem_provider.py`):**
+  - `inspect_path()`, `list_directory()` y `find_relevant_files()` eliminan llamadas previas a `Path.exists()`/`is_dir()` y verifican `is_stat_reparse_or_symlink(st)` (`stat.S_ISLNK` y `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`) directamente sobre el resultado de `os.lstat()` y `entry.stat(follow_symlinks=False)`.
+- **F6 — Coalescencia de caché concurrente, frescura de `RESOURCES` y descubrimiento de aplicaciones (`src/context/engine.py`, `src/context/process_app_provider.py`, `src/context/console.py`, `src/context/models.py`, `src/brain/goal_engine.py`):**
+  - `ProcessAwarenessProvider.collect()` permite a `ApplicationAwarenessProvider` consultar hasta `max(max_processes, max_applications * 4)` procesos para que `max_processes` no trunque aplicaciones en ejecución.
+  - `ContextAwarenessEngine` implementa locks por categoría (`_category_locks`) con doble verificación para coalescer solicitudes concurrentes ante un cache miss en una única recolección sin bloquear categorías independientes.
+  - Las consultas generales de `/contexto` y de N6 usan `refresh_resources=True` para obtener métricas `RESOURCES` frescas sin quedar retenidas por el TTL de 5 s, registrando en `snapshot.cached_categories` cualquier categoría servida desde caché.
+- **Documentación actualizada:** `README.md`, `docs/N7_CONTEXT_AWARENESS_ENGINE.md` y `CONTEXT.md`.
+- **Pruebas nuevas:** añadidas `test_21` a `test_26` en `tests/test_context_awareness_n7.py` (total N7: **26 pruebas**; total global: **586 pruebas**).
+
+### 2. Verificaciones Realmente Ejecutadas (Remediación N7 F1–F6)
+
+- Compilación estática (`.\venv\Scripts\python.exe -m py_compile` sobre todos los módulos modificados y pruebas): **0 errores (código 0)**.
+- Suite específica N7 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_context_awareness_n7 -v`): **26 pruebas ejecutadas en 12.654s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suites de regresión N6 + N5 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_goal_engine tests.test_file_editor_and_chain tests.test_transaction_recovery tests.test_memory_isolation -v`): **154 pruebas ejecutadas en 77.072s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"`): **586 pruebas ejecutadas en 127.827s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- `.\venv\Scripts\python.exe main.py --help` y verificación de no-carga de módulos de audio al importar y usar N7: **OK (código 0, `audio_modules_loaded: []`)**.
+- Integridad de `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (idéntico antes y después de todas las pruebas).
+- Auditoría `GitSafetyGuard`: `find_tracked_sensitive_files() == []`, `0` secretos detectados en diff/archivos candidatos y `prompts_history.txt` excluido de Git.
+
+
+
 

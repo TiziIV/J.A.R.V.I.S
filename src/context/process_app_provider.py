@@ -207,9 +207,17 @@ class ProcessAwarenessProvider:
         self.policy.assert_read_only_operation("collect_processes")
         now_iso = utc_now_iso()
 
+        # F6.A: Cuando se solicita explícitamente un max_results (p. ej. desde ApplicationAwarenessProvider),
+        # permitir hasta max(max_processes, max_applications * 4) para que el límite de procesos
+        # no trunque prematuramente las aplicaciones de usuario detectables.
+        upper_cap = (
+            max(self.policy.max_processes, self.policy.max_applications * 4)
+            if max_results is not None
+            else self.policy.max_processes
+        )
         limit = min(
             max(1, int(max_results)) if max_results is not None else self.policy.max_processes,
-            self.policy.max_processes,
+            upper_cap,
         )
         name_query = (filter_name or "").strip().lower()
 
@@ -352,15 +360,28 @@ class ApplicationAwarenessProvider:
         self._isfile_fn = isfile_fn
         self._window_enumerator = window_enumerator
 
-    def collect(self) -> ApplicationAwarenessInfo:
-        """Diferencia aplicaciones instaladas, aplicaciones en ejecución y ventanas activas."""
+    def collect(
+        self,
+        *,
+        include_windows: bool = True,
+        target_app: Optional[str] = None,
+    ) -> ApplicationAwarenessInfo:
+        """Diferencia aplicaciones instaladas, aplicaciones en ejecución y ventanas activas.
+
+        Args:
+            include_windows: Si es False, omite desde el origen la enumeración de títulos de
+                ventanas de escritorio (minimización F4 cuando solo se requiere estado de apps).
+            target_app: Si se especifica, filtra los resultados únicamente a la aplicación
+                solicitada evitando recolectar o exponer aplicaciones ajenas al objetivo.
+        """
         self.policy.assert_read_only_operation("collect_applications")
         now_iso = utc_now_iso()
         notes: list[str] = []
+        target_low = (target_app or "").strip().lower()
 
-        # 1. Consultar mapa de procesos activos para cruzar con aplicaciones y ventanas
+        # 1. Consultar mapa de procesos activos para cruzar con aplicaciones y ventanas (F6.A)
         proc_snapshot = self.process_provider.collect(
-            max_results=max(self.policy.max_processes, self.policy.max_applications)
+            max_results=max(self.policy.max_processes, self.policy.max_applications * 4)
         )
         pid_to_name: dict[int, str] = {p.pid: p.name for p in proc_snapshot.processes}
         running_by_name: dict[str, list[int]] = {}
@@ -370,20 +391,37 @@ class ApplicationAwarenessProvider:
                 continue
             running_by_name.setdefault(p.name, []).append(p.pid)
 
-        # 2. Consultar ventanas activas/visibles de forma segura
-        if self._window_enumerator is not None:
+        # 2. Consultar ventanas activas/visibles de forma segura solo cuando se requiera (F4)
+        if not include_windows:
+            fg_win, vis_wins, win_unavail = None, (), 0
+        elif self._window_enumerator is not None:
             fg_win, vis_wins, win_unavail = self._window_enumerator()
         else:
             fg_win, vis_wins, win_unavail = self._enumerate_windows_safe(pid_to_name)
+
+        if target_low and vis_wins:
+            vis_wins = tuple(
+                w
+                for w in vis_wins
+                if target_low in w.title.lower()
+                or (w.process_name and target_low in w.process_name.lower())
+            )
+            if fg_win is not None and not (
+                target_low in fg_win.title.lower()
+                or (fg_win.process_name and target_low in fg_win.process_name.lower())
+            ):
+                fg_win = None
 
         bounded_windows = vis_wins[: self.policy.max_windows]
 
         # 3. Construir lista de aplicaciones en ejecución (excluyendo servicios del sistema)
         running_apps: list[ApplicationItem] = []
         for exe_name, pids in sorted(running_apps_items := list(running_by_name.items()), key=lambda kv: kv[0].lower()):
+            display = exe_name[:-4] if exe_name.lower().endswith(".exe") else exe_name
+            if target_low and target_low not in display.lower() and target_low not in exe_name.lower():
+                continue
             if len(running_apps) >= self.policy.max_applications:
                 break
-            display = exe_name[:-4] if exe_name.lower().endswith(".exe") else exe_name
             running_apps.append(
                 ApplicationItem(
                     name=sanitize_untrusted_label(display, max_len=80),
@@ -399,6 +437,13 @@ class ApplicationAwarenessProvider:
 
         # 4. Detectar aplicaciones instaladas del catálogo seguro sin escanear registros privados
         installed_apps = self._detect_installed_catalog(running_by_name)
+        if target_low and installed_apps:
+            installed_apps = tuple(
+                a
+                for a in installed_apps
+                if target_low in a.name.lower()
+                or (a.executable_name and target_low in a.executable_name.lower())
+            )
 
         unavailable_total = proc_snapshot.access_denied_count + win_unavail
         if unavailable_total > 0:

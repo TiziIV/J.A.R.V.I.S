@@ -28,6 +28,7 @@ from typing import Optional, Sequence
 
 from src.context.models import (
     AvailabilityStatus,
+    ContextAccessDeniedError,
     DirectorySnapshot,
     FileMetadataItem,
     FileSystemContextInfo,
@@ -94,13 +95,26 @@ class FileSystemContextProvider:
         """Consulta existencia y metadatos básicos de una ruta dentro de las raíces autorizadas.
 
         Lanza `ContextAccessDeniedError` si la ruta está fuera de las raíces permitidas,
-        contiene traversal `..`, apunta a un archivo sensible o atraviesa un symlink/junction.
+        contiene traversal `..`, apunta a un archivo/subárbol sensible o atraviesa un symlink/junction.
         """
         self.policy.assert_read_only_operation("inspect_path")
         resolved, auth_root = self.policy.validate_read_path(raw_path, must_exist=False)
 
-        exists = resolved.exists()
-        if not exists:
+        # F2, F5: Usar os.lstat directamente sin llamar antes a resolved.exists(), evitando seguir
+        # junctions/symlinks reemplazados por TOCTOU y capturando errores de permisos de forma segura.
+        try:
+            st = os.lstat(resolved)
+        except FileNotFoundError:
+            try:
+                dangling = os.path.lexists(resolved)
+            except OSError as exc:
+                raise ContextAccessDeniedError(
+                    f"Acceso denegado al comprobar existencia de '{resolved.name}'."
+                ) from exc
+            if dangling or self.policy.is_reparse_point_or_symlink(resolved):
+                raise ContextAccessDeniedError(
+                    f"Ruta rechazada: se detectó un enlace o junction NTFS roto en '{resolved.name}'."
+                )
             ext = resolved.suffix.lower()
             return FileMetadataItem(
                 path=str(resolved),
@@ -114,8 +128,25 @@ class FileSystemContextProvider:
                 modified_at=None,
                 authorized_root=str(auth_root),
             )
+        except PermissionError as exc:
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por permisos del sistema operativo en '{resolved.name}'."
+            ) from exc
+        except OSError as exc:
+            raise ContextAccessDeniedError(
+                f"No fue posible inspeccionar de forma segura '{resolved.name}' ({type(exc).__name__})."
+            ) from exc
 
-        st = os.lstat(resolved)
+        # F5: Comprobar sobre el stat_result obtenido que no sea symlink ni FILE_ATTRIBUTE_REPARSE_POINT
+        if self.policy.is_stat_reparse_or_symlink(st, resolved):
+            raise ContextAccessDeniedError(
+                f"Ruta rechazada: se detectó un enlace simbólico o reparse point NTFS en '{resolved.name}'."
+            )
+        if self.policy.is_forbidden_context_subpath(resolved, auth_root):
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por privacidad: '{resolved.name}' pertenece a un subárbol sensible excluido."
+            )
+
         is_dir = stat.S_ISDIR(st.st_mode)
         is_file = stat.S_ISREG(st.st_mode)
         ext = "" if is_dir else resolved.suffix.lower()
@@ -146,7 +177,22 @@ class FileSystemContextProvider:
         self.policy.assert_read_only_operation("list_directory")
         resolved_dir, auth_root = self.policy.validate_read_path(raw_dir_path, must_exist=True)
 
-        if not resolved_dir.is_dir():
+        try:
+            root_st = os.lstat(resolved_dir)
+        except PermissionError as exc:
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por permisos al listar '{resolved_dir.name}'."
+            ) from exc
+        except OSError as exc:
+            raise ContextAccessDeniedError(
+                f"No fue posible acceder al directorio '{resolved_dir.name}' ({type(exc).__name__})."
+            ) from exc
+
+        if self.policy.is_stat_reparse_or_symlink(root_st, resolved_dir):
+            raise ContextAccessDeniedError(
+                f"Ruta rechazada: '{resolved_dir.name}' es un enlace simbólico o junction NTFS."
+            )
+        if not stat.S_ISDIR(root_st.st_mode):
             raise ValueError(f"La ruta solicitada no es un directorio: '{resolved_dir.name}'.")
 
         depth_limit = min(
@@ -170,10 +216,22 @@ class FileSystemContextProvider:
                 continue
             if self.policy.is_reparse_point_or_symlink(current_dir):
                 continue
+            if self.policy.is_forbidden_context_subpath(current_dir, auth_root):
+                continue
 
             try:
                 dir_items = sorted(os.scandir(current_dir), key=lambda e: e.name.lower())
-            except OSError:
+            except PermissionError as exc:
+                if current_depth == 1:
+                    raise ContextAccessDeniedError(
+                        f"Acceso denegado por permisos al enumerar '{current_dir.name}'."
+                    ) from exc
+                continue
+            except OSError as exc:
+                if current_depth == 1:
+                    raise ContextAccessDeniedError(
+                        f"Error de sistema de archivos al enumerar '{current_dir.name}' ({type(exc).__name__})."
+                    ) from exc
                 continue
 
             for entry in dir_items:
@@ -181,25 +239,30 @@ class FileSystemContextProvider:
                 entry_path = Path(entry.path)
                 name_low = entry.name.lower()
 
-                # Omitir archivos sensibles y enlaces simbólicos / junctions
+                # F3, F5: Omitir archivos/subárboles sensibles y enlaces simbólicos / junctions
                 if is_sensitive_context_filename(entry.name):
+                    continue
+                if self.policy.is_forbidden_context_subpath(entry_path, auth_root):
                     continue
                 if self.policy.is_reparse_point_or_symlink(entry_path):
                     continue
-
-                if len(entries) >= entry_limit:
-                    truncated = True
-                    break
 
                 try:
                     st = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
 
+                if self.policy.is_stat_reparse_or_symlink(st, entry_path):
+                    continue
+
                 is_dir = stat.S_ISDIR(st.st_mode)
                 is_file = stat.S_ISREG(st.st_mode)
                 if is_dir and name_low in _IGNORED_SCAN_DIRS:
                     continue
+
+                if len(entries) >= entry_limit:
+                    truncated = True
+                    break
 
                 max_depth_seen = max(max_depth_seen, current_depth)
                 ext = "" if is_dir else entry_path.suffix.lower()
@@ -245,7 +308,23 @@ class FileSystemContextProvider:
         """Busca archivos relevantes para un objetivo dentro de una ubicación autorizada."""
         self.policy.assert_read_only_operation("find_relevant_files")
         resolved_dir, auth_root = self.policy.validate_read_path(search_root, must_exist=True)
-        if not resolved_dir.is_dir():
+
+        try:
+            root_st = os.lstat(resolved_dir)
+        except PermissionError as exc:
+            raise ContextAccessDeniedError(
+                f"Acceso denegado por permisos al buscar en '{resolved_dir.name}'."
+            ) from exc
+        except OSError as exc:
+            raise ContextAccessDeniedError(
+                f"No fue posible acceder al directorio '{resolved_dir.name}' ({type(exc).__name__})."
+            ) from exc
+
+        if self.policy.is_stat_reparse_or_symlink(root_st, resolved_dir):
+            raise ContextAccessDeniedError(
+                f"Ruta rechazada: '{resolved_dir.name}' es un enlace simbólico o junction NTFS."
+            )
+        if not stat.S_ISDIR(root_st.st_mode):
             raise ValueError(f"La ruta de búsqueda no es un directorio: '{resolved_dir.name}'.")
 
         tokens = [
@@ -272,6 +351,8 @@ class FileSystemContextProvider:
                 continue
             if self.policy.is_reparse_point_or_symlink(current_dir):
                 continue
+            if self.policy.is_forbidden_context_subpath(current_dir, auth_root):
+                continue
 
             try:
                 dir_items = sorted(os.scandir(current_dir), key=lambda e: e.name.lower())
@@ -287,12 +368,17 @@ class FileSystemContextProvider:
 
                 if is_sensitive_context_filename(entry.name):
                     continue
+                if self.policy.is_forbidden_context_subpath(entry_path, auth_root):
+                    continue
                 if self.policy.is_reparse_point_or_symlink(entry_path):
                     continue
 
                 try:
                     st = entry.stat(follow_symlinks=False)
                 except OSError:
+                    continue
+
+                if self.policy.is_stat_reparse_or_symlink(st, entry_path):
                     continue
 
                 is_dir = stat.S_ISDIR(st.st_mode)

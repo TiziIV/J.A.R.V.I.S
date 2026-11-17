@@ -1,136 +1,223 @@
 # J.A.R.V.I.S. (Just A Rather Very Intelligent System)
 
-> Asistente virtual por voz modular, privado y local-first para Windows, diseñado para convivir fluidamente en hardware de consumo (NVIDIA GeForce GTX 1660 de 6 GB VRAM) con aceleración CUDA, fallback inteligente en la nube y control total del sistema.
+> Asistente personal autónomo, modular, privado y *local-first* para Windows, diseñado para operar con fluidez en hardware de consumo (NVIDIA GeForce GTX 1660 de 6 GB VRAM) combinando arquitectura **Multi-Brain**, gobernanza transaccional (**N5**), planificación autónoma supervisada (**N6**), conciencia contextual del sistema en solo lectura (**N7**) e interacción opcional por voz acelerada en GPU.
 
 ---
 
-## 🌟 Características Principales
+## 📌 1. Descripción General y Arquitectura Multi-Brain
 
-1. **Detección Manos Libres Continua (Hands-Free Wake Word):**
-   - Detección en CPU ultra-liviana (<4% CPU) de la palabra clave *"Hey Jarvis"* mediante `openwakeword`.
-   - Transición auditiva suave con pitido no intrusivo (`winsound.Beep`) en lugar de locuciones repetitivas.
+**J.A.R.V.I.S.** es un asistente local desarrollado en Python para Windows que prioriza la soberanía de datos, la ejecución determinista bajo políticas de seguridad verificables y el uso eficiente de recursos locales.
 
-2. **Entrada de Voz Inteligente (VAD + Whisper GPU):**
-   - Calibración automática de ruido ambiente (400 ms) y búfer circular pre-roll de 250 ms.
-   - Detección de Actividad de Voz (VAD) adaptativa con corte automático por silencio (2.5 s).
-   - Transcripción acelerada por hardware con `faster-whisper` (CTranslate2 en CUDA `float16`) en ~350 ms.
-   - Filtros probabilísticos anti-alucinaciones (`no_speech_prob < 0.65`, `avg_logprob > -1.0`).
-
-3. **Cerebro Híbrido Resiliente (Local-First + Cloud Fallback):**
-   - **Primario Local:** Ollama (`qwen2.5-coder:3b` o `llama3.2:3b`) con inferencia local en GPU (<2.2 GB VRAM).
-   - **Respaldo Nube:** Google Gemini (`gemini-2.0-flash` con fallback a `gemini-1.5-flash`) en caso de saturación o caída del servicio local.
-   - **Memoria Conversacional:** Ventana deslizante de 8 turnos (16 mensajes) con soporte para comandos como *"olvida lo que hablamos"*.
-
-4. **Enrutamiento de Intenciones y Function Calling:**
-   - Módulo `IntentRouter` con contrato estricto JSON y regex sanitizers tolerantes a bloques markdown o respuestas truncadas.
-   - Ejecuta herramientas de forma autónoma sin colgar el ciclo de audio.
-
-5. **Ecosistema de Habilidades (Skills Engine):**
-   - **Información del Sistema:** Fecha y hora (`system_time`), telemetría de CPU y memoria RAM con psutil (`system_info`).
-   - **Lanzador de Apps:** Whitelist segura de aplicaciones Windows (`app_launcher`: Notepad, Calculadora, VS Code, Edge, Chrome).
-   - **Navegación Web:** Búsqueda instantánea en Google o YouTube (`web_search`).
-   - **Control de Windows:** Volumen maestro (`volume_control`), reproducción multimedia (`media_control`), portapapeles (`clipboard_manager`), y bloqueo de pantalla (`system_power`).
-
-6. **Síntesis de Voz (TTS) con Circuit Breaker:**
-   - **Voz Neuronal Primaria:** `edge-tts` (Tomás / Álvaro) con reproducción asíncrona mediante `pygame.mixer`.
-   - **Circuit Breaker Blindado:** Si Bing devuelve error 403 o se pierde la conexión, conmuta permanentemente y sin demoras al motor nativo offline de Windows (`System.Speech` / PowerShell) seleccionando voces hispanas (Sabina Desktop).
-   - **Anti-Eco Estricto:** Purga y validación de descriptores de audio antes de reabrir el micrófono.
-
-7. **Interfaz en Bandeja del Sistema (System Tray):**
-   - Icono dinámico con código de colores según el estado:
-     - 🔵 **Azul:** Reposo (esperando *Hey Jarvis*).
-     - 🟢 **Verde:** Escuchando voz del usuario.
-     - 🟡 **Amarillo:** Procesando orden / LLM.
-     - 🔴 **Rojo:** Hablando por sintetizador (micrófono cerrado).
-   - Menú contextual: Ver estado, limpiar memoria conversacional y salida ordenada.
+### Arquitectura Multi-Brain (`src/brain/brain_manager.py`)
+El núcleo cognitivo coordina múltiples motores locales y en la nube bajo una identidad común definida en [config/prompts.py](config/prompts.py):
+- **Motores Locales Primarios:** `OLLAMA` (modelo estructurado principal) y `OLLAMA_UNCENSORED` (modelo local secundario), ejecutándose localmente con bajo consumo de VRAM.
+- **Motores Cloud Opcionales / Respaldo:** `GEMINI` (`gemini-2.0-flash` con fallback a `gemini-1.5-flash`), `CLAUDE`, `GPT` y `CODEX` (`codex exec` en sandbox de solo lectura).
+- **Enrutamiento y Deliberación (`AUTO`):** Clasificación automática de complejidad, deliberación multi-agente (`AutoDeliberator`) y políticas de degradación controlada cuando una clave API opcional no está configurada o el servicio local no responde.
 
 ---
 
-## 💻 Requisitos de Hardware y Entorno
+## 📊 2. Estado Actual del Proyecto
 
-- **Sistema Operativo:** Windows 10 u 11 (64 bits).
-- **GPU:** NVIDIA GeForce GTX 1660 (o superior) con 6 GB de VRAM y soporte CUDA Toolkit 12.x.
-- **Python:** Versión 3.12 (64-bit).
-- **Consumo de VRAM medido en producción:**
-  - Whisper GPU: ~950 MB VRAM.
-  - Ollama qwen2.5-coder:3b: ~2.2 GB VRAM.
-  - **Total:** ~3.15 GB / 6 GB (52% de VRAM libre para el sistema).
+| Fase / Capa | Estado | Resumen de implementación y validación |
+| :--- | :--- | :--- |
+| **Core Voz, VAD, TTS y System Tray** (`v3.0.0`) | **Completada** | Wake Word en CPU (`openwakeword`), captura mono 16 kHz con VAD adaptativo, STT GPU (`faster-whisper`), TTS (`edge-tts` + Circuit Breaker a `System.Speech`) y bandeja del sistema (`pystray`). |
+| **Multi-Brain, Exportación Documental y Extracción Web** (`v5.1.0`) | **Completada** | `BrainManager`, `DocumentExportSkill` (con validación anti-reparse/TOCTOU) y `WebExtractionSkill` (defensa SSRF, DNS rebinding y sobre de aislamiento de contenido externo). |
+| **N5 — Gobernanza Transaccional y Ejecución Segura** (`v5.2.0`) | **Cerrada y Auditada** | `TransactionManager` WAL-First encadenado por SHA-256, `PolicyEngine`, `ChainOrchestrator`, `FileEditorSkill`, tokens de aprobación interactiva de un solo uso y aislamiento determinista de memoria (`JARVIS_ENV=test`). Documentado en [docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md](docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md). |
+| **N6 — Autonomous Goal & Planning Engine** | **Cerrada y Verificada** | Comprensión de objetivos (`GoalUnderstandingEngine`), descomposición y validación DAG (`GoalPlanningEngine`), selector de riesgos (`GoalSkillSelector`), supervisión con timeouts/reintentos/replanificación (`ExecutionSupervisor`) y persistencia aislada (`GoalStore`). Documentado en [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](docs/N6_AUTONOMOUS_GOAL_ENGINE.md). |
+| **N7 — Context Awareness Engine (Remediada F1–F6)** | **Completada y Endurecida** | Observación estructurada y estrictamente de **solo lectura** del entorno Windows (`system`, `hardware`, `resources`, `storage`, `processes`, `applications`, `filesystem`), integración opcional con N6, comandos `/contexto` y endurecimiento de seguridad F1–F6. Documentado en [docs/N7_CONTEXT_AWARENESS_ENGINE.md](docs/N7_CONTEXT_AWARENESS_ENGINE.md). |
+| **N8 — Memoria de Largo Plazo y Aprendizaje por Experiencia** | **Fase Futura (No iniciada)** | Planificada para etapas posteriores; actualmente no implementada. |
 
 ---
 
-## 🚀 Inicio Rápido
+## 🏗️ 3. Arquitectura: Observación (N7), Planificación (N6) y Ejecución (N5)
 
-### 1. Diagnóstico de Pre-Vuelo (5 segundos)
-Antes de iniciar, puedes verificar el estado de todo tu hardware, drivers de GPU, micrófono y variables corriendo:
+El diseño de J.A.R.V.I.S. impone una separación estricta de responsabilidades entre observar el entorno, planificar objetivos y ejecutar modificaciones:
 
-```powershell
-python check_health.py
+```text
+[ N7: Context Awareness Engine (src/context/) ]
+   └── Solo lectura estricta: observa SO, CPU/RAM/GPU, discos, procesos, apps y metadatos de archivos autorizados.
+   └── Empaqueta datos en ContextUntrustedEnvelope (trust_level="untrusted_system_context").
+          │
+          ▼
+[ N6: Autonomous Goal & Planning Engine (src/brain/goal_*.py) ]
+   └── Interpreta objetivos (/goal), descompone subtareas en un DAG acotado y clasifica riesgos:
+       • SAFE_PLANNING -> Síntesis cognitiva interna sin efectos secundarios.
+       • LOW_RISK_EXECUTION -> Skills de consulta autorizadas.
+       • SENSITIVE_OPERATION -> Requiere aprobación humana explícita y delega en N5.
+          │
+          ▼
+[ N5: PolicyEngine + ChainOrchestrator + FileEditorSkill (src/brain/chain_orchestrator.py) ]
+   └── Valida raíces autorizadas, genera backups verificados por SHA-256, registra bitácora WAL
+       y aplica o revierte cambios transaccionales únicamente tras confirmación humana.
 ```
 
-Verás una tabla visual de diagnóstico con el reporte de CUDA, CTranslate2, Ollama, `.env`, micrófono y voces de Windows.
-
-### 2. Lanzadores Autónomos para Windows
-No necesitas recordar comandos de consola cada vez que uses el asistente:
-
-- **Modo Consola Interactivo:** Haz doble clic en `run_jarvis.bat`. Activa automáticamente el entorno virtual y lanza el asistente mostrando los logs en tiempo real.
-- **Modo Silencioso en Segundo Plano:** Haz doble clic en `run_jarvis_background.vbs`. Inicia J.A.R.V.I.S. directamente en la bandeja del sistema (System Tray) sin mostrar ventanas de terminal.
-  - *Tip para inicio automático con Windows:* Presiona `Win + R`, escribe `shell:startup` y coloca un acceso directo a `run_jarvis_background.vbs`.
+### Frontera de datos no confiables
+- **Contenido web (`WebExtractionSkill`):** marcado como `untrusted_external_content`; aislado en memoria efímera sin promoción a instrucciones del sistema ni disparo de herramientas.
+- **Contexto del sistema (`N7 ContextAwarenessEngine`):** marcado como `untrusted_system_context` con `allow_tool_execution_from_content=False`, `allow_system_prompt_promotion=False` y `allow_direct_mutation=False`.
 
 ---
 
-## 📁 Estructura del Repositorio
+## 🔒 4. Seguridad, Privacidad y Límites Reales
+
+1. **Naturaleza de solo lectura en N7:**
+   - Los módulos de `src/context/` carecen de funciones de escritura, creación, edición o borrado de archivos, terminación de procesos (`kill`/`terminate`), modificación del Registro (`winreg` se usa solo con `KEY_READ`) o ejecución con `shell=True`.
+2. **Raíces autorizadas y exclusiones específicas de N7 (F3):**
+   - `ContextAccessPolicy` restringe toda consulta de archivos a `AUTHORIZED_FILE_ROOTS` y bloquea `FORBIDDEN_SYSTEM_PREFIXES` (`C:\Windows`, `System32`, `SysWOW64`, `WindowsApps`, etc.).
+   - Sin alterar las raíces compartidas que `FileEditorSkill` requiere en N5, N7 excluye adicionalmente subárboles y archivos sensibles tanto en inspección puntual (`inspect_path`) como en recorridos (`list_directory`, `find_relevant_files`): `.git`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `data/goals`, `data/transactions`, `data/backups`, `file_editor_audit.jsonl`, `*.log`, `.npmrc`, `.netrc`, `secrets.json`, `.env*`, claves privadas (`*.pem`, `*.key`, `*.pfx`, `*.kdbx`), respaldos (`.bak`, `.old`, `.tmp`) y almacenes de credenciales/perfiles de navegadores (`Credentials`, `User Data`, `Profiles`).
+3. **Protección contra Symlinks, Junctions NTFS, Reparse Points y TOCTOU (F2, F5):**
+   - Validación de cada segmento y sus ancestros mediante `os.path.lexists`, `os.path.isjunction` y `os.lstat` verificando `stat.S_ISLNK` y el atributo nativo `FILE_ATTRIBUTE_REPARSE_POINT` (incluyendo junctions rotos cuyo destino no existe).
+   - Los errores de permisos (`PermissionError` / `OSError`) se capturan y convierten en `ContextAccessDeniedError` sin interrumpir el bucle principal de consola.
+   - `inspect_path` y `list_directory` ejecutan `os.lstat` / `entry.stat(follow_symlinks=False)` directamente sin depender de `Path.exists()` previo, volviendo a verificar `FILE_ATTRIBUTE_REPARSE_POINT` sobre el `stat_result` para reducir ventanas TOCTOU.
+4. **Protección contra NTFS Alternate Data Streams — ADS (F1):**
+   - Rechazo conservador de cualquier sintaxis `:` posterior al identificador de unidad de Windows (p. ej. `.env:secretstream`, `credentials.json:backup`, `config.ini:stream`).
+5. **Minimización de datos desde el origen (F4):**
+   - N7 jamás consulta `cmdline` ni `environ` de procesos (`_SAFE_BASE_ATTRS` cerrado), y deshabilita por defecto `hostname`, `username` y `exe_path`.
+   - En consultas originadas por objetivos N6 (`target_app`), N7 desactiva desde el origen la recolección de títulos de ventanas del escritorio (`include_windows=False`) y filtra los resultados únicamente a la aplicación solicitada.
+   - Los archivos persistidos `.goal.json` excluyen `visible_windows`, `foreground_window` y `top_processes`.
+6. **Redacción de secretos y sanitización anti-Prompt Injection (F4):**
+   - `redact_secrets` oculta claves `sk-*`, `sk-ant-*`, `AIza*`, `AQ.*`, tokens de GitHub (`ghp_*`, `github_pat_*`), AWS (`AKIA*`, `ASIA*`), encabezados `Authorization: Bearer ...`, JWT (`eyJ...`), parámetros URL (`?token=...`, `&access_token=...`, `?api_key=...`) y asignaciones `token=` / `secret=` / `password=`.
+   - `sanitize_untrusted_label` elimina caracteres de control y bidireccionales Unicode y filtra delimitadores (`</EVIDENCIA...>`, `<|system|>`), indicadores de rol (`system:`, `sistema:`), estructuras JSON de herramientas (`"tool_name"`, `"skill_name"`, `"function_call"`) e instrucciones de evasión en español e inglés.
+7. **Límites reales de las protecciones:**
+   - En Python estándar sobre Windows, las operaciones de ruta por nombre mantienen una ventana teórica mínima en el kernel entre `lstat` y `scandir`; N7 lo mitiga no abriendo ni leyendo jamás el contenido de ningún archivo y revalidando `FILE_ATTRIBUTE_REPARSE_POINT` en cada `stat_result`.
+   - En GPUs sin `nvidia-smi`, N7 detecta el adaptador por `winreg.KEY_READ` y reporta las métricas dinámicas de uso como `UNAVAILABLE` (`None`, nunca `0.0`).
+
+---
+
+## ⌨️ 5. Comandos Disponibles en Consola
+
+En el modo consola interactiva (`.\venv\Scripts\python.exe main.py`):
+
+| Comando | Fase | Descripción |
+| :--- | :--- | :--- |
+| `/modo` | Multi-Brain | Consulta o cambia el modo de inteligencia (`AUTO`, `OLLAMA`, `OLLAMA_UNCENSORED`, `GEMINI`, `CLAUDE`, `GPT`, `CODEX`). |
+| `/voz [on\|off]` | Audio | Activa o desactiva la lectura por síntesis de voz (TTS) de las respuestas en la consola. |
+| `/contexto` (o `/context`) | **N7** | Resumen general en solo lectura (sistema, hardware, recursos frescos y almacenamiento). |
+| `/contexto sistema` | **N7** | Sistema operativo, versión, build, arquitectura, Python y tiempo de actividad. |
+| `/contexto hardware` | **N7** | Procesador, núcleos físicos/lógicos, frecuencia, RAM y GPU/VRAM detectadas. |
+| `/contexto recursos` | **N7** | Uso actual en tiempo real de CPU, RAM, GPU/VRAM y espacio libre en el disco de trabajo. |
+| `/contexto almacenamiento` | **N7** | Unidades montadas, sistema de archivos y capacidad total/libre. |
+| `/contexto procesos [filtro]` | **N7** | Procesos activos acotados por consumo (opcionalmente filtrados por nombre, sin `cmdline`/`environ`). |
+| `/contexto aplicaciones` | **N7** | Ventanas visibles, aplicaciones de usuario en ejecución y catálogo seguro de apps instaladas. |
+| `/contexto archivos <ruta>` | **N7** | Metadatos básicos o listado acotado dentro de una raíz autorizada y no excluida. |
+| `/contexto ayuda` | **N7** | Muestra la ayuda de subcomandos de observación contextual. |
+| `/goal <objetivo>` | **N6** | Interpreta un objetivo, consulta contexto N7 pertinente y construye un plan DAG supervisado. |
+| `/plan` / `/plan estado` | **N6** | Muestra el plan activo, sus subtareas, categorías de riesgo y estado de aprobación. |
+| `/plan ejecutar` | **N6** | Ejecuta el plan activo solicitando confirmación interactiva para tareas `SENSITIVE_OPERATION`. |
+| `/plan aclarar <respuesta>` | **N6** | Responde preguntas de aclaración cuando un objetivo fue clasificado como ambiguo. |
+| `/plan cancelar` | **N6** | Cancela de forma limpia el objetivo o plan activo preservando la trazabilidad. |
+| `/optimizar <juego>` | **N5** | Planifica y simula ajustes de configuración sobre archivos autorizados bajo `ChainOrchestrator`. |
+| `/rollback <id>` | **N5** | Revierte transaccionalmente un cambio aplicado verificando hashes SHA-256 y backups. |
+| `/limpiar` (o `/clear`) | Memoria | Limpia el historial conversacional de corto plazo en memoria. |
+| `salir` (o `exit` / `quit`) | Sistema | Cierra de forma ordenada la sesión de consola. |
+
+---
+
+## 🚀 6. Instalación y Modos de Ejecución
+
+### Requisitos del entorno
+- **Sistema Operativo:** Windows 10 u 11 (64 bits).
+- **Python:** 3.12 (64-bit) en entorno virtual `venv/`.
+- **GPU recomendada:** NVIDIA GeForce GTX 1660 (6 GB VRAM) o superior con soporte CUDA (el sistema dispone de fallback controlado a CPU cuando CUDA o `nvidia-smi` no están presentes).
+- **Proveedores de IA:** Ollama local (primario); claves API en `.env` para proveedores cloud (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) son **opcionales** (el sistema opera en modo degradado local si no están definidas).
+
+### Diagnóstico de pre-vuelo
+```powershell
+.\venv\Scripts\python.exe check_health.py
+```
+
+### Modos de ejecución (`main.py`)
+1. **Modo Consola de Texto (predeterminado — sin carga de audio en VRAM):**
+   ```powershell
+   .\venv\Scripts\python.exe main.py
+   ```
+2. **Modo Consola con Síntesis de Voz (TTS activo, sin micrófono):**
+   ```powershell
+   .\venv\Scripts\python.exe main.py --tts
+   ```
+3. **Modo Manos Libres Completo (Wake Word + Micrófono VAD + Whisper STT + TTS + System Tray):**
+   ```powershell
+   .\venv\Scripts\python.exe main.py --voice
+   ```
+4. **Selección de modo cognitivo al iniciar:**
+   ```powershell
+   .\venv\Scripts\python.exe main.py --mode OLLAMA
+   ```
+5. **Lanzadores rápidos en Windows:** `run_jarvis.bat` (consola) y `run_jarvis_background.vbs` (bandeja del sistema).
+
+---
+
+## 🧪 7. Testing y Validación
+
+Todas las pruebas deben ejecutarse con `JARVIS_ENV="test"` para garantizar el confinamiento estricto de `ConversationMemory`, `TransactionManager` y `GoalStore` dentro de `temp/jarvis_test_isolated/`, preservando intacto `data/memory_store.json`.
+
+```powershell
+# 1. Suite específica de N7 (funcionalidad, seguridad F1-F6, consola e integración N6+N7):
+$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_context_awareness_n7 -v
+
+# 2. Suite específica de N6 (Autonomous Goal & Planning Engine):
+$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_goal_engine -v
+
+# 3. Suites de gobernanza transaccional y seguridad N5:
+$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain tests.test_transaction_recovery tests.test_memory_isolation -v
+
+# 4. Comando oficial de validación de la suite global completa:
+$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+---
+
+## 💻 8. Hardware, Rendimiento y Carga Diferida
+
+- **Carga diferida (Lazy Loading):** En modo consola (`python main.py`), los módulos de audio (`faster_whisper`, `sounddevice`, `SpeechToText`, `TextToSpeech`, `WakeWordDetector`) **no se importan ni inicializan**, manteniendo en `0 MB` el consumo de VRAM por modelos de voz.
+- **Presupuesto de VRAM en modo voz (GTX 1660 de 6 GB):**
+  - `faster-whisper` (`base`, `cuda`, `float16` con fallback automático a CPU `int8`): ~950 MB VRAM.
+  - Modelo local en Ollama (`3b`): ~2.2 GB VRAM.
+- **Coalescencia y cotas en N7:** Consultas acotadas por timeout (`CONTEXT_PROVIDER_TIMEOUT_SEC=3.0s`), límites de colección (`25` procesos, `40` aplicaciones, `25` ventanas, profundidad `3` y `150` entradas de directorio) y locks por categoría para evitar recolecciones duplicadas ante solicitudes concurrentes.
+
+---
+
+## 📁 9. Estructura del Repositorio y Documentación
 
 ```text
 jarvis-core/
 ├── config/
-│   ├── settings.py         # Configuración centralizada, .env y registro de DLLs CUDA
-│   ├── prompts.py          # Prompt maestro compartido (paridad Ollama/Gemini)
-│   ├── tools_schema.py     # Catálogo y esquemas JSON para Function Calling
-│   └── wake_config.py      # Ajustes de umbrales y buffer de openWakeWord
+│   ├── settings.py                  # Configuración central, raíces autorizadas y parámetros N5/N6/N7
+│   ├── prompts.py                   # Identidad y prompt maestro compartido
+│   ├── tools_schema.py              # Esquemas JSON para herramientas
+│   └── wake_config.py               # Umbrales de detección Wake Word
 ├── src/
-│   ├── audio/
-│   │   ├── recorder.py     # Grabador inteligente con VAD adaptativo y pre-roll
-│   │   ├── stt.py          # Transcripción con faster-whisper en CUDA
-│   │   ├── tts.py          # Síntesis edge-tts con Circuit Breaker a System.Speech
-│   │   └── wake_word.py    # Detección local en CPU de palabra de activación
-│   ├── brain/
-│   │   ├── ollama_client.py # Cliente local Ollama con streaming
-│   │   ├── gemini_client.py # Cliente Google Gemini en la nube (respaldo)
-│   │   ├── intent_router.py # Enrutador de intenciones y reparador de JSON
-│   │   └── memory.py        # Memoria conversacional de ventana deslizante
-│   ├── tools/
-│   │   └── skill_manager.py # Orquestador y registro dinámico de skills
-│   ├── ui/
-│   │   └── tray.py         # Interfaz dinámica en System Tray con pystray y PIL
-│   └── utils/
-│       └── logger.py       # Logger centralizado anti-duplicación (consola y archivo UTF-8)
-├── skills/
-│   ├── base_skill.py       # Contrato abstracto BaseSkill
-│   ├── system_skills.py    # TimeSkill, AppLauncherSkill, SystemInfoSkill, WebSearchSkill
-│   └── windows_skills.py   # VolumeControl, MediaControl, Clipboard, SystemPower
-├── tests/                  # Suite integral de pruebas unitarias (188 tests)
-├── check_health.py         # Script de diagnóstico de pre-vuelo en 5 segundos
-├── build_exe.py            # Empaquetador protegido con PyInstaller
-├── run_jarvis.bat          # Lanzador rápido en consola
-├── run_jarvis_background.vbs # Lanzador silencioso en bandeja
-├── ARCHITECTURE.md         # Documento maestro y diagramas de flujo para defensa académica
-├── CONTEXT.md              # Bitácora técnica del estado del repositorio
-└── main.py                 # Ciclo principal de conversación y orquestación
+│   ├── audio/                       # Captura VAD (recorder.py), STT (stt.py), TTS (tts.py), Wake Word
+│   ├── brain/                       # Multi-Brain, ChainOrchestrator (N5), TransactionManager (N5), GoalEngine (N6)
+│   ├── context/                     # N7 Context Awareness Engine (models, policy, providers, engine, console)
+│   ├── tools/                       # SkillManager y registro de herramientas
+│   ├── ui/                          # Interfaz en bandeja del sistema (tray.py)
+│   └── utils/                       # Logger UTF-8 y GitSafetyGuard (git_guard.py)
+├── skills/                          # BaseSkill, system_skills, windows_skills, file_editor, document_export, web_extraction
+├── docs/
+│   ├── N6_AUTONOMOUS_GOAL_ENGINE.md # Especificación y arquitectura de N6
+│   ├── N7_CONTEXT_AWARENESS_ENGINE.md # Especificación, seguridad y configuración de N7
+│   └── audits/
+│       └── INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md # Auditoría de cierre de N5
+├── tests/                           # Suite global automatizada (586 tests)
+├── AGENTS.md                        # Reglas obligatorias de desarrollo y arquitectura
+├── ARCHITECTURE.md                  # Diagramas y arquitectura base del proyecto
+├── CODEBASE_INDEX.md                # Índice compacto de módulos
+├── CONTEXT.md                       # Bitácora técnica evolutiva del proyecto
+└── main.py                          # Punto de entrada CLI, consola interactiva y ciclo de voz
 ```
 
 ---
 
-## 🧪 Suite de Pruebas Unitarias
+## 🗺️ 10. Roadmap
 
-El repositorio cuenta con **188 pruebas unitarias automatizadas** que cubren resiliencia de audio, streaming, Circuit Breaker, recuperación ante errores 403, manejo seguro de tipos en skills y estrés de memoria:
-
-```powershell
-python -m unittest discover -s tests -p "test_*.py" -v
-```
-
-**Resultado:** `188 tests in ~3.5s - OK (100% de éxito)`.
+- [x] **Fases 1–9 (`v3.0.0`):** Pipeline de voz local (Wake Word, VAD, Whisper CUDA, Streaming TTS, System Tray, empaquetado).
+- [x] **Multi-Brain + Skills Documentales/Web (`v5.1.0`):** Enrutamiento cognitivo multi-proveedor, exportación documental segura y extracción web aislada.
+- [x] **Fase N5 (`v5.2.0`):** Gobernanza transaccional WAL-First, `PolicyEngine`, `ChainOrchestrator`, aprobación interactiva y aislamiento de memoria.
+- [x] **Fase N6:** `Autonomous Goal & Planning Engine` (`/goal` y `/plan`) con validación DAG y supervisión de ejecución.
+- [x] **Fase N7:** `Context Awareness Engine` (`/contexto`) en solo lectura e integración con N6, con remediación de seguridad F1–F6 verificada.
+- [ ] **Fase N8 (Futura — No iniciada):** Memoria de largo plazo y aprendizaje basado en experiencias.
 
 ---
 
 ## 🛡️ Licencia y Créditos
-Desarrollado para propósitos académicos y de uso personal. Todos los componentes priorizan la soberanía de datos y la privacidad del usuario.
+Desarrollado para propósitos académicos y de uso personal. Todos los componentes priorizan la soberanía de datos, el principio de mínimo privilegio y la privacidad del usuario.

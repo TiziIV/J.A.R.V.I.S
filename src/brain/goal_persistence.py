@@ -98,14 +98,28 @@ def _sanitize_identifier(identifier: str, label: str = "id") -> str:
     return clean
 
 
+# Campos de contexto volátil/privado que no deben persistirse en archivos .goal.json (F4).
+_VOLATILE_CONTEXT_KEYS: frozenset[str] = frozenset(
+    {
+        "visible_windows",
+        "foreground_window",
+        "top_processes",
+    }
+)
+
+
 def _redact_nested_data(value: Any) -> Any:
-    """Redacta recursivamente posibles secretos en diccionarios o listas serializables."""
+    """Redacta recursivamente posibles secretos y suprime campos volátiles antes de persistir."""
     if isinstance(value, str):
         return redact_secrets(value)
     if isinstance(value, list):
         return [_redact_nested_data(item) for item in value]
     if isinstance(value, dict):
-        return {str(k): _redact_nested_data(v) for k, v in value.items()}
+        return {
+            str(k): _redact_nested_data(v)
+            for k, v in value.items()
+            if str(k) not in _VOLATILE_CONTEXT_KEYS
+        }
     return value
 
 

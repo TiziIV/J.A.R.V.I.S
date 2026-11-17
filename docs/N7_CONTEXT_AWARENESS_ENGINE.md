@@ -73,39 +73,50 @@ flowchart TD
 ### 3.2 Qué información NO puede obtener N7 (por diseño de seguridad y privacidad)
 
 - Argumentos de línea de comandos (`cmdline`) ni variables de entorno (`environ`) de ningún proceso.
-- Contenido ni metadatos de archivos sensibles (`.env`, `.env.*`, `prompts_history.txt`, `memory_store.json`, `*.pem`, `*.key`, `*.pfx`, `credentials.json`, `id_rsa`).
+- Contenido ni metadatos de archivos sensibles (`.env`, `.env.*`, `prompts_history.txt`, `memory_store.json`, `secrets.json`, `secrets.yaml`, `.npmrc`, `.netrc`, `.git-credentials`, `file_editor_audit.jsonl`, `*.log`, `*.pem`, `*.key`, `*.pfx`, `credentials.json`, `id_rsa`, ni copias `.bak`/`.old`/`.tmp` de estos archivos).
+- Flujos de datos alternativos NTFS (**Alternate Data Streams — ADS**, p. ej. `.env:secretstream` o `config.ini:stream`).
+- Subárboles sensibles excluidos en N7 aunque residan dentro de raíces autorizadas generales (`.git`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `data/goals`, `data/transactions`, `data/backups`, `Credentials`, `Microsoft/Credentials`, almacenes `User Data` / `Profiles` de navegadores).
 - Archivos o directorios fuera de `AUTHORIZED_FILE_ROOTS` o dentro de `FORBIDDEN_SYSTEM_PREFIXES` (`C:\Windows`, `System32`, `SysWOW64`, `WindowsApps`, etc.).
+- Enlaces simbólicos, puntos de montaje o junctions NTFS (activos o rotos, verificados mediante `os.path.lexists`, `os.path.isjunction` y `os.lstat` con `FILE_ATTRIBUTE_REPARSE_POINT`).
 - Historiales de navegación, cookies, sesiones de usuario, contraseñas ni claves privadas.
 - Nombre de host del equipo (`hostname`), usuario propietario de procesos (`username`) o rutas de ejecutables (`exe_path`) por defecto (deshabilitados salvo activación explícita en configuración).
 
 ### 3.3 Permisos necesarios
 
 - N7 opera íntegramente con los permisos de usuario estándar del proceso actual de Python.
-- **No solicita ni intenta elevación administrativa (UAC).** Cuando el sistema operativo restringe el acceso a un proceso o unidad (`PermissionError` / `psutil.AccessDenied`), N7 registra el conteo o marca `AvailabilityStatus.RESTRICTED` y continúa normalmente.
+- **No solicita ni intenta elevación administrativa (UAC).** Cuando el sistema operativo restringe el acceso a un proceso, directorio o unidad (`PermissionError` / `OSError` / `psutil.AccessDenied`), N7 convierte el fallo de ruta en `ContextAccessDeniedError` o marca `AvailabilityStatus.RESTRICTED` sin interrumpir el ciclo principal de consola.
 
 ---
 
 ## 4. Políticas de Acceso, Raíces Autorizadas y Datos Enviados a IA
 
-### 4.1 Autorización de raíces de archivos
+### 4.1 Autorización de raíces de archivos y mitigación TOCTOU (F1, F2, F3, F5)
 
-`ContextAccessPolicy` reutiliza `AUTHORIZED_FILE_ROOTS` y `FORBIDDEN_SYSTEM_PREFIXES` definidos en [config/settings.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/config/settings.py):
+`ContextAccessPolicy` reutiliza `AUTHORIZED_FILE_ROOTS` y `FORBIDDEN_SYSTEM_PREFIXES` definidos en [config/settings.py](../config/settings.py) y añade defensas específicas para N7 sin alterar las capacidades de N5 (`FileEditorSkill`):
 - Raíces predeterminadas: directorio del proyecto (`BASE_DIR`), `%USERPROFILE%\Documents`, `%USERPROFILE%\Saved Games`, `%LOCALAPPDATA%` y `%APPDATA%` (más raíces adicionales válidas en `JARVIS_EXTRA_AUTHORIZED_ROOTS`).
-- Toda consulta a `FileSystemContextProvider` valida previamente la ruta mediante `policy.validate_read_path()`, rechazando rutas relativas, segmentos `..`, rutas UNC (`\\server\share`), variables `%...%` sin expandir, dispositivos reservados de Windows y enlaces simbólicos o junctions NTFS (`FILE_ATTRIBUTE_REPARSE_POINT`).
+- Toda consulta a `FileSystemContextProvider` valida previamente la ruta mediante `policy.validate_read_path()`, rechazando:
+  1. Rutas relativas, segmentos `..`, rutas UNC (`\\server\share`), variables `%...%` sin expandir y dispositivos reservados de Windows.
+  2. Sintaxis de **NTFS Alternate Data Streams (`:stream`)** en cualquier segmento posterior al identificador de unidad (`C:\`).
+  3. Enlaces simbólicos, junctions NTFS activos o rotos (`os.path.lexists` + `os.lstat` + `FILE_ATTRIBUTE_REPARSE_POINT`) y errores de permisos (`PermissionError` / `OSError` convertidos a `ContextAccessDeniedError`).
+  4. Archivos sensibles (`FORBIDDEN_CONTEXT_FILENAMES`, `FORBIDDEN_CONTEXT_EXTENSIONS` y variantes de backup) y subárboles sensibles (`FORBIDDEN_CONTEXT_DIR_NAMES` y `FORBIDDEN_CONTEXT_SUBTREES`, tales como `.git`, `.ssh`, `data/goals`, almacenes de credenciales y navegadores), aplicando el filtro tanto en `inspect_path` como en cada entrada de `list_directory` y `find_relevant_files`.
+- **Reducción de ventana TOCTOU (F5):** `inspect_path`, `list_directory` y `find_relevant_files` ejecutan `os.lstat` / `entry.stat(follow_symlinks=False)` directamente sin depender de llamadas previas a `Path.exists()` y vuelven a comprobar `stat.S_ISLNK` y `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT` sobre el `stat_result` obtenido.
 
-### 4.2 Minimización y aislamiento para IA (`ContextUntrustedEnvelope`)
+### 4.2 Minimización en origen, redacción y aislamiento para IA (`ContextUntrustedEnvelope` — F4)
 
 - Todo dato observado del sistema se empaqueta con `trust_level="untrusted_system_context"`, `allow_tool_execution_from_content=False`, `allow_system_prompt_promotion=False` y `allow_direct_mutation=False`.
-- Con `CONTEXT_MINIMIZE_FOR_LLM=True` (valor predeterminado), el sobre enviado a N6/IA incluye únicamente el subconjunto resumido de las categorías solicitadas, acotando listas y aplicando `redact_secrets` y `sanitize_untrusted_label` para neutralizar posibles intentos de prompt injection en nombres de procesos, ventanas o archivos.
+- **Minimización desde el origen y en persistencia N6:**
+  - Cuando N6 consulta N7 para un objetivo (p. ej. con `target_app`), solicita `include_windows=False` para no enumerar títulos de ventanas privadas del escritorio y filtra las aplicaciones exclusivamente a `target_app`.
+  - Los sobres generados para N6 y persistidos en `.goal.json` (`for_persistence=True`) **jamás incluyen `visible_windows`, `foreground_window` ni listas arbitrarias de `top_processes`**, y `GoalStore` suprime defensivamente cualquier clave volátil antes de escribir a disco.
+- **Redacción de secretos (`redact_secrets`) y sanitización (`sanitize_untrusted_label`):**
+  - Redacta claves `sk-*`, `sk-ant-*`, `AIza*`, `AQ.*`, tokens de GitHub (`ghp_*`, `github_pat_*`), AWS Access Keys (`AKIA*`, `ASIA*`), tokens de Slack/GitLab/HF, encabezados `Authorization: Bearer ...`, JWT (`eyJ...`), parámetros URL (`?token=...`, `&access_token=...`, `?api_key=...`) y asignaciones `token=...` / `secret=...` / `password=...`.
+  - Neutraliza delimitadores XML/corchetes (`</EVIDENCIA...>`, `<system>`), tokens especiales de LLM (`<|system|>`, `<<SYS>>`), indicadores de rol (`system:`, `sistema:`, `desarrollador:`), estructuras JSON de herramientas (`"tool_name"`, `"skill_name"`, `"function_call"`, `"arguments"`) e instrucciones de evasión en inglés y español (`ignore/ignora/omite/descarta ... instrucciones/reglas/políticas`).
 
-### 4.3 Comportamiento ante fallos parciales
+### 4.3 Coalescencia de caché, frescura de recursos y errores parciales (F6)
 
-- Cada proveedor se ejecuta bajo un timeout independiente (`CONTEXT_PROVIDER_TIMEOUT_SEC`, por defecto `3.0` s).
-- Si una categoría falla o agota su tiempo de espera:
-  1. Se registra un `ProviderIssue` en `snapshot.partial_errors`.
-  2. La categoría o métrica afectada se incluye en `snapshot.unavailable_fields` con valor `None` (nunca `0.0`).
-  3. Las demás categorías solicitadas se entregan intactas.
-  4. En N6, los campos no disponibles se agregan a `goal.missing_info` sin bloquear la planificación ni inventar datos.
+- **Coalescencia concurrente por categoría:** `ContextAwarenessEngine` utiliza locks independientes por categoría (`_category_locks`) con doble verificación de caché para que múltiples solicitudes simultáneas ante un cache miss ejecuten una única recolección por categoría sin bloquear proveedores de otras categorías.
+- **Frescura de `RESOURCES`:** Las consultas generales de `/contexto` y el enriquecimiento de objetivos N6 pasan `refresh_resources=True` para obtener métricas en tiempo real de CPU/RAM/GPU/VRAM sin quedar retenidas por el TTL de 5 s de categorías estáticas (`SYSTEM`, `HARDWARE`, `STORAGE`). Si una categoría proviene de caché, se informa en `snapshot.cached_categories`.
+- **Descubrimiento de aplicaciones desacoplado de `max_processes`:** `ApplicationAwarenessProvider` consulta procesos activos con cota ampliada en función de `max_applications` para detectar aplicaciones en ejecución aunque existan más de `max_processes` procesos en el sistema.
+- **Aislamiento de fallos:** Cada proveedor corre bajo `CONTEXT_PROVIDER_TIMEOUT_SEC` (`3.0` s por defecto). Si falla o vence el timeout, registra `ProviderIssue` en `partial_errors` y marca `unavailable_fields` con `None` (nunca `0.0`), preservando el resto del snapshot.
 
 ---
 
