@@ -932,3 +932,43 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 - Limitaciones conocidas y riesgos pendientes: hardware físico (micrófono/TTS real) no probado en esta sesión; `GoalConsoleHandler` instancia `GoalEngine(..., use_ai=False)` por defecto para mantener determinismo y cero costos imprevistos en consola; la ejecución de operaciones sensibles exige confirmación explícita humano-en-el-bucle y `ExecutionSupervisor` sigue acotado por los timeouts de sesión actuales (`GOAL_TASK_TIMEOUT_SEC` / `GOAL_TOTAL_TIMEOUT_SEC`).
 - Próxima fase recomendada: **N7** (extensión avanzada de autonomía/ejecución tras mantener N6 como primera de las 3 fases rumbo al siguiente hito etiquetado).
 
+---
+
+## Fase N7 — Context Awareness Engine (2026-11-17)
+
+### 1. Arquitectura Modular y Archivos Incorporados / Modificados
+
+- Prompt completo registrado en `prompts_history.txt` (`PROYECTO J.A.R.V.I.S. — N7: CONTEXT AWARENESS ENGINE`).
+- Documentación técnica, de seguridad, configuración y consola creada en `docs/N7_CONTEXT_AWARENESS_ENGINE.md`.
+- Archivos nuevos creados:
+  - `src/context/__init__.py`: exportaciones públicas del paquete N7.
+  - `src/context/models.py`: modelos de datos inmutables (`frozen=True`) y contratos tipados (`ContextCategory`, `AvailabilityStatus`, `MetricReading`, `SystemContextInfo`, `GpuDeviceInfo`, `StorageVolumeInfo`, `HardwareContextInfo`, `ResourceUsageInfo`, `ProcessContextItem`, `ProcessAwarenessInfo`, `ActiveWindowInfo`, `ApplicationItem`, `ApplicationAwarenessInfo`, `FileMetadataItem`, `DirectorySnapshot`, `FileSystemContextInfo`, `ProviderIssue`, `ContextUntrustedEnvelope`, `ContextSnapshot`) y jerarquía de excepciones (`ContextError`, `ContextPolicyError`, `ContextAccessDeniedError`, `ContextProviderError`, `ContextTimeoutError`). Prohibición explícita de asignar `value=0.0` cuando `status` es `UNAVAILABLE` o `ERROR`.
+  - `src/context/policy.py`: `ContextAccessPolicy` en modo `default-deny`, reutilización de `AUTHORIZED_FILE_ROOTS` y `FORBIDDEN_SYSTEM_PREFIXES`, validación de rutas absolutas contra traversal `..`, rutas UNC, variables `%...%` sin expandir, dispositivos reservados de Windows (`CON`, `NUL`, `COM1..9`, `LPT1..9`), enlaces simbólicos y junctions NTFS (`FILE_ATTRIBUTE_REPARSE_POINT`), bloqueo de archivos sensibles (`.env`, `prompts_history.txt`, `memory_store.json`, claves privadas), redacción de secretos (`redact_secrets`) y sanitización de etiquetas no confiables (`sanitize_untrusted_label`).
+  - `src/context/system_hardware_provider.py`: `SystemInfoProvider`, `StorageInfoProvider`, `HardwareInfoProvider` y `ResourceMonitoringProvider`. Detección dinámica de CPU (descriptor `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0` en `KEY_READ` / `platform.processor()`), núcleos físicos/lógicos, frecuencia, RAM, unidades y GPU/VRAM con cascada tolerante a fallos (`nvidia-smi` con `shell=False` y timeout -> `torch.cuda` si ya está en `sys.modules` -> descriptor de adaptador `winreg.KEY_READ` -> `AvailabilityStatus.UNAVAILABLE`).
+  - `src/context/process_app_provider.py`: `ProcessAwarenessProvider` y `ApplicationAwarenessProvider`. Enumeración acotada de procesos sin consultar jamás `cmdline()` ni `environ()`, manejo resiliente de `psutil.AccessDenied` y `psutil.NoSuchProcess`, detección de ventanas visibles/en primer plano mediante `user32.dll` en solo lectura y separación entre aplicaciones instaladas, aplicaciones en ejecución y servicios internos de Windows.
+  - `src/context/filesystem_provider.py`: `FileSystemContextProvider` en estricto modo lectura dentro de raíces autorizadas (`inspect_path`, `list_directory`, `find_relevant_files`, `collect`) con límites de profundidad y cantidad de entradas.
+  - `src/context/engine.py`: `ContextAwarenessEngine` con selección bajo demanda por categorías, caché TTL configurable, timeout por proveedor, aislamiento de errores parciales, inferencia selectiva de categorías para N6 (`infer_relevant_categories_for_goal`) y empaquetado de datos no confiables (`build_untrusted_envelope`, `build_n6_context_payload`).
+  - `src/context/console.py`: `ContextConsoleHandler` para `/contexto` (`sistema`, `hardware`, `recursos`, `almacenamiento`, `procesos`, `aplicaciones`, `archivos`, `ayuda`) sin importar módulos de audio.
+  - `tests/test_context_awareness_n7.py`: suite de 20 pruebas integrales cubriendo funcionalidad, seguridad adversarial, auditoría AST de solo lectura, consola e integración N6+N7.
+- Archivos modificados:
+  - `config/settings.py`: constantes configurables y seguras por defecto (`CONTEXT_ENGINE_ENABLED`, `CONTEXT_ALLOWED_CATEGORIES`, `CONTEXT_ENABLED_CATEGORIES`, `CONTEXT_MAX_PROCESSES`, `CONTEXT_MAX_APPLICATIONS`, `CONTEXT_MAX_WINDOWS`, `CONTEXT_MAX_DIR_DEPTH`, `CONTEXT_MAX_DIR_ENTRIES`, `CONTEXT_CACHE_TTL_SEC`, `CONTEXT_PROVIDER_TIMEOUT_SEC`, `CONTEXT_MINIMIZE_FOR_LLM`, `CONTEXT_INCLUDE_HOSTNAME`, `CONTEXT_INCLUDE_PROCESS_USER`, `CONTEXT_INCLUDE_PROCESS_EXE`).
+  - `src/brain/goal_engine.py`: integración no intrusiva con `ContextAwarenessEngine` (`context_engine`, `set_context_engine`, `request_context`, `_enrich_goal_with_n7_context`) manteniendo 100% de retrocompatibilidad cuando N7 no está conectado o se deshabilita.
+  - `src/brain/goal_persistence.py`: redacción recursiva de secretos (`_redact_nested_data`) sobre `goal.context` y `goal.missing_info` antes de persistir instantáneas `.goal.json`.
+  - `src/brain/goal_console.py`: inyección opcional de `context_engine` hacia `GoalEngine`.
+  - `main.py`: inicialización perezosa de `ContextAwarenessEngine` y `ContextConsoleHandler` para `/contexto` (y `/context`) en consola sin penalizar el tiempo de arranque ni cargar `faster_whisper` / STT / TTS.
+
+### 2. Verificaciones Realmente Ejecutadas y Estado del Roadmap (N7)
+
+- Compilación estática (`.\venv\Scripts\python.exe -m py_compile` sobre todos los módulos nuevos/modificados y suites de pruebas): **0 errores (código 0)**.
+- Suite específica N7 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_context_awareness_n7 -v`): **20 pruebas ejecutadas en 10.606s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite específica N6 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_goal_engine -v`): **27 pruebas ejecutadas en 17.930s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **580 pruebas ejecutadas en 137.875s — OK (0 fallos, 0 errores)**.
+- Smoke test `.\venv\Scripts\python.exe main.py --help` y verificación en subproceso limpio de ausencia de módulos de audio (`src.audio.*`, `faster_whisper`, `sounddevice`) al usar N7 y `/contexto`: **OK (código 0)**.
+- Integridad de `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (intacto antes y después de todas las suites).
+- Estado del bloque de tres fases:
+  - **N5:** cerrada (`v5.2.0`), sin modificaciones de alcance.
+  - **N6:** cerrada (1.ª fase del nuevo bloque), sin modificaciones de alcance.
+  - **N7:** completada y verificada (2.ª fase del bloque actual; no se crea tag individual conforme a la regla de etiquetado cada 3 fases).
+  - **N8:** no iniciada.
+
+

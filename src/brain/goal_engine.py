@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
 from src.brain.goal_models import (
     Constraints,
@@ -38,6 +38,8 @@ from src.tools.skill_manager import SkillManager
 if TYPE_CHECKING:
     from src.brain.brain_manager import BrainManager
     from src.brain.chain_orchestrator import ChainOrchestrator
+    from src.context.engine import ContextAwarenessEngine
+    from src.context.models import ContextSnapshot
 
 
 @dataclass
@@ -59,6 +61,7 @@ class GoalEngine:
         skill_manager: Optional[SkillManager] = None,
         brain_manager: Optional["BrainManager"] = None,
         chain_orchestrator: Optional["ChainOrchestrator"] = None,
+        context_engine: Optional["ContextAwarenessEngine"] = None,
         goal_store: Optional[GoalStore] = None,
         limits: Optional[GoalEngineLimits] = None,
         use_ai: bool = False,
@@ -66,6 +69,7 @@ class GoalEngine:
         self.skill_manager: SkillManager = skill_manager or SkillManager()
         self.brain_manager: Optional["BrainManager"] = brain_manager
         self.chain_orchestrator: Optional["ChainOrchestrator"] = chain_orchestrator
+        self.context_engine: Optional["ContextAwarenessEngine"] = context_engine
         self.limits: GoalEngineLimits = limits or GoalEngineLimits()
 
         self.skill_selector: GoalSkillSelector = GoalSkillSelector(self.skill_manager)
@@ -101,6 +105,109 @@ class GoalEngine:
         self.chain_orchestrator = chain_orchestrator
         self.supervisor.chain_orchestrator = chain_orchestrator
 
+    def set_context_engine(self, context_engine: Optional["ContextAwarenessEngine"]) -> None:
+        """Conecta o reemplaza el motor de observación contextual N7."""
+        self.context_engine = context_engine
+
+    def request_context(
+        self,
+        categories: Optional[Sequence[str]] = None,
+        *,
+        target_paths: Optional[Sequence[str]] = None,
+        force_refresh: bool = False,
+    ) -> Optional["ContextSnapshot"]:
+        """Solicita bajo demanda un snapshot al motor N7 si se encuentra disponible y habilitado."""
+        if self.context_engine is None or not getattr(self.context_engine, "enabled", False):
+            return None
+        return self.context_engine.get_context_safe(
+            categories=categories,
+            target_paths=target_paths,
+            force_refresh=force_refresh,
+        )
+
+    def _enrich_goal_with_n7_context(self, goal: Goal) -> None:
+        """Incorpora contexto real de N7 al `Goal` cuando resulta pertinente para el objetivo.
+
+        Garantías:
+        - Si N7 no está conectado o está deshabilitado, conserva el comportamiento previo de N6.
+        - Evita consultas innecesarias cuando el objetivo no requiere datos del sistema local.
+        - Aísla los datos de N7 bajo un sobre no confiable (`untrusted_system_context`).
+        """
+        if self.context_engine is None or not getattr(self.context_engine, "enabled", False):
+            return
+        if goal.needs_clarification or goal.status == GoalStatus.AWAITING_CLARIFICATION:
+            return
+
+        try:
+            relevant_cats = self.context_engine.infer_relevant_categories_for_goal(
+                goal.raw_input,
+                target_paths=goal.context.target_paths,
+                target_app=goal.context.target_app,
+            )
+        except Exception:
+            return
+
+        if not relevant_cats:
+            return
+
+        snapshot = self.context_engine.get_context_safe(
+            categories=relevant_cats,
+            target_paths=goal.context.target_paths or None,
+        )
+        payload = self.context_engine.build_n6_context_payload(snapshot)
+
+        # Completa información real de hardware sin sobrescribir pistas explícitas del usuario.
+        for hw_key, hw_val in (payload.get("hardware") or {}).items():
+            if hw_key not in goal.context.hardware and hw_val is not None:
+                goal.context.hardware[hw_key] = hw_val
+
+        for env_key, env_val in (payload.get("environment") or {}).items():
+            if env_key not in goal.context.environment and env_val:
+                goal.context.environment[env_key] = str(env_val)
+
+        goal.context.extra["n7_snapshot_id"] = payload.get("snapshot_id")
+        goal.context.extra["n7_requested_categories"] = list(
+            payload.get("requested_categories") or []
+        )
+        goal.context.extra["n7_untrusted_envelope"] = payload.get("untrusted_envelope")
+        if payload.get("unavailable_fields"):
+            goal.context.extra["n7_unavailable_fields"] = list(payload["unavailable_fields"])
+        if payload.get("partial_errors"):
+            goal.context.extra["n7_partial_errors"] = list(payload["partial_errors"])
+            for err_item in payload["partial_errors"]:
+                cat_name = err_item.get("category", "context")
+                err_msg = err_item.get("message", "No disponible")
+                note = f"Dato contextual N7 no disponible ({cat_name}): {err_msg}"
+                if note not in goal.missing_info:
+                    goal.missing_info.append(note)
+
+        if snapshot.applications is not None and goal.context.target_app:
+            target_low = goal.context.target_app.lower()
+            is_running = any(
+                target_low in a.name.lower() or (a.executable_name and target_low in a.executable_name.lower())
+                for a in snapshot.applications.running_applications
+            )
+            is_installed = is_running or any(
+                target_low in a.name.lower() or (a.executable_name and target_low in a.executable_name.lower())
+                for a in snapshot.applications.installed_applications
+            )
+            goal.context.extra["n7_target_app_state"] = {
+                "target_app": goal.context.target_app,
+                "is_running": is_running,
+                "is_installed": is_installed,
+            }
+
+        if snapshot.filesystem is not None and snapshot.filesystem.queried_files:
+            goal.context.extra["n7_target_files"] = [
+                {
+                    "name": f.name,
+                    "exists": f.exists,
+                    "is_dir": f.is_dir,
+                    "category": f.file_category,
+                }
+                for f in snapshot.filesystem.queried_files
+            ]
+
     def interpret_goal(
         self,
         raw_input: str,
@@ -109,11 +216,13 @@ class GoalEngine:
         constraints: Optional[Constraints] = None,
     ) -> Goal:
         """Interpreta una petición en lenguaje natural devolviendo un `Goal` estructurado."""
-        return self.understanding.interpret(
+        goal = self.understanding.interpret(
             raw_input,
             initial_context=context,
             explicit_constraints=constraints,
         )
+        self._enrich_goal_with_n7_context(goal)
+        return goal
 
     def submit_goal(
         self,
@@ -196,6 +305,7 @@ class GoalEngine:
                 clarification_questions=tuple(refined_goal.clarification_questions),
             )
 
+        self._enrich_goal_with_n7_context(refined_goal)
         self._pending_clarification_goal = None
         plan = self.planner.build_plan(refined_goal, limits=limits or self.limits)
         self._active_plan = plan
@@ -281,6 +391,10 @@ class GoalEngine:
         ]
         if plan.goal.constraints.read_only:
             lines.append("Restricciones: MODO SOLO LECTURA (sin modificación de archivos).")
+        n7_snap_id = plan.goal.context.extra.get("n7_snapshot_id")
+        if n7_snap_id:
+            n7_cats = ", ".join(plan.goal.context.extra.get("n7_requested_categories") or [])
+            lines.append(f"Contexto N7 ({n7_snap_id}): categorías={n7_cats or 'ninguna'}")
         if plan.goal.missing_info:
             lines.append("Información faltante detectada: " + "; ".join(plan.goal.missing_info))
         lines.append("Subtareas:")

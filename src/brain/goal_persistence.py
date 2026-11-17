@@ -98,8 +98,19 @@ def _sanitize_identifier(identifier: str, label: str = "id") -> str:
     return clean
 
 
+def _redact_nested_data(value: Any) -> Any:
+    """Redacta recursivamente posibles secretos en diccionarios o listas serializables."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_redact_nested_data(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _redact_nested_data(v) for k, v in value.items()}
+    return value
+
+
 def _sanitize_runtime_strings(payload: dict[str, Any]) -> dict[str, Any]:
-    """Redacta posibles secretos en mensajes de error e historial antes de persistir."""
+    """Redacta posibles secretos en mensajes de error, contexto e historial antes de persistir."""
     cloned = json.loads(json.dumps(payload, ensure_ascii=False))
     goal_dict = cloned.get("goal")
     if isinstance(goal_dict, dict):
@@ -107,6 +118,12 @@ def _sanitize_runtime_strings(payload: dict[str, Any]) -> dict[str, Any]:
             goal_dict["error_summary"] = redact_secrets(goal_dict["error_summary"])
         if isinstance(goal_dict.get("cancellation_reason"), str):
             goal_dict["cancellation_reason"] = redact_secrets(goal_dict["cancellation_reason"])
+        if isinstance(goal_dict.get("context"), dict):
+            goal_dict["context"] = _redact_nested_data(goal_dict["context"])
+        if isinstance(goal_dict.get("missing_info"), list):
+            goal_dict["missing_info"] = [
+                redact_secrets(str(item)) for item in goal_dict["missing_info"]
+            ]
 
     for task in cloned.get("tasks") or []:
         if not isinstance(task, dict):

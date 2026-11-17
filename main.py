@@ -117,6 +117,27 @@ def run_console_session(
     tts_engine: Any = None
     chain_orchestrator: Any = orchestrator
     goal_console_handler: Any = None
+    context_engine_instance: Any = None
+    context_console_handler: Any = None
+
+    def _ensure_context_engine() -> Any:
+        nonlocal context_engine_instance
+        if context_engine_instance is None:
+            from src.context.engine import ContextAwarenessEngine
+
+            context_engine_instance = ContextAwarenessEngine()
+        return context_engine_instance
+
+    def _ensure_context_handler() -> Any:
+        nonlocal context_console_handler
+        if context_console_handler is None:
+            from src.context.console import ContextConsoleHandler
+
+            context_console_handler = ContextConsoleHandler(
+                context_engine=_ensure_context_engine(),
+                output_fn=output_fn,
+            )
+        return context_console_handler
 
     def _ensure_orchestrator() -> Any:
         nonlocal chain_orchestrator
@@ -145,6 +166,7 @@ def run_console_session(
             goal_console_handler = GoalConsoleHandler(
                 skill_manager=getattr(brain_manager, "skill_manager", None),
                 brain_manager=brain_manager,
+                context_engine=_ensure_context_engine(),
                 ensure_orchestrator_fn=_ensure_orchestrator,
                 input_fn=input_fn,
                 output_fn=output_fn,
@@ -171,7 +193,7 @@ def run_console_session(
 
     output_fn("=======================================================")
     output_fn(" J.A.R.V.I.S. — Consola Interactiva Multi-Brain")
-    output_fn(" Comandos: /modo | /voz | /goal <objetivo> | /plan | /optimizar <juego> | /rollback <id> | /limpiar | salir")
+    output_fn(" Comandos: /modo | /voz | /contexto | /goal <objetivo> | /plan | /optimizar <juego> | /rollback <id> | /limpiar | salir")
     output_fn("=======================================================")
 
     try:
@@ -378,6 +400,22 @@ def run_console_session(
                 if tts_active and tts_engine is not None and goal_reply:
                     try:
                         _speak_blocking(tts_engine, goal_reply)
+                    except Exception:
+                        pass
+                continue
+
+            # 4.6 Comandos N7 (/contexto y /context) -> observación contextual del entorno en solo lectura
+            if (
+                lowered == "/contexto"
+                or lowered.startswith("/contexto ")
+                or lowered == "/context"
+                or lowered.startswith("/context ")
+            ):
+                ctx_handler = _ensure_context_handler()
+                ctx_reply = ctx_handler.handle_command(text, output_fn=output_fn)
+                if tts_active and tts_engine is not None and ctx_reply:
+                    try:
+                        _speak_blocking(tts_engine, ctx_reply)
                     except Exception:
                         pass
                 continue

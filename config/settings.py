@@ -378,6 +378,69 @@ GOAL_MAX_REPLANS: int = _env_int("JARVIS_GOAL_MAX_REPLANS", 2, minimum=0)
 # Directorio dedicado para persistencia de objetivos N6 en producción (separado de memory_store.json).
 GOAL_STORE_DIR: Path = BASE_DIR / "data" / "goals"
 
+# ==============================================================================
+# CONFIGURACIÓN DE N7: CONTEXT AWARENESS ENGINE (OBSERVACIÓN DE SOLO LECTURA)
+# ==============================================================================
+# Interruptor maestro de N7. Si es False, las consultas contextuales quedan desactivadas
+# de forma limpia y N6 continúa operando con su flujo determinista previo.
+CONTEXT_ENGINE_ENABLED: bool = _env_bool("JARVIS_CONTEXT_ENABLED", True)
+
+# Categorías válidas de observación del entorno Windows.
+CONTEXT_ALLOWED_CATEGORIES: tuple[str, ...] = (
+    "system",
+    "hardware",
+    "resources",
+    "storage",
+    "processes",
+    "applications",
+    "filesystem",
+)
+
+
+def _build_enabled_context_categories() -> tuple[str, ...]:
+    """
+    Filtra las categorías habilitadas desde `JARVIS_CONTEXT_CATEGORIES` (separadas por coma).
+    Si no se especifica o contiene solo elementos inválidos, usa todas las categorías válidas.
+    """
+    raw = os.getenv("JARVIS_CONTEXT_CATEGORIES", "").strip()
+    if not raw:
+        return CONTEXT_ALLOWED_CATEGORIES
+    selected: list[str] = []
+    for token in raw.split(","):
+        clean = token.strip().lower()
+        if not clean:
+            continue
+        if clean in CONTEXT_ALLOWED_CATEGORIES:
+            if clean not in selected:
+                selected.append(clean)
+        else:
+            CONFIG_WARNINGS.append(
+                f"JARVIS_CONTEXT_CATEGORIES contiene una categoría no válida: '{token.strip()}'."
+            )
+    return tuple(selected) if selected else CONTEXT_ALLOWED_CATEGORIES
+
+
+CONTEXT_ENABLED_CATEGORIES: tuple[str, ...] = _build_enabled_context_categories()
+
+# Cotas de cantidad y profundidad para evitar volcados masivos o consumo innecesario de CPU/RAM.
+CONTEXT_MAX_PROCESSES: int = _env_int("JARVIS_CONTEXT_MAX_PROCESSES", 25, minimum=1)
+CONTEXT_MAX_APPLICATIONS: int = _env_int("JARVIS_CONTEXT_MAX_APPLICATIONS", 40, minimum=1)
+CONTEXT_MAX_WINDOWS: int = _env_int("JARVIS_CONTEXT_MAX_WINDOWS", 25, minimum=1)
+CONTEXT_MAX_DIR_DEPTH: int = _env_int("JARVIS_CONTEXT_MAX_DIR_DEPTH", 3, minimum=1)
+CONTEXT_MAX_DIR_ENTRIES: int = _env_int("JARVIS_CONTEXT_MAX_DIR_ENTRIES", 150, minimum=5)
+
+# Tiempo de vida de caché opcional (en segundos) para evitar consultas repetidas en ráfaga.
+CONTEXT_CACHE_TTL_SEC: float = _env_float("JARVIS_CONTEXT_CACHE_TTL_SEC", 5.0, minimum=0.0)
+
+# Tiempo máximo de espera por proveedor externo/SO (p. ej. `nvidia-smi`), evitando bloqueos.
+CONTEXT_PROVIDER_TIMEOUT_SEC: float = _env_float("JARVIS_CONTEXT_PROVIDER_TIMEOUT_SEC", 3.0, minimum=0.2)
+
+# Minimización y denegación por defecto de identificadores potencialmente sensibles.
+CONTEXT_MINIMIZE_FOR_LLM: bool = _env_bool("JARVIS_CONTEXT_MINIMIZE_FOR_LLM", True)
+CONTEXT_INCLUDE_HOSTNAME: bool = _env_bool("JARVIS_CONTEXT_INCLUDE_HOSTNAME", False)
+CONTEXT_INCLUDE_PROCESS_USER: bool = _env_bool("JARVIS_CONTEXT_INCLUDE_PROCESS_USER", False)
+CONTEXT_INCLUDE_PROCESS_EXE: bool = _env_bool("JARVIS_CONTEXT_INCLUDE_PROCESS_EXE", False)
+
 # Si una variable inválida generó advertencias, se informan una vez al importar (sin secretos).
 for _warning in CONFIG_WARNINGS:
     print(f"[Config] Aviso: {_warning}", file=sys.stderr)

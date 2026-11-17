@@ -27,6 +27,7 @@ class GoalConsoleHandler:
         goal_engine: Optional[GoalEngine] = None,
         skill_manager: Any = None,
         brain_manager: Any = None,
+        context_engine: Any = None,
         ensure_orchestrator_fn: Optional[Callable[[], Any]] = None,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
@@ -34,6 +35,7 @@ class GoalConsoleHandler:
         self._goal_engine: Optional[GoalEngine] = goal_engine
         self._skill_manager = skill_manager
         self._brain_manager = brain_manager
+        self._context_engine = context_engine
         self._ensure_orchestrator_fn = ensure_orchestrator_fn
         self._input_fn = input_fn
         self._output_fn = output_fn
@@ -44,6 +46,7 @@ class GoalConsoleHandler:
             self._goal_engine = GoalEngine(
                 skill_manager=self._skill_manager,
                 brain_manager=self._brain_manager,
+                context_engine=self._context_engine,
                 use_ai=False,
             )
         return self._goal_engine
