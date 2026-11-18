@@ -441,6 +441,47 @@ CONTEXT_INCLUDE_HOSTNAME: bool = _env_bool("JARVIS_CONTEXT_INCLUDE_HOSTNAME", Fa
 CONTEXT_INCLUDE_PROCESS_USER: bool = _env_bool("JARVIS_CONTEXT_INCLUDE_PROCESS_USER", False)
 CONTEXT_INCLUDE_PROCESS_EXE: bool = _env_bool("JARVIS_CONTEXT_INCLUDE_PROCESS_EXE", False)
 
+# ==============================================================================
+# N8.1 — LONG-TERM MEMORY & EXPERIENCE (PERSISTENCIA, LÍMITES Y LOCKING)
+# ==============================================================================
+# N8 permanece desacoplado de N6/N7 en persistencia: su almacén independiente vive
+# en data/experiences.db y en entorno de pruebas debe redirigirse al sandbox temporal.
+_raw_n8_db_path = (os.getenv("JARVIS_N8_DB_PATH") or "").strip()
+EXPERIENCES_DB_PATH: Path = (
+    Path(_raw_n8_db_path) if _raw_n8_db_path else (BASE_DIR / "data" / "experiences.db")
+)
+_raw_n8_backup_dir = (os.getenv("JARVIS_N8_BACKUP_DIR") or "").strip()
+MEMORY_BACKUP_DIR: Path = (
+    Path(_raw_n8_backup_dir) if _raw_n8_backup_dir else (BASE_DIR / "data" / "memory_backups")
+)
+
+# Bandera principal de habilitación N8 y control estricto de ingesta en N8.1.
+N8_ENABLED: bool = _env_bool("JARVIS_N8_ENABLED", True)
+# En N8.1 la captura automática post-ejecución permanece reservada/desactivada por defecto.
+N8_AUTO_CAPTURE_ENABLED: bool = _env_bool("JARVIS_N8_AUTO_CAPTURE_ENABLED", False)
+# La categoría INFERENCE queda bloqueada en N8.1 para evitar memorias especulativas.
+N8_ALLOW_INFERENCE_INGEST: bool = _env_bool("JARVIS_N8_ALLOW_INFERENCE_INGEST", False)
+
+# Protocolo de concurrencia C4: lock de archivo + RLock compartido entre instancias y procesos.
+N8_LOCK_TIMEOUT_SEC: float = _env_float("JARVIS_N8_LOCK_TIMEOUT_SEC", 5.0, minimum=0.2)
+N8_SQLITE_BUSY_TIMEOUT_MS: int = _env_int("JARVIS_N8_SQLITE_BUSY_TIMEOUT_MS", 5000, minimum=250)
+
+# Límites deterministas de almacenamiento, longitud y recuperación consultiva futura (N8.2/N8.3).
+N8_MAX_ACTIVE_MEMORIES: int = _env_int("JARVIS_N8_MAX_ACTIVE_MEMORIES", 5000, minimum=10)
+N8_MAX_TITLE_CHARS: int = _env_int("JARVIS_N8_MAX_TITLE_CHARS", 120, minimum=20)
+N8_MAX_CONTENT_CHARS: int = _env_int("JARVIS_N8_MAX_CONTENT_CHARS", 1200, minimum=100)
+N8_MAX_SUMMARY_CHARS: int = _env_int("JARVIS_N8_MAX_SUMMARY_CHARS", 280, minimum=40)
+N8_MAX_REVISIONS_PER_MEMORY: int = _env_int("JARVIS_N8_MAX_REVISIONS_PER_MEMORY", 50, minimum=2)
+
+# Motor de búsqueda textual de SQLite: FTS5 cuando la compilación lo soporta, con fallback SQL.
+N8_FTS5_ENABLED: bool = _env_bool("JARVIS_N8_FTS5_ENABLED", True)
+
+# Presupuestos reservados para recuperación consultiva N8.2/N8.3 (sin uso directo en N8.1).
+N8_TEXT_MAX_ITEMS: int = _env_int("JARVIS_N8_TEXT_MAX_ITEMS", 5, minimum=1)
+N8_TEXT_MAX_CHARS: int = _env_int("JARVIS_N8_TEXT_MAX_CHARS", 1600, minimum=200)
+N8_VOICE_MAX_ITEMS: int = _env_int("JARVIS_N8_VOICE_MAX_ITEMS", 3, minimum=1)
+N8_VOICE_MAX_CHARS: int = _env_int("JARVIS_N8_VOICE_MAX_CHARS", 600, minimum=120)
+
 # Si una variable inválida generó advertencias, se informan una vez al importar (sin secretos).
 for _warning in CONFIG_WARNINGS:
     print(f"[Config] Aviso: {_warning}", file=sys.stderr)

@@ -55,3 +55,24 @@ data/
 
 # Exportaciones documentales de usuario
 exports/
+
+# Bases de datos SQLite locales, locks, backups y artefactos de memoria (N8)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db-tmp
+*.db.lock
+*.db.backup
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.sqlite.lock
+*.sqlite3.lock
+*.corrupt.*
+memory_backups/

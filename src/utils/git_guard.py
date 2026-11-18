@@ -50,6 +50,12 @@ SENSITIVE_FILENAMES: frozenset[str] = frozenset(
         "auth.json",
         "id_rsa",
         "id_ed25519",
+        "memory_store.json",
+        "experiences.db",
+        "experiences.db-wal",
+        "experiences.db-shm",
+        "experiences.db-journal",
+        "experiences.db.lock",
     }
 )
 
@@ -64,6 +70,24 @@ SENSITIVE_EXTENSIONS: tuple[str, ...] = (
     ".wav",
     ".mp3",
     ".bak",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".db-journal",
+    ".db-tmp",
+    ".db.lock",
+    ".db.backup",
+    ".sqlite",
+    ".sqlite3",
+    ".sqlite-wal",
+    ".sqlite-shm",
+    ".sqlite-journal",
+    ".sqlite3-wal",
+    ".sqlite3-shm",
+    ".sqlite3-journal",
+    ".sqlite.lock",
+    ".sqlite3.lock",
+    ".tmp",
 )
 
 # Patrones para detectar valores reales de claves API o tokens dentro de un diff de Git.
@@ -122,6 +146,9 @@ def is_sensitive_path(rel_path: str) -> bool:
     if name_lower.startswith(".env.") or name_lower.endswith(".env"):
         return True
 
+    if ".corrupt." in name_lower or ".db.backup" in name_lower:
+        return True
+
     if any(name_lower.endswith(ext) for ext in SENSITIVE_EXTENSIONS):
         return True
 
@@ -129,9 +156,10 @@ def is_sensitive_path(rel_path: str) -> bool:
         return True
 
     # Directorios sensibles o locales del proyecto
-    if any(part in ("data", ".codex", "venv", ".venv") for part in parts_lower[:-1]):
+    sensitive_dirs = ("data", "backups", "memory_backups", "temp", ".codex", "venv", ".venv")
+    if any(part in sensitive_dirs for part in parts_lower[:-1]):
         return True
-    if parts_lower and parts_lower[0] in ("data", ".codex", "venv", ".venv"):
+    if parts_lower and parts_lower[0] in sensitive_dirs:
         return True
 
     return False

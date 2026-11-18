@@ -1097,3 +1097,41 @@ M1, M2 y B1–B4 tienen correcciones, documentación y verificaciones aprobadas.
 - Suite global completa, tras la corrección: **591 pruebas ejecutadas en 104.119s — OK (0 fallos, 0 errores)**.
 - La memoria real permanece intacta: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`.
 - `git diff --check`: sin errores. El estado de cierre de la iteración anterior queda actualizado: los dos errores del entorno quedaron resueltos y la suite global está verde.
+
+---
+
+## Fase N8.1 — Persistencia Base, Modelos, Políticas y Locking de Memoria a Largo Plazo (2026-11-18)
+
+### 1. Resumen de Implementación
+
+Se implementó el núcleo independiente `src/memory/` para **N8.1 — Long-Term Memory & Experience**, manteniendo intactos `data/memory_store.json`, `N5`, `N6` y `N7` y dejando explícitamente fuera del alcance de esta fase `MemoryRetriever`, `MemoryEngine`, comandos `/memoria` / `/privado` / `/incognito`, captura automática post-ejecución e integración conversacional N6/Multi-Brain (reservados para N8.2 y N8.3).
+
+### 2. Archivos Creados y Modificados
+
+- **Nuevos (`src/memory/`):**
+  - `src/memory/__init__.py`: superficie pública estable de contratos N8.1 para N8.2 y N8.3.
+  - `src/memory/models.py`: enumeraciones (`MemoryCategory`, `MemorySource`, `MemoryStatus`, `MemoryScopeType`, `MemoryAuditAction`), máquina de estados `ALLOWED_MEMORY_TRANSITIONS`, excepciones tipadas (`MemorySubsystemError`, `MemoryValidationError`, `MemoryPolicyError`, `MemoryPrivateModeError`, `MemoryPersistenceError`, `MemoryLockTimeoutError`, `MemoryCorruptionError`, `MemoryDuplicateError`, `MemoryNotFoundError`, `MemoryTransitionError`), `ExecutionVerificationEvidence`, `MemoryProvenance`, `MemoryCreateInput`, `MemoryRecord`, `MemoryRevision`, `MemoryAuditEntry`, `MemoryWriteResult`, `MemoryQueryFilter`, `MemorySearchCandidate`, `IntegrityReport`, `StoreStats` y helpers deterministas (`utc_now_iso`, `parse_iso_utc`, `generate_memory_id`, `canonical_json`, `is_valid_sha256_hex`).
+  - `src/memory/policy.py`: `MemoryPolicy`, `sanitize_memory_text()` (sin reutilizar `sanitize_untrusted_label()`, preservando prosa técnica multilínea mientras elimina `Cf`, `U+034F` y selectores de variación), `normalize_text_for_search()`, `normalize_scope()`, `compute_content_fingerprint()`, rechazo de secretos sin exposición (`assert_no_secrets` con apoyo de `redact_secrets` e `is_sensitive_key`), bloqueo de `INFERENCE`, validación de matriz origen/categoría y `ExecutionVerificationEvidence`, modo privado y validación local segura `validate_safe_local_db_path()` (rechazo UNC/SMB, `..`, `%ENV%`, nombres reservados Windows, reparse points NTFS y bloqueo de `data/` real bajo `JARVIS_ENV=test`).
+  - `src/memory/migrations.py`: esquema SQLite versionado v1 (`schema_migrations`, `store_metadata`, `memories`, `memory_revisions`, `memory_audit`, `memory_fts`), detección runtime `fts5_available()`, tokenizer `unicode61 remove_diacritics 2`, índices parciales únicos (`idx_memories_active_fingerprint`, `idx_memories_active_exec_provenance`) y configuración por conexión (`foreign_keys=ON`, `busy_timeout`, `secure_delete=ON`, `synchronous=FULL`, `temp_store=MEMORY`, `journal_mode=WAL`).
+  - `src/memory/store.py`: `ExperienceStoreLock` (registro modular `_LOCK_REGISTRY` por ruta canónica + `threading.RLock` + lock OS no bloqueante `msvcrt.locking` en Windows / `fcntl.flock` POSIX sobre `<db>.lock` con reentrancia segura entre distintas instancias en el mismo hilo) y `ExperienceStore` con conexiones efímeras cerradas antes de soltar el lock, CRUD transaccional (`BEGIN IMMEDIATE`), dedupe por huella y procedencia de ejecución, revisiones inmutables, revocación con purga directa de `memory_fts`, búsqueda segura FTS5 con respaldo SQL `LIKE` y `verify_integrity()` con cuarentena `.corrupt.<uuid>`.
+- **Modificados:**
+  - `config/settings.py`: añadidas constantes tipadas `EXPERIENCES_DB_PATH`, `MEMORY_BACKUP_DIR`, `N8_ENABLED`, `N8_AUTO_CAPTURE_ENABLED` (`False`), `N8_ALLOW_INFERENCE_INGEST` (`False`), `N8_LOCK_TIMEOUT_SEC`, `N8_SQLITE_BUSY_TIMEOUT_MS`, `N8_MAX_ACTIVE_MEMORIES`, `N8_MAX_TITLE_CHARS`, `N8_MAX_CONTENT_CHARS`, `N8_MAX_SUMMARY_CHARS`, `N8_MAX_REVISIONS_PER_MEMORY`, `N8_FTS5_ENABLED` y presupuestos reservados `N8_TEXT_MAX_*` / `N8_VOICE_MAX_*`.
+  - `.gitignore` y `src/utils/git_guard.py`: añadida protección explícita para `experiences.db*`, `*.db`, `*.db-wal`, `*.db-shm`, `*.db-journal`, `*.db-tmp`, `*.db.lock`, `*.db.backup`, `*.sqlite*`, `*.corrupt.*`, `memory_store.json`, `backups/`, `memory_backups/` y `temp/`.
+  - `tests/test_memory_n8_persistence.py`: suite aislada de 19 pruebas cubriendo modelos, políticas, sanitización, secretos, `INFERENCE`, `EXECUTION_VERIFIED`, migraciones, CRUD/revisiones/revocación/dedupe/FKs/FTS5+SQL fallback/rollback/corrupción, hilos/reentrancia/multiproceso real con `subprocess` y bloqueo Git/UNC.
+  - `docs/N8_LONG_TERM_MEMORY.md` y `README.md`: documentación técnica de N8.1 y separación de contratos reservados N8.2/N8.3.
+  - `prompts_history.txt`: registrado el prompt íntegro de N8.1 (archivo local excluido de Git).
+
+### 3. Verificaciones Realmente Ejecutadas (N8.1)
+
+- Compilación estática (`.\venv\Scripts\python.exe -m py_compile` sobre `config/settings.py`, `src/utils/git_guard.py` y `src/memory/*.py`): **OK (código 0)**.
+- Suite aislada N8.1 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence -v`): **19 pruebas ejecutadas en 15.834s — OK (0 fallos, 0 errores, 0 omitidas)**, incluyendo concurrencia real con `subprocess` de 4 escritores + 1 administrador concurrente e inyección de fallo transaccional con rollback.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"`): **610 pruebas ejecutadas en 130.477s — OK (0 fallos, 0 errores, 0 omitidas)** frente a línea base de **591 pruebas** (+19 pruebas nuevas sin regresiones).
+- Integridad de datos reales:
+  - `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (intacto antes y después).
+  - `data/` contiene únicamente `memory_store.json`; no se creó `data/experiences.db`.
+
+### 4. Pendientes y Límites de Fase
+
+- **Pendiente N8.2:** `MemoryRetriever` (ranking ponderado y presupuesto por voz/texto), backups automatizados y restauración, comandos de consola (`/memoria`, `/privado`, `/incognito`) y purga controlada.
+- **Pendiente N8.3:** captura automática `EXECUTION_VERIFIED` post-ejecución desde N5/N6 y síntesis consultiva aislada hacia N6/Multi-Brain.
+- En esta iteración N8.1 solo se publica commit verificado (sin crear tag nuevo, reservando los tags anotados según la cadencia de cierre por bloques/fases de `AGENTS.md`).
