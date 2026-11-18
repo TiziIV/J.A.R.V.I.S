@@ -62,7 +62,7 @@ _TOKEN_FORMAT_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Conserva el nombre del encabezado y el esquema; solo se oculta la credencial.
 _AUTH_SCHEME_RE: re.Pattern[str] = re.compile(
     r"(?i)\b((?:proxy-)?authorization\s*[:=]\s*[\"']?(?:bearer|basic|digest|token|negotiate)\s+)"
-    r"([A-Za-z0-9_\-\.~+/]{6,}={0,2})"
+    r"([A-Za-z0-9_\-\.~+/]+={0,2})"
 )
 # Encabezado sin esquema: exige que el valor contenga al menos un dígito para no tocar prosa.
 _AUTH_BARE_RE: re.Pattern[str] = re.compile(
@@ -92,15 +92,15 @@ _URL_PARAM_RE: re.Pattern[str] = re.compile(
 _KV_RE: re.Pattern[str] = re.compile(
     r"""(?ix)
     (?P<prefix>
-        (?P<kq>["']?)\b
+        (?:\\?["']?)\b
         (?P<key>api[_\-]?key|apikey|x-api-key|access[_\-]?token|refresh[_\-]?token|id[_\-]?token|
-                auth[_\-]?token|client[_\-]?secret|private[_\-]?key|secret|token|password|passwd|pwd)
-        (?P=kq)\s*(?P<sep>[:=])\s*
+                auth[_\-]?token|client[_\-]?secret|private[_\-]?key|secret|token|password|passwd|pwd|authorization|proxy-authorization)(?:[_\-][a-z0-9_-]+)?
+        (?:\\?["']?)\s*(?P<sep>[:=])\s*
     )
     (?:
-        (?P<vq>["'])(?P<qval>[^"'\r\n]{3,})(?P=vq)
+        (?P<vq>\\?["'])(?P<qval>(?:\\.|[^\\])*?)(?:\\?["'])
         |
-        (?P<val>[A-Za-z0-9_\-\.~+/!@\#$%^*]{6,}={0,2})
+        (?P<val>[A-Za-z0-9_\-\.~+/!@\#$%^*]+={0,2})
     )
     """
 )
@@ -110,7 +110,7 @@ _CREDENTIAL_LIKE_RE: re.Pattern[str] = re.compile(r"[\d_\-/+~!@#$%^*=]")
 _SENSITIVE_KEY_RE: re.Pattern[str] = re.compile(
     r"(?i)^(?:api[_\-]?key|apikey|x-api-key|access[_\-]?token|refresh[_\-]?token|id[_\-]?token|"
     r"auth[_\-]?token|client[_\-]?secret|private[_\-]?key|secret|token|password|passwd|pwd|"
-    r"authorization|proxy-authorization)$"
+    r"authorization|proxy-authorization)(?:[_\-][a-z0-9_-]+)?$"
 )
 
 
@@ -125,7 +125,8 @@ def _kv_replacement(match: re.Match[str]) -> str:
         quote = match.group("vq")
         return f"{match.group('prefix')}{quote}{_REDACTED}{quote}"
     value = match.group("val")
-    if match.group("sep") == ":" and not _CREDENTIAL_LIKE_RE.search(value):
+    is_authorization = "authorization" in match.group("key").lower()
+    if match.group("sep") == ":" and not is_authorization and not _CREDENTIAL_LIKE_RE.search(value):
         return match.group(0)
     return f"{match.group('prefix')}{_REDACTED}"
 
@@ -146,22 +147,39 @@ def _redact_text(text: str, extra_secrets: tuple[str, ...]) -> str:
     return sanitized
 
 
-def _redact_structure(value: Any, extra_secrets: tuple[str, ...]) -> Any:
-    """Redacción recursiva sobre diccionarios, listas y tuplas (otros tipos se devuelven intactos)."""
+def _redact_structure(
+    value: Any,
+    extra_secrets: tuple[str, ...],
+    visited: Optional[dict[int, Any]] = None,
+) -> Any:
+    """Redacta estructuras anidadas y sustituye ciclos para evitar recursión infinita."""
+    if visited is None:
+        visited = {}
     if isinstance(value, str):
         return _redact_text(value, extra_secrets)
     if isinstance(value, dict):
+        if id(value) in visited:
+            return "[CIRCULAR_REFERENCE]"
         redacted: dict[Any, Any] = {}
+        visited[id(value)] = redacted
         for key, item in value.items():
             if is_sensitive_key(key) and isinstance(item, (str, int, float)) and not isinstance(item, bool) and item != "":
                 redacted[key] = _REDACTED
             else:
-                redacted[key] = _redact_structure(item, extra_secrets)
+                redacted[key] = _redact_structure(item, extra_secrets, visited)
         return redacted
     if isinstance(value, list):
-        return [_redact_structure(item, extra_secrets) for item in value]
+        if id(value) in visited:
+            return "[CIRCULAR_REFERENCE]"
+        redacted_list: list[Any] = []
+        visited[id(value)] = redacted_list
+        redacted_list.extend(_redact_structure(item, extra_secrets, visited) for item in value)
+        return redacted_list
     if isinstance(value, tuple):
-        return tuple(_redact_structure(item, extra_secrets) for item in value)
+        if id(value) in visited:
+            return "[CIRCULAR_REFERENCE]"
+        visited[id(value)] = "[CIRCULAR_REFERENCE]"
+        return tuple(_redact_structure(item, extra_secrets, visited) for item in value)
     return value
 
 

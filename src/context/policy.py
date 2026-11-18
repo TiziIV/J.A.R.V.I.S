@@ -137,6 +137,9 @@ FORBIDDEN_CONTEXT_EXTENSIONS: tuple[str, ...] = (
     ".sqlite-wal",
     ".sqlite-shm",
     ".sqlite-journal",
+    ".sqlite3-wal",
+    ".sqlite3-shm",
+    ".sqlite3-journal",
     ".db-wal",
     ".db-shm",
     ".db-journal",
@@ -167,6 +170,10 @@ _VARIABLE_TAIL_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\.\d{8}_\d{6}(?:_\d{1,6})?(?:_[a-z0-9]+)?$"),
     re.compile(r"\.[0-9a-f]{8,32}$"),
     re.compile(r"\.\d{1,4}$"),
+)
+_TRAILING_UNSAFE_SUFFIX_RE: re.Pattern[str] = re.compile(
+    r"(?i)(?:\.backup|\.temp|\.save|\.copy|\.orig|\.swp|\.swo|\.bak|\.bkp|\.bk|\.old|\.tmp|~|"
+    r"\.\d{8}_\d{6}(?:_\d{1,6})?(?:_[a-z0-9]+)?|\.[0-9a-f]{8,32}|\.\d{1,4})+$"
 )
 
 # Nombres de directorios sensibles bloqueados en cualquier nivel para consultas N7 (F3).
@@ -305,7 +312,7 @@ _FILTERED_MARKER = "[DATO_SISTEMA_FILTRADO]"
 # Verbos de anulación/evasión y sustantivos-objetivo (todo en minúsculas y SIN tildes: el texto
 # se compara ya plegado, ver `_neutralize_injection`).
 _OVERRIDE_VERBS = (
-    r"(?:ignore|ignora|ignorar|ignoren|disregard|forget|olvida|olvidar|omite|omitir|omitan|"
+    r"(?:ignore|ignora|ignorar|ignoren|disregard|forget|olvida|olvidar|omite|omitir|omitan|cambia|cambiar|borra|borrar|revela|revelar|"
     r"descarta|descartar|desobedece|desobedecer|anula|anular|bypass|override|overrule|"
     r"saltea|salta|saltear|reemplaza|reemplazar|sustituye|sustituir|sobrescribe|sobrescribir|"
     r"replace|overwrite)"
@@ -390,12 +397,22 @@ _INJECTION_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
 # palabras; controles/privados/no asignados/separadores de línea se convierten en espacio.
 _UNICODE_DROP_CATEGORIES: frozenset[str] = frozenset({"Cf"})
 _UNICODE_SPACE_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cs", "Co", "Cn", "Zl", "Zp"})
+_UNICODE_DROP_CODEPOINTS: frozenset[int] = frozenset(
+    {0x034F, *range(0xFE00, 0xFE10), *range(0xE0100, 0xE01F0)}
+)
+_CYRILLIC_CONFUSABLES: dict[str, str] = {
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x",
+    "і": "i", "ј": "j", "у": "y", "к": "k", "м": "m", "т": "t",
+    "в": "b", "н": "h",
+}
 
 
 def _normalize_untrusted_text(text: str) -> str:
     """NFKC + eliminación de caracteres invisibles y de control (anti ZWSP/bidi/homoglifos de ancho)."""
     out: list[str] = []
     for ch in unicodedata.normalize("NFKC", text):
+        if ord(ch) in _UNICODE_DROP_CODEPOINTS:
+            continue
         category = unicodedata.category(ch)
         if category in _UNICODE_DROP_CATEGORIES:
             continue
@@ -418,7 +435,8 @@ def _neutralize_injection(text: str) -> str:
         for part in unicodedata.normalize("NFKD", ch):
             if unicodedata.combining(part):
                 continue
-            for lowered in part.lower():
+            normalized_part = part.translate(str.maketrans(_CYRILLIC_CONFUSABLES)).lower()
+            for lowered in normalized_part:
                 folded_chars.append(lowered)
                 index_map.append(idx)
     if not folded_chars:
@@ -460,6 +478,15 @@ def _check_single_sensitive_basename(clean_name: str) -> bool:
         return False
     if clean_name in FORBIDDEN_CONTEXT_FILENAMES:
         return True
+    if clean_name in {"npmrc", "envrc", "netrc", "pypirc"}:
+        return True
+    if clean_name == "wallet":
+        return True
+    # Gestores de paquetes y configuraciones de credenciales suelen crear copias con sufijos propios.
+    if clean_name.startswith((".npmrc.", ".envrc.", ".netrc.", ".pypirc.", "npmrc.", "envrc.", "netrc.", "pypirc.")):
+        return True
+    if clean_name.startswith("wallet.") and clean_name.endswith((".bak", ".backup", ".old", ".tmp")):
+        return True
     if clean_name.startswith(".env.") or clean_name.endswith(".env"):
         if clean_name not in {".env.example", ".env.template", ".env.sample", ".env.dist"}:
             return True
@@ -491,11 +518,19 @@ def _check_single_sensitive_basename(clean_name: str) -> bool:
 
 
 def _sensitive_name_variants(name: str) -> tuple[str, ...]:
-    """Variantes de un nombre sin prefijo temporal (`.~`, `.`) para comparar contra las listas."""
+    """Genera variantes conservando puntos internos de nombres ocultos."""
     variants = [name]
-    trimmed = name.lstrip(".~")
-    if trimmed and trimmed != name:
-        variants.append(trimmed)
+    if name.startswith(".~"):
+        editor_variant = name[2:]
+        if editor_variant:
+            variants.append(editor_variant)
+            stripped_hidden = editor_variant.lstrip(".")
+            if stripped_hidden and stripped_hidden != editor_variant:
+                variants.append(stripped_hidden)
+    elif name.startswith("."):
+        stripped_hidden = name.lstrip(".")
+        if stripped_hidden and stripped_hidden != name:
+            variants.append(stripped_hidden)
     return tuple(variants)
 
 
@@ -521,26 +556,13 @@ def is_sensitive_context_filename(filename: str) -> bool:
     if not current:
         return False
 
-    # Cada iteración retira como máximo un sufijo; el bucle termina cuando no hay más que retirar.
-    # (el límite de iteraciones es una salvaguarda defensiva contra nombres patológicos)
-    for _ in range(32):
-        if any(_check_single_sensitive_basename(variant) for variant in _sensitive_name_variants(current)):
-            return True
-        reduced = current
-        for suffix in _BACKUP_OR_TEMP_SUFFIXES:
-            if reduced.endswith(suffix) and len(reduced) > len(suffix):
-                reduced = reduced[: -len(suffix)].rstrip(". ")
-                break
-        else:
-            for tail_re in _VARIABLE_TAIL_RES:
-                tail_match = tail_re.search(reduced)
-                if tail_match and tail_match.start() > 0:
-                    reduced = reduced[: tail_match.start()].rstrip(". ")
-                    break
-        if not reduced or reduced == current:
-            return False
-        current = reduced
-    return False
+    # Una expresión con sufijos repetidos evita reprocesar el nombre entero por cada `.bak`.
+    # Así el coste crece con la longitud de entrada, sin un límite fijo de iteraciones.
+    normalized = _TRAILING_UNSAFE_SUFFIX_RE.sub("", current).rstrip(". ")
+    return any(
+        _check_single_sensitive_basename(variant)
+        for variant in _sensitive_name_variants(normalized)
+    )
 
 
 def sanitize_untrusted_label(raw_text: Any, *, max_len: int = 160) -> str:

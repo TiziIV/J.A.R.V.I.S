@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import ssl
 import subprocess
@@ -21,6 +22,7 @@ import threading
 import time
 from typing import Any
 import unittest
+import uuid
 from urllib.parse import urlsplit
 import zlib
 
@@ -60,6 +62,27 @@ from src.tools.skill_manager import SkillManager
 
 PUBLIC_TEST_IP = "93.184.216.34"
 PUBLIC_TEST_IPV6 = "2606:2800:220:1:248:1893:25c8:1946"
+
+
+class _WorkspaceTemporaryDirectory:
+    """Crea temporales bajo el repo con permisos heredados, válidos en Windows y sandbox."""
+
+    def __init__(self) -> None:
+        self.root: Path = Path(__file__).resolve().parents[1] / "temp" / "web_extraction_tests"
+        self.path: Path = self.root
+
+    def __enter__(self) -> str:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / f"run_{uuid.uuid4().hex}"
+        self.path.mkdir()
+        return str(self.path)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        root = self.root.resolve()
+        target = self.path.resolve()
+        if target.parent != root or not target.is_relative_to(root):
+            raise RuntimeError("Se rechazó limpiar un temporal fuera de la raíz de pruebas.")
+        shutil.rmtree(target)
 
 
 def _make_routed_socket_factory(
@@ -625,7 +648,7 @@ class TestWebTransportSecurityAndStreamingRealServer(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with _WorkspaceTemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             ca_path, cert_path, key_path = _generate_ephemeral_tls_bundle(tmp_dir, ["docs.example.test"])
 
@@ -1108,7 +1131,7 @@ class TestSkillIntegrationAndDocumentConverter(unittest.TestCase):
         multi_cites = [el for el in parsed_multi.elements if isinstance(el, Citation)]
         self.assertEqual([c.source_id for c in multi_cites], ["src-1", "src-2"])
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with _WorkspaceTemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             exporter = DocumentExportSkill(allowed_roots=[tmp_dir])
             out_msg = converter.export(

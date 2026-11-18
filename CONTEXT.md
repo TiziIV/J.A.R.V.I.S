@@ -1052,3 +1052,42 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 
 
 
+
+## Remediación M1, M2 y B1–B4 — iteración de cierre N7 (2026-11-18)
+
+### Cambios aplicados
+
+- Prompt íntegro de cierre registrado en `prompts_history.txt` (archivo local excluido de Git).
+- `src/brain/exceptions.py`: redacción recursiva segura ante ciclos; cubre Basic breve, JSON y claves Authorization compuestas, incluso en JSON con comillas escapadas. `BrainError` conserva redacción en mensaje y `detail`.
+- `src/brain/goal_persistence.py`: redacta estructuras WAL antes de serializarlas; las rutas de snapshot mantienen su saneamiento recursivo.
+- `src/brain/goal_supervisor.py`: las observaciones N7 y resúmenes no confiables viajan como JSON con procedencia, escapando delimitadores antes de formar la síntesis. El resultado conserva un envelope no confiable en vez de devolver `None`.
+- `src/context/process_app_provider.py`: `ApplicationAwarenessProvider.collect()` ahora omite ventanas por defecto; el opt-in explícito sigue disponible.
+- `src/context/policy.py`: bloquea journals WAL/SHM SQLite, nombres sensibles con sufijos de credenciales y variantes ocultas; normaliza sufijos hasta convergencia sin tope fijo. La defensa de sanitización contempla U+034F, selectores de variación, homoglifos cirílicos comunes y verbos imperativos con objetivos de instrucciones.
+- `tests/test_context_awareness_n7.py`: amplía los casos existentes de persistencia, ciclos, falsos positivos, aislamiento N6, privacidad, nombres sensibles y cantidades de sufijos (31, 32, 33, 100, 1000 y 10000).
+- `tests/test_web_extraction_skill.py`: sus dos pruebas que generan archivos temporales usan una carpeta temporal bajo el repositorio; así evitan los errores de ACL de `%TEMP%` observados en Windows y permiten ejecutar la suite global en este entorno.
+- `README.md` y `docs/N7_CONTEXT_AWARENESS_ENGINE.md`: reflejan el estado en verificación, la frontera JSON estructural, el default privado y las variantes de nombres bloqueadas.
+
+### Verificaciones ejecutadas
+
+- `py_compile` de los módulos modificados y la suite N7: **OK**.
+- Casos focalizados de M1, B1, M2 y B2/B3: **OK**.
+- Suite N7: **31 pruebas — OK**.
+- Regresión N5 + N6 (`test_goal_engine`, `test_file_editor_and_chain`, `test_transaction_recovery`, `test_memory_isolation`): **154 pruebas — OK**.
+- Suite global: primera ejecución con `%TEMP%` del sistema produjo dos errores en `tests.test_web_extraction_skill` (exportación temporal y escritura/limpieza de PEM con `PermissionError`). Se ajustaron esas dos pruebas para usar temporales bajo el repositorio; los dos casos focalizados pasaron y la suite global final ejecutó **591 pruebas — OK (0 fallos, 0 errores)** en 104.119s.
+- `git diff --check`: **sin errores** (Git advirtió normalización LF/CRLF para archivos afectados).
+- Auditoría AST de solo lectura incluida en `test_11_security_read_only_enforcement_and_file_integrity_preserved`: **pasó** como parte de N7.
+- `GitSafetyGuard`: rama `main`; `find_tracked_sensitive_files() == []`; cero secretos detectados en los archivos candidatos; staging vacío al finalizar las verificaciones.
+- Integridad de memoria antes/después: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (sin cambios).
+
+### Estado de cierre
+
+M1, M2 y B1–B4 tienen correcciones, documentación y verificaciones aprobadas. El cierre técnico queda **CERRADO**, incluida la suite global y el análisis AST de solo lectura. N7 queda habilitada para avanzar a N8; N8 todavía no se inició. Pendiente: gestión Git requerida (preparación específica, auditoría de staging, commit, tag anotado del hito y push normal) y confirmar el estado remoto final.
+
+### Seguimiento — normalización de temporales de pruebas Windows (2026-11-18)
+
+- Causa de los dos errores previos: en este entorno, `tempfile.TemporaryDirectory` crea directorios temporales con permisos ACL que impiden la escritura de los artefactos de las pruebas. No era un fallo del exportador ni de la generación de certificados.
+- `tests/test_web_extraction_skill.py`: los dos casos afectados ahora usan `_WorkspaceTemporaryDirectory`, que crea temporales bajo `temp/web_extraction_tests` con permisos heredados del workspace y valida que la limpieza quede estrictamente dentro de esa raíz.
+- Verificación aislada de exportación Markdown/DOCX y TLS/SNI: **2/2 OK**.
+- Suite global completa, tras la corrección: **591 pruebas ejecutadas en 104.119s — OK (0 fallos, 0 errores)**.
+- La memoria real permanece intacta: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`.
+- `git diff --check`: sin errores. El estado de cierre de la iteración anterior queda actualizado: los dos errores del entorno quedaron resueltos y la suite global está verde.

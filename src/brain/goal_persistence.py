@@ -113,7 +113,7 @@ def _redact_nested_data(value: Any) -> Any:
     if isinstance(value, str):
         return redact_secrets(value)
     if isinstance(value, list):
-        return [_redact_nested_data(item) for item in value]
+        return redact_secrets(value)
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for k, v in value.items():
@@ -245,7 +245,9 @@ class GoalStore:
                 "event_type": str(event_type),
                 "payload": payload,
             }
-            line = redact_secrets(json.dumps(record, ensure_ascii=False)) + "\n"
+            # Redactamos antes de serializar para que las claves sensibles sigan siendo estructura,
+            # no texto JSON ambiguo que pueda evadir la detección.
+            line = json.dumps(redact_secrets(record), ensure_ascii=False) + "\n"
             try:
                 with open(wal_path, "a", encoding="utf-8") as fh:
                     fh.write(line)
@@ -253,7 +255,7 @@ class GoalStore:
                     os.fsync(fh.fileno())
             except OSError as err:
                 raise GoalPersistenceError(
-                    f"No se pudo escribir evento WAL para '{plan_id}': {err}"
+                    redact_secrets(f"No se pudo escribir evento WAL para '{plan_id}': {err}")
                 ) from err
 
     def load_plan(self, plan_id: str) -> GoalPlan:

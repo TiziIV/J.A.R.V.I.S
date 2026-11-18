@@ -363,7 +363,7 @@ class ApplicationAwarenessProvider:
     def collect(
         self,
         *,
-        include_windows: bool = True,
+        include_windows: bool = False,
         target_app: Optional[str] = None,
     ) -> ApplicationAwarenessInfo:
         """Diferencia aplicaciones instaladas, aplicaciones en ejecución y ventanas activas.
