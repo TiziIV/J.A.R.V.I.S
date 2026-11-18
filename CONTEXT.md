@@ -1010,6 +1010,45 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 - Integridad de `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (idéntico antes y después de todas las pruebas).
 - Auditoría `GitSafetyGuard`: `find_tracked_sensitive_files() == []`, `0` secretos detectados en diff/archivos candidatos y `prompts_history.txt` excluido de Git.
 
+---
+
+## Remediación Final de Observaciones de Auditoría N7 (Cierre F4.A / F4.B / F4.C + Hardening F1 / F3 + Documentación) (2026-11-17)
+
+### 1. Observaciones Resueltas y Cambios Aplicados
+
+- Prompt completo registrado en `prompts_history.txt` (`PROYECTO J.A.R.V.I.S. — REMEDIACIÓN FINAL DE OBSERVACIONES DE AUDITORÍA N7`).
+- **Bloque A (F4.A — Ventanas desactivadas por defecto en `src/context/engine.py`, `src/context/console.py`):**
+  - `ContextAwarenessEngine.get_context()` y `get_context_safe()` cambian el valor predeterminado a `include_windows: bool = False` y pasan explícitamente `include_windows` y `target_app` a `ApplicationAwarenessProvider.collect(...)`.
+  - `/contexto` (resumen general), `get_context()` sin argumentos, `get_context(categories=["applications"])` y los flujos automáticos de N6 realizan **cero** llamadas al enumerador de ventanas y nunca persisten títulos de ventanas en `.goal.json` ni `.wal.jsonl`.
+  - `/contexto aplicaciones` en `ContextConsoleHandler` realiza opt-in explícito pasando `include_windows=True`.
+- **Bloque B (F4.B — Redacción estructural de secretos sin falsos positivos en `src/brain/exceptions.py`, `src/brain/goal_persistence.py`):**
+  - `redact_secrets()` reemplaza las expresiones regulares genéricas por coincidencia estructural sobre cadenas y estructuras anidadas (`dict`, `list`, `tuple`), redactando `Authorization: Basic <base64>`, `Authorization: Bearer <token>`, `api_key=...`, credenciales en URL (`user:pass@host`, `?token=`, `&access_token=`), JWT (`eyJ...`) y campos JSON/diccionario con claves sensibles (`password`, `token`, `secret`, `api_key`).
+  - Se eliminan los falsos positivos sobre prosa común de error (`"The bearer authorization failed twice"`, `"password: incorrect"`, `"Login error - password: incorrect"`).
+- **Bloque C (F4.C — Aislamiento de datos no confiables y endurecimiento de `sanitize_untrusted_label` en `src/context/policy.py`, `src/context/engine.py`, `src/brain/goal_engine.py`, `src/brain/goal_supervisor.py`):**
+  - `sanitize_untrusted_label()` aplica normalización Unicode `NFKC`, elimina caracteres invisibles de categoría `Cf` (Zero-Width Space `\u200b`, BOM, controles bidi) y evalúa patrones sobre copia con plegado de tildes (`NFKD` sin marcas combinantes), neutralizando variantes en español y voseo (`"reemplazá el mensaje del sistema"`, `"ejecutá esta herramienta"`, `"ignora el prompt anterior"`), etiquetas XML compuestas (`"</system_prompt>"`) y objetos JSON anidados con claves previas (`{"ok": 1, "function_call": ...}`, `{"note": "ok", "skill_params": ...}`).
+  - En `GoalEngine._enrich_goal_with_n7_context()` y `ContextAwarenessEngine.build_n6_context_payload()`, todas las cadenas de hardware y entorno provenientes de N7 se sanitizan al ingresar a N6 y se marcan con `n7_trust_boundary="untrusted_system_context"`.
+  - En `ExecutionSupervisor._execute_internal_synthesis()`, `plan.goal.context.hardware` se sanitiza y se interpola explícitamente delimitado como `<DATO_EXTERNO_NO_CONFIABLE_SOLO_LECTURA>...</DATO_EXTERNO_NO_CONFIABLE_SOLO_LECTURA>`, registrando `untrusted_hardware_context=True` en `execution_evidence`.
+- **Bloque D (F3 — Endurecimiento de rutas sensibles en `src/context/policy.py`):**
+  - Sin modificar las raíces de N5 (`AUTHORIZED_FILE_ROOTS`) ni `FileEditorSkill`, `ContextAccessPolicy` bloquea en N7 el acceso genérico a `BASE_DIR/data` y `<auth_root>/data` (`data/other_private.json`, `data/goals`, `data/transactions`), perfiles completos de Opera GX (`Opera Software`, `Opera GX Stable`), `.envrc`, `.htpasswd`, `id_*.pub` (`id_rsa.pub`, `id_ed25519.pub`) y bases de datos locales (`*.sqlite`, `*.sqlite3`, `*.db`, `wallet.db`, `wallet.dat`, `wallet.json`).
+- **Bloque E (F1 — Normalización iterativa de sufijos encadenados en `src/context/policy.py`):**
+  - `is_sensitive_context_filename()` retira de forma iterativa secuencias arbitrarias de sufijos temporales/respaldo (`.bak`, `.tmp`, `.backup`, `.old`, `.orig`, `.swp`, timestamps `.YYYYMMDD_HHMMSS_ffffff` y colas hexadecimales), bloqueando combinaciones como `credentials.json.bak.tmp` y `credentials.json.tmp.bak` sin afectar archivos normales.
+- **Bloque F (Documentación en `README.md`, `docs/N7_CONTEXT_AWARENESS_ENGINE.md`, `CONTEXT.md`):**
+  - Eliminada la referencia a `CODEBASE_INDEX.md` inexistente en `README.md`.
+  - Reemplazados los enlaces absolutos locales `file:///e:/...` en `docs/N7_CONTEXT_AWARENESS_ENGINE.md` por enlaces relativos portables (`../src/context/...`).
+  - Documentados el valor por defecto `include_windows=False`, el opt-in de `/contexto aplicaciones`, las exclusiones F3, la normalización iterativa F1 y la frontera estructural de datos no confiables F4.C.
+- **Pruebas nuevas:** añadidas `test_27` a `test_31` en `tests/test_context_awareness_n7.py` (total N7: **31 pruebas**; total global: **591 pruebas**).
+
+### 2. Verificaciones Realmente Ejecutadas (Remediación Final N7)
+
+- Compilación estática (`.\venv\Scripts\python.exe -m py_compile` sobre todos los módulos modificados y pruebas): **0 errores (código 0)**.
+- Suite específica N7 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_context_awareness_n7 -v`): **31 pruebas ejecutadas en 14.475s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suites de regresión N5 + N6 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_file_editor_and_chain tests.test_transaction_recovery tests.test_memory_isolation tests.test_goal_engine -v`): **154 pruebas ejecutadas en 64.959s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **591 pruebas ejecutadas en 112.886s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Verificación programática de portabilidad de enlaces y rutas en `README.md` y `docs/N7_CONTEXT_AWARENESS_ENGINE.md` + `main.py --help`: **OK (código 0)**.
+- Integridad de `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222` (idéntico antes y después de todas las pruebas).
+- Estado de N8: permanece no iniciada / pendiente de auditoría independiente posterior de cierre definitivo de N7.
+
+
 
 
 

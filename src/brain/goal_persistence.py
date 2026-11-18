@@ -22,7 +22,7 @@ from typing import Any, Optional
 import uuid
 
 from config.settings import BASE_DIR, GOAL_STORE_DIR
-from src.brain.exceptions import redact_secrets
+from src.brain.exceptions import is_sensitive_key, redact_secrets
 from src.brain.goal_models import (
     GoalPersistenceError,
     GoalPlan,
@@ -115,11 +115,16 @@ def _redact_nested_data(value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_nested_data(item) for item in value]
     if isinstance(value, dict):
-        return {
-            str(k): _redact_nested_data(v)
-            for k, v in value.items()
-            if str(k) not in _VOLATILE_CONTEXT_KEYS
-        }
+        cleaned: dict[str, Any] = {}
+        for k, v in value.items():
+            if str(k) in _VOLATILE_CONTEXT_KEYS:
+                continue
+            # Un valor escalar bajo una clave sensible (password, token, ...) se oculta por completo.
+            if is_sensitive_key(str(k)) and isinstance(v, (str, int, float)) and not isinstance(v, bool) and v != "":
+                cleaned[str(k)] = "[REDACTED]"
+            else:
+                cleaned[str(k)] = _redact_nested_data(v)
+        return cleaned
     return value
 
 

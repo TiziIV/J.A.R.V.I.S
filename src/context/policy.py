@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import unicodedata
 from typing import Any, Optional, Sequence
 
 from config import settings
@@ -55,8 +56,10 @@ FORBIDDEN_CONTEXT_FILENAMES: frozenset[str] = frozenset(
         ".env.production",
         ".env.test",
         ".env.staging",
+        ".envrc",
         "prompts_history.txt",
         "memory_store.json",
+        "credentials",
         "credentials.json",
         "token.json",
         "auth.json",
@@ -69,8 +72,19 @@ FORBIDDEN_CONTEXT_FILENAMES: frozenset[str] = frozenset(
         ".npmrc",
         ".pypirc",
         ".netrc",
+        ".htpasswd",
+        "htpasswd",
+        ".pgpass",
+        ".my.cnf",
+        ".s3cfg",
+        ".boto",
         ".git-credentials",
         ".dockerconfigjson",
+        ".dockercfg",
+        "kubeconfig",
+        ".kubeconfig",
+        "terraform.tfstate",
+        "terraform.tfvars",
         "file_editor_audit.jsonl",
         "jarvis_system.log",
         "id_rsa",
@@ -79,6 +93,9 @@ FORBIDDEN_CONTEXT_FILENAMES: frozenset[str] = frozenset(
         "id_dsa",
         "authorized_keys",
         "known_hosts",
+        "wallet.dat",
+        "wallet.json",
+        "wallet.db",
         "login data",
         "login data for account",
         "cookies",
@@ -97,9 +114,13 @@ FORBIDDEN_CONTEXT_EXTENSIONS: tuple[str, ...] = (
     ".key",
     ".pfx",
     ".p12",
+    ".p8",
+    ".ppk",
     ".kdbx",
+    ".kdb",
     ".jks",
     ".keystore",
+    ".wallet",
     ".ovpn",
     ".gpg",
     ".asc",
@@ -107,18 +128,45 @@ FORBIDDEN_CONTEXT_EXTENSIONS: tuple[str, ...] = (
     ".cer",
     ".crt",
     ".log",
+    # Bases de datos locales (SQLite y similares): suelen guardar sesiones, historiales o tokens.
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".db3",
+    ".sdb",
+    ".sqlite-wal",
+    ".sqlite-shm",
+    ".sqlite-journal",
+    ".db-wal",
+    ".db-shm",
+    ".db-journal",
 )
 
 # Sufijos de respaldo/temporales que no deben permitir evadir la detección de archivos sensibles.
+# Incluye las convenciones reales del proyecto: `<archivo>.<YYYYMMDD_HHMMSS_ffffff>.bak` (backups de
+# FileEditorSkill) y `.<archivo>.<hex>.tmp` / `.~<archivo>.<hex>.tmp` (temporales atómicos).
 _BACKUP_OR_TEMP_SUFFIXES: tuple[str, ...] = (
     ".bak",
     ".backup",
+    ".bkp",
+    ".bk",
     ".old",
     ".orig",
     ".tmp",
+    ".temp",
     ".swp",
+    ".swo",
     ".save",
     ".copy",
+    "~",
+)
+
+# Segmentos finales variables que también se retiran al normalizar (timestamp N5, hex de temporales,
+# contador de rotación `.1`, `.2`).
+_VARIABLE_TAIL_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\.\d{8}_\d{6}(?:_\d{1,6})?(?:_[a-z0-9]+)?$"),
+    re.compile(r"\.[0-9a-f]{8,32}$"),
+    re.compile(r"\.\d{1,4}$"),
 )
 
 # Nombres de directorios sensibles bloqueados en cualquier nivel para consultas N7 (F3).
@@ -130,18 +178,42 @@ FORBIDDEN_CONTEXT_DIR_NAMES: frozenset[str] = frozenset(
         ".azure",
         ".kube",
         ".gnupg",
+        "gnupg",
         ".password-store",
         ".docker",
+        ".gcloud",
+        ".terraform",
         "credentials",
         "secrets",
         "keyrings",
+        "wallet",
         "wallets",
         "user data",
+        # Perfiles completos de navegadores y clientes con sesiones/cookies/contraseñas.
+        "opera software",
+        "opera gx stable",
+        "opera stable",
+        "opera neon",
+        "bravesoftware",
+        "brave-browser",
+        "vivaldi",
+        "yandexbrowser",
+        "chromium",
+        "waterfox",
+        "librewolf",
+        "tor browser",
+        "thunderbird",
+        # Gestores de contraseñas.
+        "1password",
+        "bitwarden",
+        "lastpass",
+        "keepass",
     }
 )
 
 # Subárboles relativos o de perfil de usuario bloqueados específicamente en N7 (F3)
 # sin alterar las raíces autorizadas compartidas con N5 (`FileEditorSkill`).
+# Nota: `BASE_DIR/data` completo se bloquea aparte (ruta absoluta) en `ContextAccessPolicy`.
 FORBIDDEN_CONTEXT_SUBTREES: tuple[str, ...] = (
     "data/goals",
     "data/transactions",
@@ -152,15 +224,11 @@ FORBIDDEN_CONTEXT_SUBTREES: tuple[str, ...] = (
     "microsoft/protect",
     "microsoft/vault",
     "microsoft/crypto",
-    "google/chrome/user data",
-    "microsoft/edge/user data",
-    "bravesoftware/brave-browser/user data",
-    "vivaldi/user data",
-    "opera software/opera stable",
-    "mozilla/firefox/profiles",
-    "1password",
-    "bitwarden",
-    "keepass",
+    "google/chrome",
+    "microsoft/edge",
+    "mozilla/firefox",
+    "mozilla/thunderbird",
+    "discord/local storage",
     "gcloud",
 )
 
@@ -226,52 +294,164 @@ CATEGORY_ALIASES: dict[str, ContextCategory] = {
     "files": ContextCategory.FILESYSTEM,
 }
 
-# Caracteres de control ASCII, controles bidireccionales Unicode y bloque Tags.
+# Se conserva por compatibilidad: caracteres de control ASCII y bidireccionales/Tags de Unicode.
 _CONTROL_AND_BIDI_RE: re.Pattern[str] = re.compile(
     r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\U000e0000-\U000e007f]+"
 )
 
-# Patrones de suplantación de rol, delimitadores o inyección de instrucciones en nombres del sistema (F4).
-_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Instrucciones de anulación o evasión en inglés y español (con variantes y sinónimos)
-    re.compile(
-        r"(?i)\b(?:ignore|ignora|ignorar|ignoren|disregard|forget|olvida|olvidar|omite|omitir|"
-        r"descarta|descartar|desobedece|desobedecer|anula|anular|bypass|override|salta|saltear|"
-        r"reemplaza|sobrescribe)\s+"
-        r"(?:all\s+|any\s+|todas\s+las\s+|todos\s+los\s+|las\s+|los\s+|cualquier\s+)?"
-        r"(?:previous\s+|prior\s+|above\s+|system\s+|safety\s+|security\s+|"
-        r"anteriores\s+|previas\s+|previos\s+|del\s+sistema\s+|de\s+seguridad\s+)?"
-        r"(?:instructions|instrucciones|rules|reglas|policies|pol[ií]ticas|constraints|"
-        r"restricciones|directives|directivas|orders|[oó]rdenes|prompts|guidelines|l[ií]mites)"
+# Marcador literal que reemplaza cualquier fragmento de un dato externo que imite instrucciones.
+_FILTERED_MARKER = "[DATO_SISTEMA_FILTRADO]"
+
+# Verbos de anulación/evasión y sustantivos-objetivo (todo en minúsculas y SIN tildes: el texto
+# se compara ya plegado, ver `_neutralize_injection`).
+_OVERRIDE_VERBS = (
+    r"(?:ignore|ignora|ignorar|ignoren|disregard|forget|olvida|olvidar|omite|omitir|omitan|"
+    r"descarta|descartar|desobedece|desobedecer|anula|anular|bypass|override|overrule|"
+    r"saltea|salta|saltear|reemplaza|reemplazar|sustituye|sustituir|sobrescribe|sobrescribir|"
+    r"replace|overwrite)"
+)
+_OVERRIDE_NOUNS = (
+    r"(?:instructions?|instrucciones?|rules?|reglas?|prompts?|polic(?:y|ies)|politicas?|"
+    r"constraints?|restricciones?|guidelines?|directives?|directivas?|ordenes|orden|limites|"
+    r"safeguards?|salvaguardas?|guardrails?|mensajes?|messages?)"
+)
+_TOOL_NOUNS = (
+    r"(?:herramientas?|tools?|skills?|comandos?|commands?|funcion|function|file_editor|system_power|"
+    r"app_launcher|document_export|web_extraction|chain_orchestrator|policy_engine)"
+)
+
+# Cada entrada: (patrón sobre texto plegado, `to_end`). Si `to_end` es True se neutraliza desde el
+# inicio de la coincidencia hasta el final de la etiqueta (carga estructurada: JSON, objetos).
+_INJECTION_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
+    # "ignora/omite/anula/reemplaza ... instrucciones/reglas/prompt/mensaje del sistema ..."
+    (
+        re.compile(
+            rf"\b{_OVERRIDE_VERBS}\b(?:\s+[a-z0-9_']+){{0,4}}?\s+{_OVERRIDE_NOUNS}\b"
+            r"(?:\s+(?:anterior(?:es)?|previos?|previas?|previous|prior|above|del\s+sistema|"
+            r"de\s+seguridad|of\s+the\s+system|de\s+arriba))*"
+        ),
+        False,
     ),
-    # Etiquetas o delimitadores XML/HTML/corchetes de cierre o apertura de evidencia/sistema
-    re.compile(
-        r"(?i)<\s*/?\s*(?:evidencia[a-z0-9_]*|untrusted[a-z0-9_]*|system|assistant|developer|"
-        r"user|instruction[s]?|prompt|context[o]?|tool[a-z0-9_]*|function[a-z0-9_]*)\b[^>]*>"
+    # "ejecuta/invoca/llama/run/execute ... herramienta/tool/skill/comando/file_editor ..."
+    (
+        re.compile(
+            r"\b(?:ejecuta|ejecutar|ejecuten|invoca|invocar|llama|llamar|run|execute|invoke|call)\b"
+            rf"(?:\s+[a-z0-9_']+){{0,3}}?\s+{_TOOL_NOUNS}\b"
+        ),
+        False,
     ),
-    re.compile(
-        r"(?i)\[\s*/?\s*(?:evidencia[a-z0-9_]*|untrusted[a-z0-9_]*|system|assistant|developer|inst)\b[^\]]*\]"
+    # Cambio de rol/persona.
+    (
+        re.compile(
+            r"\b(?:you\s+are\s+now|from\s+now\s+on|a\s+partir\s+de\s+ahora|ahora\s+eres|"
+            r"actua\s+como|act\s+as\s+(?:a|an|the|if))\b"
+        ),
+        False,
     ),
-    # Marcadores especiales de tokens de control de LLM (<|system|>, <|im_start|>, <<SYS>>, ### System:)
-    re.compile(
-        r"(?i)(?:<\|[a-z0-9_:\-]+\|>|<<\s*/?\s*sys\s*>>|###\s*(?:system|instruction[s]?|assistant|user|developer|sistema|instrucci[oó]n)\b\s*:?)"
+    # Etiquetas XML/HTML que imitan delimitadores de sistema/evidencia/herramientas (apertura o cierre).
+    (
+        re.compile(
+            r"<\s*/?\s*[a-z0-9_\-:.]*(?:system|assistant|developer|user|instruction|prompt|evidencia|"
+            r"untrusted|context|tool|function|skill|polic|datos|sistema|mensaje|message|role|human)"
+            r"[a-z0-9_\-:.]*(?:\s[^>]{0,200})?/?\s*>"
+        ),
+        False,
     ),
-    # Indicadores de rol directos en inglés y español
-    re.compile(r"(?i)\b(?:system|assistant|developer|user|sistema|asistente|desarrollador)\s*:"),
-    # Objetos o fragmentos JSON que simulan invocación de herramientas o comandos
-    re.compile(
-        r"(?i)\{\s*['\"]?(?:action|tool|tool_name|skill_name|command|function|function_call|tool_calls|arguments|skill_params)['\"]?\s*:"
+    (re.compile(r"\[\s*/?\s*(?:inst|sys|system|assistant|user|evidencia\w*|untrusted\w*)\s*\]"), False),
+    # Tokens de control de plantillas de chat: <|system|>, <|im_start|>, <<SYS>>, "### System".
+    (re.compile(r"<\|[^|>]{0,40}\|>"), False),
+    (re.compile(r"<<\s*/?\s*sys\s*>>"), False),
+    (re.compile(r"#{2,}\s*(?:system|instruction|assistant|user|developer|sistema|instruccion)\w*\s*:?"), False),
+    # Indicadores de rol directos.
+    (
+        re.compile(r"\b(?:system|assistant|developer|user|human|sistema|asistente|desarrollador|usuario)\s*:"),
+        False,
     ),
-    re.compile(
-        r"(?i)['\"]?(?:tool_name|skill_name|function_call|tool_calls)['\"]?\s*:\s*['\"][a-z0-9_.\-]+['\"]"
+    # Carga estructurada: objetos JSON (simples o anidados) con claves de invocación de herramientas/acciones.
+    (
+        re.compile(
+            r"\{[^{}]{0,240}(?:\{[^{}]{0,240}\}[^{}]{0,240})*?"
+            r"[\"']?(?:action|tool|tool_name|tool_calls?|tool_use|tool_input|function|function_call|"
+            r"skill|skill_name|skill_params|command|arguments|path)[\"']?\s*:"
+            r"[^{}]{0,240}(?:\{[^{}]{0,240}\}[^{}]{0,240})*\}"
+        ),
+        False,
     ),
-    # Órdenes directas de ejecución de herramientas críticas infiltradas en etiquetas
-    re.compile(
-        r"(?i)\b(?:ejecuta|ejecutar|invoca|invocar|run|execute|invoke|call)\s+"
-        r"(?:la\s+herramienta\s+|la\s+skill\s+|el\s+comando\s+|tool\s+|skill\s+|command\s+)?"
-        r"(?:file_editor|system_power|app_launcher|chain_orchestrator|policy_engine|powershell|cmd\.exe)\b"
+    (
+        re.compile(
+            r"[\"']?(?:tool_name|tool_calls?|tool_use|tool_input|function_call|skill_name|skill_params|"
+            r"arguments)[\"']?\s*:\s*(?:\{[^{}]{0,240}\}|\[[^\[\]]{0,240}\]|[\"'][^\"']{0,120}[\"']|[a-z0-9_.\-]+)?"
+        ),
+        False,
     ),
 )
+
+# Categorías Unicode: `Cf` (formato: ZWSP, ZWJ, BOM, bidi, tags...) se ELIMINA para que no pueda partir
+# palabras; controles/privados/no asignados/separadores de línea se convierten en espacio.
+_UNICODE_DROP_CATEGORIES: frozenset[str] = frozenset({"Cf"})
+_UNICODE_SPACE_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+
+def _normalize_untrusted_text(text: str) -> str:
+    """NFKC + eliminación de caracteres invisibles y de control (anti ZWSP/bidi/homoglifos de ancho)."""
+    out: list[str] = []
+    for ch in unicodedata.normalize("NFKC", text):
+        category = unicodedata.category(ch)
+        if category in _UNICODE_DROP_CATEGORIES:
+            continue
+        if category in _UNICODE_SPACE_CATEGORIES:
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _neutralize_injection(text: str) -> str:
+    """Reemplaza por un marcador literal los fragmentos que imiten instrucciones, roles o JSON de herramientas.
+
+    La detección se hace sobre una copia plegada (minúsculas, sin tildes ni marcas combinantes), pero
+    el reemplazo se aplica sobre el texto original mediante un mapa de índices.
+    """
+    folded_chars: list[str] = []
+    index_map: list[int] = []
+    for idx, ch in enumerate(text):
+        for part in unicodedata.normalize("NFKD", ch):
+            if unicodedata.combining(part):
+                continue
+            for lowered in part.lower():
+                folded_chars.append(lowered)
+                index_map.append(idx)
+    if not folded_chars:
+        return text
+    folded = "".join(folded_chars)
+
+    spans: list[tuple[int, int]] = []
+    for pattern, to_end in _INJECTION_PATTERNS:
+        for match in pattern.finditer(folded):
+            if match.end() == match.start():
+                continue
+            start = index_map[match.start()]
+            end = len(text) if to_end else index_map[match.end() - 1] + 1
+            spans.append((start, end))
+    if not spans:
+        return text
+
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(text[cursor:start])
+        pieces.append(f" {_FILTERED_MARKER} ")
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def _check_single_sensitive_basename(clean_name: str) -> bool:
@@ -285,7 +465,12 @@ def _check_single_sensitive_basename(clean_name: str) -> bool:
             return True
     if any(clean_name.endswith(ext) for ext in FORBIDDEN_CONTEXT_EXTENSIONS):
         return True
-    if clean_name.startswith(("client_secret", "service_account", "gcloud_credentials", "firebase-adminsdk")):
+    # Claves públicas SSH (id_rsa.pub, id_ed25519.pub, ...): exponen la identidad del usuario.
+    if clean_name.startswith("id_") and clean_name.endswith(".pub"):
+        return True
+    if clean_name.startswith(
+        ("client_secret", "service_account", "service-account", "gcloud_credentials", "firebase-adminsdk")
+    ):
         return True
     if clean_name.endswith(
         (
@@ -305,12 +490,23 @@ def _check_single_sensitive_basename(clean_name: str) -> bool:
     return False
 
 
+def _sensitive_name_variants(name: str) -> tuple[str, ...]:
+    """Variantes de un nombre sin prefijo temporal (`.~`, `.`) para comparar contra las listas."""
+    variants = [name]
+    trimmed = name.lstrip(".~")
+    if trimmed and trimmed != name:
+        variants.append(trimmed)
+    return tuple(variants)
+
+
 def is_sensitive_context_filename(filename: str) -> bool:
     """Determina si un nombre de archivo corresponde a un secreto, ADS o almacén privado (F1, F3).
 
     - Rechaza de forma conservadora cualquier nombre con sintaxis de Alternate Data Stream (`:`).
     - Normaliza espacios y puntos finales de Windows antes de evaluar las listas de exclusión.
-    - Detecta copias de respaldo (`.bak`, `.old`, `.tmp`, etc.) de archivos sensibles.
+    - Retira de forma ITERATIVA todos los sufijos de respaldo/temporales encadenados
+      (`credentials.json.bak.tmp`, `credentials.json.tmp.bak`, `x.20260101_120000_000001.bak`, ...)
+      evaluando el nombre resultante tras cada retirada.
     """
     raw_clean = (filename or "").strip().lower()
     if not raw_clean:
@@ -321,38 +517,52 @@ def is_sensitive_context_filename(filename: str) -> bool:
     if ":" in raw_clean:
         return True
 
-    name_low = raw_clean.rstrip(". ")
-    if not name_low:
+    current = raw_clean.rstrip(". ")
+    if not current:
         return False
 
-    if _check_single_sensitive_basename(name_low):
-        return True
-
-    # Evitar evasión mediante sufijos de backup/temporales (ej. credentials.json.bak, .env.old)
-    stripped = name_low
-    for suffix in _BACKUP_OR_TEMP_SUFFIXES:
-        if stripped.endswith(suffix) and len(stripped) > len(suffix):
-            stripped = stripped[: -len(suffix)].rstrip(". ")
-            if _check_single_sensitive_basename(stripped):
-                return True
-
+    # Cada iteración retira como máximo un sufijo; el bucle termina cuando no hay más que retirar.
+    # (el límite de iteraciones es una salvaguarda defensiva contra nombres patológicos)
+    for _ in range(32):
+        if any(_check_single_sensitive_basename(variant) for variant in _sensitive_name_variants(current)):
+            return True
+        reduced = current
+        for suffix in _BACKUP_OR_TEMP_SUFFIXES:
+            if reduced.endswith(suffix) and len(reduced) > len(suffix):
+                reduced = reduced[: -len(suffix)].rstrip(". ")
+                break
+        else:
+            for tail_re in _VARIABLE_TAIL_RES:
+                tail_match = tail_re.search(reduced)
+                if tail_match and tail_match.start() > 0:
+                    reduced = reduced[: tail_match.start()].rstrip(". ")
+                    break
+        if not reduced or reduced == current:
+            return False
+        current = reduced
     return False
 
 
 def sanitize_untrusted_label(raw_text: Any, *, max_len: int = 160) -> str:
-    """Sanitiza un texto proveniente del sistema operativo (nombre de proceso, ventana o archivo).
+    """Sanitiza un texto proveniente del sistema operativo (nombre de proceso, ventana, GPU o archivo).
 
-    1. Redacta cualquier posible clave API, token o contraseña mediante `redact_secrets`.
-    2. Elimina saltos de línea, caracteres de control y marcadores invisibles Unicode.
-    3. Neutraliza patrones de inyección de instrucciones o suplantación de rol.
+    Defensa COMPLEMENTARIA (no es la frontera de seguridad): el aislamiento real proviene de que los datos
+    de N7 viajan como datos estructurados no confiables (`ContextUntrustedEnvelope`, bloques JSON
+    delimitados) y de que la ejecución depende de `PolicyEngine`/`ChainOrchestrator`/aprobación humana.
+
+    1. Normaliza Unicode (NFKC) y elimina invisibles (ZWSP, bidi, tags) y caracteres de control.
+    2. Redacta claves API, tokens y contraseñas con formato estructural (`redact_secrets`).
+    3. Neutraliza (reemplaza por un marcador literal) fragmentos que imiten instrucciones, roles,
+       delimitadores de prompt o JSON de herramientas, en español e inglés, ignorando tildes/mayúsculas.
     4. Acota la longitud máxima a `max_len` caracteres.
+    Límite conocido: una frase maliciosa que no coincida con ningún patrón sobrevive como texto literal
+    inofensivo; por eso nunca debe interpolarse como instrucción.
     """
     if raw_text is None:
         return ""
-    text = redact_secrets(str(raw_text))
-    text = _CONTROL_AND_BIDI_RE.sub(" ", text)
-    for pattern in _INJECTION_PATTERNS:
-        text = pattern.sub("[DATO_SISTEMA_FILTRADO]", text)
+    text = _normalize_untrusted_text(str(raw_text))
+    text = redact_secrets(text)
+    text = _neutralize_injection(text)
     collapsed = " ".join(text.split())
     if len(collapsed) > max_len:
         return collapsed[: max_len - 3] + "..."
@@ -377,6 +587,11 @@ class ContextAccessPolicy:
         include_process_user: Optional[bool] = None,
         include_process_exe: Optional[bool] = None,
     ) -> None:
+        # F3: `BASE_DIR/data` (memoria, objetivos, auditoría, transacciones) queda fuera de la observación
+        # genérica de N7. Es una exclusión propia de N7: no altera las raíces autorizadas de N5.
+        self._project_data_dir_norm: str = os.path.normcase(
+            str((Path(settings.BASE_DIR) / "data").resolve())
+        )
         raw_roots = (
             authorized_roots
             if authorized_roots is not None
@@ -573,6 +788,12 @@ class ContextAccessPolicy:
         auth_root: Optional[Path] = None,
     ) -> bool:
         """Determina si una ruta pertenece a un directorio o subárbol sensible excluido en N7 (F3)."""
+        norm_path = os.path.normcase(str(path_obj))
+        if norm_path == self._project_data_dir_norm or norm_path.startswith(
+            self._project_data_dir_norm + os.sep
+        ):
+            return True
+
         try:
             rel_parts = (
                 path_obj.relative_to(auth_root).parts
@@ -594,6 +815,8 @@ class ContextAccessPolicy:
                 return True
 
         rel_posix = "/".join(norm_parts)
+        if rel_posix == "data" or rel_posix.startswith("data/"):
+            return True
         full_posix = "/".join(
             p.strip().rstrip(". ").lower() for p in path_obj.parts[1:] if p.strip()
         )

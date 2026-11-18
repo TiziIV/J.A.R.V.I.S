@@ -63,20 +63,21 @@ El diseño de J.A.R.V.I.S. impone una separación estricta de responsabilidades 
    - Los módulos de `src/context/` carecen de funciones de escritura, creación, edición o borrado de archivos, terminación de procesos (`kill`/`terminate`), modificación del Registro (`winreg` se usa solo con `KEY_READ`) o ejecución con `shell=True`.
 2. **Raíces autorizadas y exclusiones específicas de N7 (F3):**
    - `ContextAccessPolicy` restringe toda consulta de archivos a `AUTHORIZED_FILE_ROOTS` y bloquea `FORBIDDEN_SYSTEM_PREFIXES` (`C:\Windows`, `System32`, `SysWOW64`, `WindowsApps`, etc.).
-   - Sin alterar las raíces compartidas que `FileEditorSkill` requiere en N5, N7 excluye adicionalmente subárboles y archivos sensibles tanto en inspección puntual (`inspect_path`) como en recorridos (`list_directory`, `find_relevant_files`): `.git`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `data/goals`, `data/transactions`, `data/backups`, `file_editor_audit.jsonl`, `*.log`, `.npmrc`, `.netrc`, `secrets.json`, `.env*`, claves privadas (`*.pem`, `*.key`, `*.pfx`, `*.kdbx`), respaldos (`.bak`, `.old`, `.tmp`) y almacenes de credenciales/perfiles de navegadores (`Credentials`, `User Data`, `Profiles`).
+   - Sin alterar las raíces compartidas que `FileEditorSkill` requiere en N5, N7 excluye adicionalmente subárboles y archivos sensibles tanto en inspección puntual (`inspect_path`) como en recorridos (`list_directory`, `find_relevant_files`): `BASE_DIR/data` completo (incluyendo `data/goals`, `data/transactions`, `data/backups`, `data/other_private.json`, `memory_store.json`), `.git`, `.ssh`, `id_*.pub`, `.aws`, `.gnupg`, `.kube`, `file_editor_audit.jsonl`, `*.log`, `.npmrc`, `.netrc`, `.envrc`, `.htpasswd`, `secrets.json`, `.env*`, claves privadas (`*.pem`, `*.key`, `*.pfx`, `*.ppk`, `*.kdbx`), bases de datos locales (`*.sqlite`, `*.sqlite3`, `*.db`, `wallet.db`, `wallet.dat`, `wallet.json`) y almacenes de credenciales/perfiles completos de navegadores (`Credentials`, `User Data`, `Opera Software`, `Opera GX Stable`, `Google/Chrome`, `Mozilla/Firefox`, `Microsoft/Edge`).
 3. **Protección contra Symlinks, Junctions NTFS, Reparse Points y TOCTOU (F2, F5):**
    - Validación de cada segmento y sus ancestros mediante `os.path.lexists`, `os.path.isjunction` y `os.lstat` verificando `stat.S_ISLNK` y el atributo nativo `FILE_ATTRIBUTE_REPARSE_POINT` (incluyendo junctions rotos cuyo destino no existe).
    - Los errores de permisos (`PermissionError` / `OSError`) se capturan y convierten en `ContextAccessDeniedError` sin interrumpir el bucle principal de consola.
    - `inspect_path` y `list_directory` ejecutan `os.lstat` / `entry.stat(follow_symlinks=False)` directamente sin depender de `Path.exists()` previo, volviendo a verificar `FILE_ATTRIBUTE_REPARSE_POINT` sobre el `stat_result` para reducir ventanas TOCTOU.
-4. **Protección contra NTFS Alternate Data Streams — ADS (F1):**
+4. **Protección contra NTFS Alternate Data Streams (ADS) y sufijos encadenados (F1):**
    - Rechazo conservador de cualquier sintaxis `:` posterior al identificador de unidad de Windows (p. ej. `.env:secretstream`, `credentials.json:backup`, `config.ini:stream`).
-5. **Minimización de datos desde el origen (F4):**
+   - Normalización iterativa de sufijos temporales y de respaldo encadenados (`.bak`, `.tmp`, `.backup`, `.old`, `.orig`, `.swp`, marcas temporales N5 `.YYYYMMDD_HHMMSS_ffffff`), bloqueando variantes como `credentials.json.bak.tmp` o `credentials.json.tmp.bak`.
+5. **Minimización de datos y ventanas desactivadas por defecto (F4.A):**
    - N7 jamás consulta `cmdline` ni `environ` de procesos (`_SAFE_BASE_ATTRS` cerrado), y deshabilita por defecto `hostname`, `username` y `exe_path`.
-   - En consultas originadas por objetivos N6 (`target_app`), N7 desactiva desde el origen la recolección de títulos de ventanas del escritorio (`include_windows=False`) y filtra los resultados únicamente a la aplicación solicitada.
-   - Los archivos persistidos `.goal.json` excluyen `visible_windows`, `foreground_window` y `top_processes`.
-6. **Redacción de secretos y sanitización anti-Prompt Injection (F4):**
-   - `redact_secrets` oculta claves `sk-*`, `sk-ant-*`, `AIza*`, `AQ.*`, tokens de GitHub (`ghp_*`, `github_pat_*`), AWS (`AKIA*`, `ASIA*`), encabezados `Authorization: Bearer ...`, JWT (`eyJ...`), parámetros URL (`?token=...`, `&access_token=...`, `?api_key=...`) y asignaciones `token=` / `secret=` / `password=`.
-   - `sanitize_untrusted_label` elimina caracteres de control y bidireccionales Unicode y filtra delimitadores (`</EVIDENCIA...>`, `<|system|>`), indicadores de rol (`system:`, `sistema:`), estructuras JSON de herramientas (`"tool_name"`, `"skill_name"`, `"function_call"`) e instrucciones de evasión en español e inglés.
+   - `ContextAwarenessEngine.get_context()` y `get_context_safe()` utilizan `include_windows=False` como comportamiento predeterminado: ni `/contexto` general, ni `get_context()` sin argumentos, ni las consultas automáticas de N6 invocan el enumerador de ventanas de escritorio. La enumeración de ventanas solo se activa mediante opt-in explícito (`include_windows=True`, como en `/contexto aplicaciones`).
+   - Los archivos persistidos `.goal.json` y `.wal.jsonl` excluyen `visible_windows`, `foreground_window` y `top_processes`.
+6. **Redacción estructural de secretos y aislamiento de datos no confiables (F4.B, F4.C):**
+   - `redact_secrets` aplica coincidencia estructural sobre cadenas y estructuras anidadas (`dict`/`list`/`tuple`) para ocultar `Authorization: Basic <base64>`, `Authorization: Bearer <token>`, claves `sk-*`, `sk-ant-*`, `AIza*`, `AQ.*`, GitHub (`ghp_*`, `github_pat_*`), AWS (`AKIA*`, `ASIA*`), JWT (`eyJ...`), credenciales en URL (`user:pass@host`, `?token=...`), asignaciones `api_key=` / `token=` / `secret=` / `password=` y campos JSON sensibles, sin falsos positivos sobre prosa común de error (p. ej. `"The bearer authorization failed twice"` o `"password: incorrect"`).
+   - `sanitize_untrusted_label` actúa como defensa complementaria (normalización Unicode NFKC, eliminación de invisibles `Cf` como Zero-Width Space `\u200b` y controles bidi, plegado de tildes para español/voseo e inglés, etiquetas XML compuestas como `</system_prompt>` y objetos JSON anidados con `function_call` o `skill_params`). La frontera real de aislamiento reside en que todo dato de N7 (incluyendo `hardware["gpu"]` en `ExecutionSupervisor._execute_internal_synthesis`) viaja delimitado como dato externo de solo lectura (`ContextUntrustedEnvelope` / `<DATO_EXTERNO_NO_CONFIABLE_SOLO_LECTURA>`) y nunca puede promoverse a instrucciones ni eludir `PolicyEngine`, `ChainOrchestrator` o la aprobación humana de N5.
 7. **Límites reales de las protecciones:**
    - En Python estándar sobre Windows, las operaciones de ruta por nombre mantienen una ventana teórica mínima en el kernel entre `lstat` y `scandir`; N7 lo mitiga no abriendo ni leyendo jamás el contenido de ningún archivo y revalidando `FILE_ATTRIBUTE_REPARSE_POINT` en cada `stat_result`.
    - En GPUs sin `nvidia-smi`, N7 detecta el adaptador por `winreg.KEY_READ` y reporta las métricas dinámicas de uso como `UNAVAILABLE` (`None`, nunca `0.0`).
@@ -198,10 +199,9 @@ jarvis-core/
 │   ├── N7_CONTEXT_AWARENESS_ENGINE.md # Especificación, seguridad y configuración de N7
 │   └── audits/
 │       └── INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md # Auditoría de cierre de N5
-├── tests/                           # Suite global automatizada (586 tests)
+├── tests/                           # Suite global automatizada (591 tests)
 ├── AGENTS.md                        # Reglas obligatorias de desarrollo y arquitectura
 ├── ARCHITECTURE.md                  # Diagramas y arquitectura base del proyecto
-├── CODEBASE_INDEX.md                # Índice compacto de módulos
 ├── CONTEXT.md                       # Bitácora técnica evolutiva del proyecto
 └── main.py                          # Punto de entrada CLI, consola interactiva y ciclo de voz
 ```

@@ -41,6 +41,7 @@ from src.brain.goal_models import (
 from src.brain.goal_persistence import GoalStore
 from src.brain.goal_planner import validate_plan_dag
 from src.brain.goal_skill_selector import GoalSkillSelector
+from src.context.policy import sanitize_untrusted_label
 from src.tools.skill_manager import SkillManager
 
 if TYPE_CHECKING:
@@ -636,8 +637,23 @@ class ExecutionSupervisor:
             else:
                 snippets.append(f"[{dep_id}] {dep_data.get('summary', '')}")
 
-        hw_ctx = plan.goal.context.hardware
-        hw_note = f" Hardware en contexto: {hw_ctx}." if hw_ctx else ""
+        raw_hw_ctx = plan.goal.context.hardware or {}
+        safe_hw_ctx: dict[str, Any] = {}
+        for hw_k, hw_v in raw_hw_ctx.items():
+            clean_k = sanitize_untrusted_label(str(hw_k), max_len=48)
+            if isinstance(hw_v, str):
+                safe_hw_ctx[clean_k] = sanitize_untrusted_label(hw_v, max_len=120)
+            else:
+                safe_hw_ctx[clean_k] = redact_secrets(hw_v)
+
+        if safe_hw_ctx:
+            untrusted_count += 1
+        hw_note = (
+            " Hardware en contexto [untrusted_system_context]: "
+            f"<DATO_EXTERNO_NO_CONFIABLE_SOLO_LECTURA>{safe_hw_ctx}</DATO_EXTERNO_NO_CONFIABLE_SOLO_LECTURA>."
+            if safe_hw_ctx
+            else ""
+        )
         base_summary = (
             f"Síntesis '{task.title}': "
             + (" | ".join(snippets) if snippets else plan.goal.interpreted_summary)
@@ -650,6 +666,7 @@ class ExecutionSupervisor:
                 "task_id": task.task_id,
                 "upstream_task_ids": list(upstream_outputs.keys()),
                 "isolated_untrusted_sources": untrusted_count,
+                "untrusted_hardware_context": bool(safe_hw_ctx),
                 "verified_at": utc_now_iso(),
             },
             "untrusted_envelope": None,

@@ -157,6 +157,7 @@ class ContextConsoleHandler:
             if subcmd in {"aplicaciones", "applications", "apps", "ventanas"}:
                 snap = self.engine.get_context(
                     categories=[ContextCategory.APPLICATIONS],
+                    include_windows=True,
                     force_refresh=True,
                 )
                 report = self.format_snapshot(snap)

@@ -158,7 +158,7 @@ class ContextAwarenessEngine:
         search_query: str = "",
         process_filter: Optional[str] = None,
         target_app: Optional[str] = None,
-        include_windows: bool = True,
+        include_windows: bool = False,
         force_refresh: bool = False,
         refresh_resources: bool = False,
     ) -> ContextSnapshot:
@@ -281,19 +281,16 @@ class ContextAwarenessEngine:
 
             elif cat == ContextCategory.APPLICATIONS:
                 sources_consulted.append("ApplicationAwarenessProvider")
-                can_cache_app = (not force_refresh) and include_windows and (not target_app)
+                can_cache_app = (not force_refresh) and (not include_windows) and (not target_app)
 
                 def _collect_apps() -> ApplicationAwarenessInfo:
-                    if include_windows and not target_app:
+                    try:
+                        raw_app = self.application_provider.collect(
+                            include_windows=include_windows,
+                            target_app=target_app,
+                        )
+                    except TypeError:
                         raw_app = self.application_provider.collect()
-                    else:
-                        try:
-                            raw_app = self.application_provider.collect(
-                                include_windows=include_windows,
-                                target_app=target_app,
-                            )
-                        except TypeError:
-                            raw_app = self.application_provider.collect()
                     return self._apply_app_minimization(
                         raw_app,
                         include_windows=include_windows,
@@ -410,7 +407,7 @@ class ContextAwarenessEngine:
         search_query: str = "",
         process_filter: Optional[str] = None,
         target_app: Optional[str] = None,
-        include_windows: bool = True,
+        include_windows: bool = False,
         force_refresh: bool = False,
         refresh_resources: bool = False,
     ) -> ContextSnapshot:
@@ -688,28 +685,35 @@ class ContextAwarenessEngine:
 
         if snapshot.system is not None:
             minimized["system"] = {
-                "os": f"{snapshot.system.os_name} {snapshot.system.os_release}",
-                "version": snapshot.system.os_version,
-                "build": snapshot.system.os_build,
-                "architecture": snapshot.system.architecture,
-                "python": snapshot.system.python_version,
+                "os": sanitize_untrusted_label(
+                    f"{snapshot.system.os_name} {snapshot.system.os_release}",
+                    max_len=80,
+                ),
+                "version": sanitize_untrusted_label(snapshot.system.os_version, max_len=80),
+                "build": sanitize_untrusted_label(snapshot.system.os_build, max_len=64),
+                "architecture": sanitize_untrusted_label(snapshot.system.architecture, max_len=32),
+                "python": sanitize_untrusted_label(snapshot.system.python_version, max_len=32),
                 "uptime_seconds": snapshot.system.uptime_seconds,
             }
 
         if snapshot.hardware is not None:
             gpus_summary = [
                 {
-                    "name": g.name,
-                    "vendor": g.vendor,
+                    "name": sanitize_untrusted_label(g.name, max_len=96),
+                    "vendor": sanitize_untrusted_label(g.vendor, max_len=48),
                     "vram_total_mb": g.vram_total_mb,
                     "vram_total_gb": g.vram_total_gb,
-                    "driver_version": g.driver_version,
-                    "source": g.detection_source,
+                    "driver_version": (
+                        sanitize_untrusted_label(g.driver_version, max_len=48)
+                        if g.driver_version
+                        else None
+                    ),
+                    "source": sanitize_untrusted_label(g.detection_source, max_len=32),
                 }
                 for g in snapshot.hardware.gpus[:2]
             ]
             minimized["hardware"] = {
-                "cpu_model": snapshot.hardware.cpu_model,
+                "cpu_model": sanitize_untrusted_label(snapshot.hardware.cpu_model, max_len=120),
                 "cpu_cores_physical": snapshot.hardware.cpu_cores_physical,
                 "cpu_cores_logical": snapshot.hardware.cpu_cores_logical,
                 "ram_total_gb": snapshot.hardware.ram_total_gb,
@@ -881,7 +885,7 @@ class ContextAwarenessEngine:
 
         if snapshot.hardware is not None:
             if snapshot.hardware.cpu_model:
-                hw_dict["cpu_model"] = snapshot.hardware.cpu_model
+                hw_dict["cpu_model"] = sanitize_untrusted_label(snapshot.hardware.cpu_model, max_len=120)
             if snapshot.hardware.cpu_cores_physical is not None:
                 hw_dict["cpu_cores_physical"] = snapshot.hardware.cpu_cores_physical
             if snapshot.hardware.cpu_cores_logical is not None:
@@ -892,13 +896,13 @@ class ContextAwarenessEngine:
                 hw_dict["ram_available_gb"] = snapshot.hardware.ram_available_gb
             if snapshot.hardware.gpus:
                 primary = snapshot.hardware.gpus[0]
-                hw_dict["gpu"] = primary.name
+                hw_dict["gpu"] = sanitize_untrusted_label(primary.name, max_len=96)
                 if primary.vram_total_gb is not None:
                     hw_dict["vram_gb"] = primary.vram_total_gb
                 if primary.vram_total_mb is not None:
                     hw_dict["vram_mb"] = primary.vram_total_mb
                 if primary.driver_version:
-                    hw_dict["gpu_driver"] = primary.driver_version
+                    hw_dict["gpu_driver"] = sanitize_untrusted_label(primary.driver_version, max_len=48)
 
         if snapshot.resources is not None:
             if snapshot.resources.cpu_percent.value is not None:
@@ -914,10 +918,13 @@ class ContextAwarenessEngine:
 
         env_summary: dict[str, str] = {}
         if snapshot.system is not None:
-            env_summary["os"] = f"{snapshot.system.os_name} {snapshot.system.os_release}"
-            env_summary["os_version"] = snapshot.system.os_version
-            env_summary["architecture"] = snapshot.system.architecture
-            env_summary["python_version"] = snapshot.system.python_version
+            env_summary["os"] = sanitize_untrusted_label(
+                f"{snapshot.system.os_name} {snapshot.system.os_release}",
+                max_len=80,
+            )
+            env_summary["os_version"] = sanitize_untrusted_label(snapshot.system.os_version, max_len=80)
+            env_summary["architecture"] = sanitize_untrusted_label(snapshot.system.architecture, max_len=32)
+            env_summary["python_version"] = sanitize_untrusted_label(snapshot.system.python_version, max_len=32)
 
         return {
             "snapshot_id": snapshot.snapshot_id,

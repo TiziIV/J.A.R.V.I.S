@@ -33,6 +33,7 @@ from src.brain.goal_planner import GoalPlanningEngine, TaskDecomposer
 from src.brain.goal_skill_selector import GoalSkillSelector
 from src.brain.goal_supervisor import ExecutionResult, ExecutionSupervisor, PlanEvaluator
 from src.brain.goal_understanding import GoalUnderstandingEngine
+from src.context.policy import sanitize_untrusted_label
 from src.tools.skill_manager import SkillManager
 
 if TYPE_CHECKING:
@@ -162,16 +163,22 @@ class GoalEngine:
             target_app=goal.context.target_app or None,
         )
 
-        # Completa información real de hardware sin sobrescribir pistas explícitas del usuario.
+        # Completa información real de hardware sin sobrescribir pistas explícitas del usuario,
+        # sanitizando cualquier etiqueta textual para mantener la frontera de datos no confiables (F4.C).
         for hw_key, hw_val in (payload.get("hardware") or {}).items():
             if hw_key not in goal.context.hardware and hw_val is not None:
-                goal.context.hardware[hw_key] = hw_val
+                goal.context.hardware[hw_key] = (
+                    sanitize_untrusted_label(hw_val, max_len=120)
+                    if isinstance(hw_val, str)
+                    else hw_val
+                )
 
         for env_key, env_val in (payload.get("environment") or {}).items():
             if env_key not in goal.context.environment and env_val:
-                goal.context.environment[env_key] = str(env_val)
+                goal.context.environment[env_key] = sanitize_untrusted_label(str(env_val), max_len=96)
 
         goal.context.extra["n7_snapshot_id"] = payload.get("snapshot_id")
+        goal.context.extra["n7_trust_boundary"] = "untrusted_system_context"
         goal.context.extra["n7_requested_categories"] = list(
             payload.get("requested_categories") or []
         )
@@ -181,8 +188,8 @@ class GoalEngine:
         if payload.get("partial_errors"):
             goal.context.extra["n7_partial_errors"] = list(payload["partial_errors"])
             for err_item in payload["partial_errors"]:
-                cat_name = err_item.get("category", "context")
-                err_msg = err_item.get("message", "No disponible")
+                cat_name = sanitize_untrusted_label(str(err_item.get("category", "context")), max_len=32)
+                err_msg = sanitize_untrusted_label(str(err_item.get("message", "No disponible")), max_len=120)
                 note = f"Dato contextual N7 no disponible ({cat_name}): {err_msg}"
                 if note not in goal.missing_info:
                     goal.missing_info.append(note)
@@ -198,7 +205,7 @@ class GoalEngine:
                 for a in snapshot.applications.installed_applications
             )
             goal.context.extra["n7_target_app_state"] = {
-                "target_app": goal.context.target_app,
+                "target_app": sanitize_untrusted_label(goal.context.target_app, max_len=64),
                 "is_running": is_running,
                 "is_installed": is_installed,
             }
@@ -206,7 +213,7 @@ class GoalEngine:
         if snapshot.filesystem is not None and snapshot.filesystem.queried_files:
             goal.context.extra["n7_target_files"] = [
                 {
-                    "name": f.name,
+                    "name": sanitize_untrusted_label(f.name, max_len=80),
                     "exists": f.exists,
                     "is_dir": f.is_dir,
                     "category": f.file_category,
