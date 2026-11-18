@@ -1081,7 +1081,13 @@ Se implementó el subsistema modular de exportación documental desacoplado de p
 
 ### Estado de cierre
 
-M1, M2 y B1–B4 tienen correcciones, documentación y verificaciones aprobadas. El cierre técnico queda **CERRADO**, incluida la suite global y el análisis AST de solo lectura. N7 queda habilitada para avanzar a N8; N8 todavía no se inició. Pendiente: gestión Git requerida (preparación específica, auditoría de staging, commit, tag anotado del hito y push normal) y confirmar el estado remoto final.
+M1, M2 y B1–B4 tienen correcciones, documentación y verificaciones aprobadas. El cierre técnico queda **CERRADO**, incluida la suite global y el análisis AST de solo lectura. N7 queda habilitada para avanzar a N8; N8 todavía no se inició.
+
+### Publicación Git
+
+- Commit principal: `62c54be` (`fix(n7): close audit findings M1-M2 and B1-B4`).
+- Tag anotado publicado: `v5.3.0`.
+- `main` y `v5.3.0` se publicaron con push normal a `origin`; verificación final: `main...origin/main` sincronizadas y árbol limpio.
 
 ### Seguimiento — normalización de temporales de pruebas Windows (2026-11-18)
 
