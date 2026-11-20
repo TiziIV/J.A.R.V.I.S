@@ -76,6 +76,7 @@ class MemoryAuditAction(str, Enum):
     EXPIRE = "EXPIRE"
     SUPERSEDE = "SUPERSEDE"
     DEDUPE_HIT = "DEDUPE_HIT"
+    REJECT_IDEMPOTENCY_CONFLICT = "REJECT_IDEMPOTENCY_CONFLICT"
     INTEGRITY_CHECK = "INTEGRITY_CHECK"
     MIGRATE = "MIGRATE"
     REJECT_PRIVATE_MODE = "REJECT_PRIVATE_MODE"
@@ -127,6 +128,10 @@ class MemoryCorruptionError(MemoryPersistenceError):
 
 class MemoryDuplicateError(MemoryPolicyError):
     """Conflicto explícito de duplicación al intentar actualizar/revisar contra otro recuerdo activo."""
+
+
+class MemoryIdempotencyConflictError(MemoryPolicyError):
+    """Conflicto explícito al reutilizar una `idempotency_key` con evidencia o payload incompatible."""
 
 
 class MemoryNotFoundError(MemorySubsystemError, LookupError):
@@ -228,6 +233,7 @@ class ExecutionVerificationEvidence:
     scope_type: MemoryScopeType = MemoryScopeType.PROJECT
     scope_key: str = "default"
     evidence_sha256: str = ""
+    canonical_unit_id: str | None = None
 
     def __post_init__(self) -> None:
         layer = (self.source_layer or "").strip()
@@ -296,6 +302,18 @@ class ExecutionVerificationEvidence:
             raise MemoryValidationError("scope_key de evidencia verificada no puede estar vacío.")
         object.__setattr__(self, "scope_key", self.scope_key.strip())
 
+        if self.canonical_unit_id is not None:
+            if not isinstance(self.canonical_unit_id, str) or not self.canonical_unit_id.strip():
+                raise MemoryValidationError(
+                    "canonical_unit_id en ExecutionVerificationEvidence no puede estar vacío si se especifica."
+                )
+            clean_unit = self.canonical_unit_id.strip()
+            if len(clean_unit) > 128:
+                raise MemoryValidationError(
+                    "canonical_unit_id no puede superar 128 caracteres."
+                )
+            object.__setattr__(self, "canonical_unit_id", clean_unit)
+
         expected_digest = self.compute_evidence_digest()
         provided_digest = (self.evidence_sha256 or "").strip().lower()
         if provided_digest:
@@ -311,7 +329,7 @@ class ExecutionVerificationEvidence:
 
     def canonical_payload(self) -> dict[str, Any]:
         """Devuelve el payload estructural utilizado para firma/huella determinista."""
-        return {
+        payload: dict[str, Any] = {
             "source_layer": self.source_layer,
             "source_execution_id": self.source_execution_id,
             "source_plan_id": self.source_plan_id,
@@ -328,6 +346,10 @@ class ExecutionVerificationEvidence:
             "scope_type": self.scope_type.value,
             "scope_key": self.scope_key,
         }
+        # Incluimos `canonical_unit_id` solo cuando está presente para preservar compatibilidad SHA-256 v1.
+        if self.canonical_unit_id is not None:
+            payload["canonical_unit_id"] = self.canonical_unit_id
+        return payload
 
     def compute_evidence_digest(self) -> str:
         """Calcula el SHA-256 determinista del contrato de evidencia sin mutar el objeto."""
@@ -430,6 +452,8 @@ class MemoryCreateInput:
     provenance: MemoryProvenance | None = None
     verification_evidence: ExecutionVerificationEvidence | None = None
     pending_confirmation: bool = False
+    canonical_unit_id: str | None = None
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, MemoryCategory):
@@ -498,6 +522,8 @@ class MemoryRecord:
     superseded_by: str | None = None
     last_verified_at: str | None = None
     access_count: int = 0
+    canonical_unit_id: str | None = None
+    idempotency_key: str | None = None
 
     @property
     def is_pending_confirmation(self) -> bool:
@@ -531,6 +557,8 @@ class MemoryRecord:
             "superseded_by": self.superseded_by,
             "last_verified_at": self.last_verified_at,
             "access_count": self.access_count,
+            "canonical_unit_id": self.canonical_unit_id,
+            "idempotency_key": self.idempotency_key,
         }
 
     def to_canonical_json(self) -> str:
@@ -683,6 +711,7 @@ class StoreStats:
     expired_memories: int
     total_revisions: int
     total_audit_entries: int
+    store_version_token: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -698,6 +727,7 @@ class StoreStats:
             "expired_memories": self.expired_memories,
             "total_revisions": self.total_revisions,
             "total_audit_entries": self.total_audit_entries,
+            "store_version_token": self.store_version_token,
         }
 
 
@@ -750,6 +780,7 @@ class MemoryRetrievalResult:
     blocked_by_history_policy: bool = False
     untrusted_advisory_json: str = ""
     backend_used: str = "none"
+    store_version_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -790,6 +821,28 @@ class RestoreResult:
     preserved_previous_paths: tuple[str, ...]
     integrity_report: IntegrityReport
     details: str
+
+
+@dataclass(frozen=True)
+class ExecutionInvalidationResult:
+    """Resultado estructurado e idempotente de invalidar recuerdos por `execution_id` revertida."""
+
+    execution_id: str
+    invalidated_count: int
+    invalidated_memory_ids: tuple[str, ...]
+    already_inactive_count: int = 0
+    store_version_token: str = ""
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "invalidated_count": self.invalidated_count,
+            "invalidated_memory_ids": list(self.invalidated_memory_ids),
+            "already_inactive_count": self.already_inactive_count,
+            "store_version_token": self.store_version_token,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True)

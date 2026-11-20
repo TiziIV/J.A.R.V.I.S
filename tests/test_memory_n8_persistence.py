@@ -33,6 +33,7 @@ from src.memory import (
     MemoryCorruptionError,
     MemoryCreateInput,
     MemoryDuplicateError,
+    MemoryIdempotencyConflictError,
     MemoryLockTimeoutError,
     MemoryNotFoundError,
     MemoryPolicy,
@@ -443,8 +444,11 @@ class N8PersistenceAndConcurrencyTests(unittest.TestCase):
                 self.assertEqual(conn.execute("PRAGMA synchronous").fetchone()[0], 2)
                 self.assertEqual(conn.execute("PRAGMA secure_delete").fetchone()[0], 1)
                 self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
-                mig_count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-                self.assertEqual(mig_count, 1)
+                mig_rows = conn.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version ASC"
+                ).fetchall()
+                self.assertEqual([int(r[0]) for r in mig_rows], list(range(1, CURRENT_SCHEMA_VERSION + 1)))
+                self.assertEqual(CURRENT_SCHEMA_VERSION, 2)
 
         report = store.verify_integrity()
         self.assertTrue(report.ok)
@@ -575,6 +579,17 @@ class N8PersistenceAndConcurrencyTests(unittest.TestCase):
                 verification_evidence=ev,
             )
         )
+        e1_retry = store.create_memory(
+            MemoryCreateInput(
+                category=MemoryCategory.EXPERIENCE,
+                source=MemorySource.EXECUTION_VERIFIED,
+                title="Paso A verificado",
+                content="Se exportó el informe correctamente.",
+                scope_type=MemoryScopeType.PROJECT,
+                scope_key="jarvis-core",
+                verification_evidence=ev,
+            )
+        )
         e2 = store.create_memory(
             MemoryCreateInput(
                 category=MemoryCategory.FACT,
@@ -587,9 +602,30 @@ class N8PersistenceAndConcurrencyTests(unittest.TestCase):
             )
         )
         self.assertTrue(e1.created)
-        self.assertTrue(e2.deduplicated)
-        self.assertEqual(e2.matched_reason, "execution_provenance")
-        self.assertEqual(e1.record.memory_id, e2.record.memory_id)
+        self.assertFalse(e1_retry.created)
+        self.assertTrue(e1_retry.deduplicated)
+        self.assertEqual(e1_retry.matched_reason, "idempotency_key")
+        self.assertEqual(e1.record.memory_id, e1_retry.record.memory_id)
+
+        # En esquema v2 EXPERIENCE y FACT de la misma tarea coexisten con canonical_unit_id distintos.
+        self.assertTrue(e2.created)
+        self.assertNotEqual(e1.record.memory_id, e2.record.memory_id)
+        self.assertNotEqual(e1.record.canonical_unit_id, e2.record.canonical_unit_id)
+
+        # Reutilizar explícitamente la misma unidad/idempotency_key con contenido distinto falla con conflicto auditable.
+        with self.assertRaises(MemoryIdempotencyConflictError):
+            store.create_memory(
+                MemoryCreateInput(
+                    category=MemoryCategory.EXPERIENCE,
+                    source=MemorySource.EXECUTION_VERIFIED,
+                    title="Paso A adulterado",
+                    content="Intento de sobrescritura con contenido distinto.",
+                    scope_type=MemoryScopeType.PROJECT,
+                    scope_key="jarvis-core",
+                    verification_evidence=ev,
+                    canonical_unit_id=e1.record.canonical_unit_id,
+                )
+            )
 
     def test_sql_fallback_when_fts5_disabled(self) -> None:
         """Si FTS5 se deshabilita por configuración, las búsquedas funcionan con respaldo SQL LIKE."""

@@ -459,6 +459,61 @@ def compute_content_fingerprint(
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def compute_default_canonical_unit_id(
+    *,
+    operation_type: str,
+    category: MemoryCategory,
+) -> str:
+    """
+    Construye un `canonical_unit_id` mínimo y determinista a partir únicamente de campos ya
+    existentes en `ExecutionVerificationEvidence` y `MemoryCreateInput`.
+
+    Justificación técnica junior:
+    Permite distinguir de base una unidad `EXPERIENCE` de una `FACT` generadas en la misma
+    operación sin obligar al adaptador a inventar campos futuros. Cuando una sola tarea ejecuta
+    múltiples suboperaciones verificadas de la misma categoría (por ejemplo varias operaciones
+    de `ChainOrchestrator` en Subfase 2), el adaptador N5/N6 deberá aportar un `canonical_unit_id`
+    explícito por suboperación (por ejemplo `n5:<execution_id>:<op_id>:<category>`).
+    """
+    clean_op = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", (operation_type or "execution").strip().lower()).strip("_") or "execution"
+    unit = f"{clean_op}:{category.value.lower()}"
+    return unit[:128]
+
+
+def compute_execution_idempotency_key(
+    *,
+    source_layer: str,
+    source_execution_id: str,
+    source_plan_id: str | None,
+    source_task_id: str | None,
+    canonical_unit_id: str,
+) -> str:
+    """
+    Calcula la clave determinista de idempotencia lógica para una unidad `EXECUTION_VERIFIED`.
+
+    Composición v2 (compatible únicamente con campos reales existentes):
+    `(source_layer, source_execution_id, source_plan_id, source_task_id, canonical_unit_id)`.
+
+    Garantías y límites:
+    - Dos reintentos de la misma unidad dentro de la misma ejecución producen exactamente la misma clave.
+    - Dos ejecuciones distintas (`source_execution_id` diferente) nunca colisionan en `idempotency_key`
+      aunque compartan categoría, ámbito o texto normalizado idéntico.
+    - Dentro de una misma ejecución/tarea, distintas unidades canónicas obtienen claves independientes.
+    - Límite contractual: la seguridad multi-unidad dentro de una misma tarea depende de que el
+      adaptador N5/N6 asigne un `canonical_unit_id` único a cada unidad diferente antes de ingestar.
+    """
+    payload = {
+        "schema": "n8_v2_idem",
+        "source_layer": (source_layer or "").strip(),
+        "source_execution_id": (source_execution_id or "").strip(),
+        "source_plan_id": (source_plan_id or "").strip(),
+        "source_task_id": (source_task_id or "").strip(),
+        "canonical_unit_id": (canonical_unit_id or "").strip(),
+    }
+    digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    return f"idem_{digest}"
+
+
 @dataclass(frozen=True)
 class PreparedMemoryCreate:
     """Resultado validado, sanitizado y listo para insertarse transaccionalmente en SQLite."""
@@ -479,6 +534,8 @@ class PreparedMemoryCreate:
     provenance: MemoryProvenance
     verification_evidence: ExecutionVerificationEvidence | None
     expires_at: str | None
+    canonical_unit_id: str | None = None
+    idempotency_key: str | None = None
 
 
 class MemoryPolicy:
@@ -693,6 +750,9 @@ class MemoryPolicy:
         metadata = tuple(filtered_meta)
 
         evidence: ExecutionVerificationEvidence | None = payload.verification_evidence
+        resolved_unit_id: str | None = None
+        resolved_idempotency_key: str | None = None
+
         if payload.source == MemorySource.EXECUTION_VERIFIED:
             if evidence is None:
                 raise MemoryPolicyError(
@@ -713,6 +773,50 @@ class MemoryPolicy:
                     raise MemoryValidationError(
                         "provenance.source_execution_id no coincide con ExecutionVerificationEvidence."
                     )
+
+            payload_unit = payload.canonical_unit_id.strip() if isinstance(payload.canonical_unit_id, str) and payload.canonical_unit_id.strip() else None
+            if payload.canonical_unit_id is not None and payload_unit is None:
+                raise MemoryValidationError("canonical_unit_id no puede estar vacío si se especifica.")
+            ev_unit = evidence.canonical_unit_id
+            if payload_unit is not None and ev_unit is not None and payload_unit != ev_unit:
+                raise MemoryValidationError(
+                    "canonical_unit_id del MemoryCreateInput no coincide con ExecutionVerificationEvidence."
+                )
+            raw_unit = (
+                payload_unit
+                or ev_unit
+                or compute_default_canonical_unit_id(
+                    operation_type=evidence.operation_type,
+                    category=payload.category,
+                )
+            )
+            resolved_unit_id = sanitize_memory_text(
+                raw_unit,
+                max_chars=128,
+                allow_newlines=False,
+                field_name="canonical_unit_id",
+                check_secrets=True,
+            )
+
+            if payload.idempotency_key is not None:
+                if not isinstance(payload.idempotency_key, str) or not payload.idempotency_key.strip():
+                    raise MemoryValidationError("idempotency_key no puede estar vacío si se especifica.")
+                resolved_idempotency_key = sanitize_memory_text(
+                    payload.idempotency_key,
+                    max_chars=128,
+                    allow_newlines=False,
+                    field_name="idempotency_key",
+                    check_secrets=True,
+                )
+            else:
+                resolved_idempotency_key = compute_execution_idempotency_key(
+                    source_layer=evidence.source_layer,
+                    source_execution_id=evidence.source_execution_id,
+                    source_plan_id=evidence.source_plan_id,
+                    source_task_id=evidence.source_task_id,
+                    canonical_unit_id=resolved_unit_id,
+                )
+
             provenance = MemoryProvenance(
                 source=MemorySource.EXECUTION_VERIFIED,
                 source_layer=evidence.source_layer,
@@ -729,6 +833,10 @@ class MemoryPolicy:
             if evidence is not None:
                 raise MemoryValidationError(
                     "Solo EXECUTION_VERIFIED puede adjuntar ExecutionVerificationEvidence."
+                )
+            if payload.canonical_unit_id is not None or payload.idempotency_key is not None:
+                raise MemoryValidationError(
+                    "canonical_unit_id e idempotency_key solo se admiten para fuente EXECUTION_VERIFIED."
                 )
             provenance = payload.provenance or MemoryProvenance(
                 source=payload.source,
@@ -765,4 +873,6 @@ class MemoryPolicy:
             provenance=provenance,
             verification_evidence=evidence,
             expires_at=payload.expires_at,
+            canonical_unit_id=resolved_unit_id,
+            idempotency_key=resolved_idempotency_key,
         )

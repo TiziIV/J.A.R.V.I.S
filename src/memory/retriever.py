@@ -299,7 +299,7 @@ class MemoryRetriever:
             elif scope_key is not None and scope_key.strip():
                 exact_scope = normalize_scope(norm_st, scope_key)
 
-        raw_candidates = self.store.search_text_candidates(
+        raw_candidates, snapshot_token = self.store.search_text_candidates_with_version(
             bounded_query,
             scope_type=exact_scope[0] if exact_scope else (MemoryScopeType(scope_type) if scope_type else None),
             scope_key=exact_scope[1] if exact_scope else (scope_key.strip().lower() if scope_key else None),
@@ -406,4 +406,5 @@ class MemoryRetriever:
             blocked_by_history_policy=False,
             untrusted_advisory_json=advisory_json,
             backend_used=backend_used,
+            store_version_token=snapshot_token,
         )

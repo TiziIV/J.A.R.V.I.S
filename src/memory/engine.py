@@ -18,6 +18,7 @@ from config import settings
 from src.brain.exceptions import is_sensitive_key
 from src.memory.models import (
     BackupInfo,
+    ExecutionInvalidationResult,
     IntegrityReport,
     MemoryCategory,
     MemoryCreateInput,
@@ -193,6 +194,10 @@ class MemoryEngine:
     def get_stats(self) -> StoreStats:
         return self.store.get_stats()
 
+    def get_store_version_token(self) -> str:
+        """Devuelve el token monótono actual (`epoch:seq`) del almacén de experiencias."""
+        return self.store.get_store_version_token()
+
     def verify_integrity(self, *, quarantine_on_corruption: bool = False) -> IntegrityReport:
         return self.store.verify_integrity(quarantine_on_corruption=quarantine_on_corruption)
 
@@ -271,6 +276,25 @@ class MemoryEngine:
             memory_id,
             reason=reason,
             actor=actor,
+        )
+
+    def invalidate_by_execution(
+        self,
+        execution_id: str,
+        *,
+        reason: str = "rollback_execution",
+        actor: str = "system",
+    ) -> ExecutionInvalidationResult:
+        """
+        Revoca todos los recuerdos `EXECUTION_VERIFIED` activos asociados a una ejecución
+        revertida sin purgar la evidencia histórica de auditoría ni tocar recuerdos ajenos.
+        """
+        self._assert_write_allowed()
+        return self.store.invalidate_by_execution(
+            execution_id,
+            reason=reason,
+            actor=actor,
+            private_mode=self.is_private_mode,
         )
 
     def purge_memory(

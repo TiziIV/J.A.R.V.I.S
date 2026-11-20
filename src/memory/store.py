@@ -32,13 +32,17 @@ from src.memory.migrations import (
     CORE_TABLES,
     MigrationResult,
     apply_migrations,
+    bump_store_version_token_tx,
     configure_connection,
     fts5_available,
+    read_store_version_components,
+    rotate_store_version_token_tx,
     table_exists,
 )
 from src.memory.models import (
     ALLOWED_MEMORY_TRANSITIONS,
     BackupInfo,
+    ExecutionInvalidationResult,
     IntegrityReport,
     MemoryAuditAction,
     MemoryAuditEntry,
@@ -47,6 +51,7 @@ from src.memory.models import (
     MemoryCorruptionError,
     MemoryCreateInput,
     MemoryDuplicateError,
+    MemoryIdempotencyConflictError,
     MemoryLockTimeoutError,
     MemoryNotFoundError,
     MemoryPersistenceError,
@@ -73,6 +78,7 @@ from src.memory.models import (
 )
 from src.memory.policy import (
     MemoryPolicy,
+    PreparedMemoryCreate,
     compute_content_fingerprint,
     is_test_environment,
     normalize_scope,
@@ -307,6 +313,7 @@ def _row_to_memory_record(row: sqlite3.Row) -> MemoryRecord:
         verified_at=row["verified_at"],
         evidence_hash=row["evidence_hash"],
     )
+    row_keys = set(row.keys())
     return MemoryRecord(
         memory_id=row["memory_id"],
         category=MemoryCategory(row["category"]),
@@ -332,6 +339,8 @@ def _row_to_memory_record(row: sqlite3.Row) -> MemoryRecord:
         superseded_by=row["superseded_by"],
         last_verified_at=row["last_verified_at"],
         access_count=int(row["access_count"]),
+        canonical_unit_id=row["canonical_unit_id"] if "canonical_unit_id" in row_keys else None,
+        idempotency_key=row["idempotency_key"] if "idempotency_key" in row_keys else None,
     )
 
 
@@ -545,6 +554,50 @@ class ExperienceStore:
                     busy_timeout_ms=self.busy_timeout_ms,
                 )
 
+    def get_store_version_token(self) -> str:
+        """Consulta el `store_version_token` global vigente sin mutar estado ni avanzar la versión."""
+        self.policy.assert_enabled()
+        with self.acquire_lock():
+            with self._open_connection() as conn:
+                self._ensure_ready(conn)
+                _, _, token = read_store_version_components(conn)
+                return token
+
+    @staticmethod
+    def _execution_payload_matches(
+        existing: MemoryRecord,
+        prepared: PreparedMemoryCreate,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """
+        Compara evidencia y payload estructural entre un registro `EXECUTION_VERIFIED` previo y
+        un nuevo intento con igual `idempotency_key` o unidad canónica, sin filtrar texto en mensajes.
+        """
+        mismatches: list[str] = []
+        checks = (
+            ("category", existing.category == prepared.category),
+            ("scope_type", existing.scope_type == prepared.scope_type),
+            ("scope_key", existing.scope_key == prepared.scope_key),
+            ("title", existing.title == prepared.title),
+            ("content", existing.content == prepared.content),
+            ("summary", existing.summary == prepared.summary),
+            ("content_fingerprint", existing.content_fingerprint == prepared.content_fingerprint),
+            ("tags", existing.tags == prepared.tags),
+            ("importance", existing.importance == prepared.importance),
+            ("confidence", abs(existing.confidence - prepared.confidence) < 1e-9),
+            ("canonical_unit_id", existing.canonical_unit_id == prepared.canonical_unit_id),
+            ("expires_at", existing.expires_at == prepared.expires_at),
+            ("source_layer", existing.provenance.source_layer == prepared.provenance.source_layer),
+            ("source_execution_id", existing.provenance.source_execution_id == prepared.provenance.source_execution_id),
+            ("source_plan_id", existing.provenance.source_plan_id == prepared.provenance.source_plan_id),
+            ("source_task_id", existing.provenance.source_task_id == prepared.provenance.source_task_id),
+            ("approval_hash", existing.provenance.approval_hash == prepared.provenance.approval_hash),
+            ("evidence_hash", existing.provenance.evidence_hash == prepared.provenance.evidence_hash),
+        )
+        for field_name, matched in checks:
+            if not matched:
+                mismatches.append(field_name)
+        return (len(mismatches) == 0), tuple(mismatches)
+
     def create_memory(
         self,
         payload: MemoryCreateInput,
@@ -553,7 +606,10 @@ class ExperienceStore:
         actor: str = "system",
     ) -> MemoryWriteResult:
         """
-        Valida políticas, sanitiza y persiste un recuerdo nuevo aplicando deduplicación determinista.
+        Valida políticas, sanitiza y persiste un recuerdo aplicando reglas diferenciadas:
+        - `EXECUTION_VERIFIED`: idempotencia estricta por `idempotency_key` antes de cualquier otra regla,
+          rechazo auditable ante evidencia/payload distinto y no fusión por `content_fingerprint` entre ejecuciones.
+        - Orígenes convencionales (`USER_EXPLICIT` / `DECISION_CONFIRMED`): dedupe por `content_fingerprint`.
         """
         prepared = self.policy.prepare_create(payload, private_mode=private_mode)
         clean_actor = sanitize_memory_text(
@@ -570,40 +626,64 @@ class ExperienceStore:
                 now = utc_now_iso()
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    # 1) Dedupe por huella canónica dentro de recuerdos ACTIVOS.
-                    dup_fp = conn.execute(
-                        """
-                        SELECT * FROM memories
-                        WHERE content_fingerprint = ? AND status = 'ACTIVE'
-                        LIMIT 1
-                        """,
-                        (prepared.content_fingerprint,),
-                    ).fetchone()
-                    if dup_fp is not None:
-                        existing = _row_to_memory_record(dup_fp)
-                        self._insert_audit_tx(
-                            conn,
-                            action=MemoryAuditAction.DEDUPE_HIT,
-                            memory_id=existing.memory_id,
-                            actor=clean_actor,
-                            reason="content_fingerprint",
-                            details={"content_fingerprint": prepared.content_fingerprint},
-                            created_at=now,
-                        )
-                        conn.execute("COMMIT")
-                        return MemoryWriteResult(
-                            record=existing,
-                            created=False,
-                            deduplicated=True,
-                            matched_reason="content_fingerprint",
-                        )
+                    # 1) Para EXECUTION_VERIFIED la idempotencia se resuelve primero y nunca por texto/fingerprint.
+                    if prepared.source == MemorySource.EXECUTION_VERIFIED:
+                        assert prepared.idempotency_key is not None
+                        dup_idem = conn.execute(
+                            """
+                            SELECT * FROM memories
+                            WHERE idempotency_key = ?
+                            LIMIT 1
+                            """,
+                            (prepared.idempotency_key,),
+                        ).fetchone()
+                        if dup_idem is not None:
+                            existing = _row_to_memory_record(dup_idem)
+                            matches, mismatches = self._execution_payload_matches(existing, prepared)
+                            if matches:
+                                self._insert_audit_tx(
+                                    conn,
+                                    action=MemoryAuditAction.DEDUPE_HIT,
+                                    memory_id=existing.memory_id,
+                                    actor=clean_actor,
+                                    reason="idempotency_key",
+                                    details={
+                                        "idempotency_key": prepared.idempotency_key,
+                                        "canonical_unit_id": prepared.canonical_unit_id,
+                                        "existing_status": existing.status.value,
+                                    },
+                                    created_at=now,
+                                )
+                                conn.execute("COMMIT")
+                                return MemoryWriteResult(
+                                    record=existing,
+                                    created=False,
+                                    deduplicated=True,
+                                    matched_reason="idempotency_key",
+                                )
 
-                    # 2) Dedupe por procedencia estructurada para EXECUTION_VERIFIED.
-                    if (
-                        prepared.source == MemorySource.EXECUTION_VERIFIED
-                        and prepared.provenance.source_execution_id
-                    ):
-                        dup_prov = conn.execute(
+                            self._insert_audit_tx(
+                                conn,
+                                action=MemoryAuditAction.REJECT_IDEMPOTENCY_CONFLICT,
+                                memory_id=existing.memory_id,
+                                actor=clean_actor,
+                                reason="idempotency_key_payload_mismatch",
+                                details={
+                                    "idempotency_key": prepared.idempotency_key,
+                                    "canonical_unit_id": prepared.canonical_unit_id,
+                                    "mismatched_fields": list(mismatches),
+                                },
+                                created_at=now,
+                            )
+                            # Persistimos la auditoría del rechazo sin modificar recuerdos ni avanzar store_version_token.
+                            conn.execute("COMMIT")
+                            raise MemoryIdempotencyConflictError(
+                                "Conflicto de idempotencia: ya existe un registro con la misma clave y evidencia/payload incompatible "
+                                f"(campos en conflicto: {', '.join(mismatches)})."
+                            )
+
+                        # Segunda línea de defensa: impedir otra clave distinta para la misma unidad canónica ACTIVA.
+                        dup_unit = conn.execute(
                             """
                             SELECT * FROM memories
                             WHERE source = 'EXECUTION_VERIFIED'
@@ -611,6 +691,7 @@ class ExperienceStore:
                               AND source_execution_id = ?
                               AND COALESCE(source_plan_id, '') = ?
                               AND COALESCE(source_task_id, '') = ?
+                              AND canonical_unit_id = ?
                               AND status = 'ACTIVE'
                             LIMIT 1
                             """,
@@ -619,21 +700,49 @@ class ExperienceStore:
                                 prepared.provenance.source_execution_id,
                                 prepared.provenance.source_plan_id or "",
                                 prepared.provenance.source_task_id or "",
+                                prepared.canonical_unit_id,
                             ),
                         ).fetchone()
-                        if dup_prov is not None:
-                            existing = _row_to_memory_record(dup_prov)
+                        if dup_unit is not None:
+                            existing = _row_to_memory_record(dup_unit)
+                            self._insert_audit_tx(
+                                conn,
+                                action=MemoryAuditAction.REJECT_IDEMPOTENCY_CONFLICT,
+                                memory_id=existing.memory_id,
+                                actor=clean_actor,
+                                reason="canonical_unit_conflict",
+                                details={
+                                    "idempotency_key": prepared.idempotency_key,
+                                    "existing_idempotency_key": existing.idempotency_key,
+                                    "canonical_unit_id": prepared.canonical_unit_id,
+                                },
+                                created_at=now,
+                            )
+                            conn.execute("COMMIT")
+                            raise MemoryIdempotencyConflictError(
+                                "Conflicto de unidad canónica: ya existe un recuerdo activo para esa unidad de ejecución con distinta idempotency_key."
+                            )
+                    else:
+                        # 2) Dedupe convencional por huella canónica únicamente entre recuerdos NO EXECUTION_VERIFIED.
+                        dup_fp = conn.execute(
+                            """
+                            SELECT * FROM memories
+                            WHERE content_fingerprint = ?
+                              AND status = 'ACTIVE'
+                              AND source != 'EXECUTION_VERIFIED'
+                            LIMIT 1
+                            """,
+                            (prepared.content_fingerprint,),
+                        ).fetchone()
+                        if dup_fp is not None:
+                            existing = _row_to_memory_record(dup_fp)
                             self._insert_audit_tx(
                                 conn,
                                 action=MemoryAuditAction.DEDUPE_HIT,
                                 memory_id=existing.memory_id,
                                 actor=clean_actor,
-                                reason="execution_provenance",
-                                details={
-                                    "source_execution_id": prepared.provenance.source_execution_id,
-                                    "source_plan_id": prepared.provenance.source_plan_id,
-                                    "source_task_id": prepared.provenance.source_task_id,
-                                },
+                                reason="content_fingerprint",
+                                details={"content_fingerprint": prepared.content_fingerprint},
                                 created_at=now,
                             )
                             conn.execute("COMMIT")
@@ -641,7 +750,7 @@ class ExperienceStore:
                                 record=existing,
                                 created=False,
                                 deduplicated=True,
-                                matched_reason="execution_provenance",
+                                matched_reason="content_fingerprint",
                             )
 
                     # 3) Control de capacidad activa.
@@ -679,9 +788,10 @@ class ExperienceStore:
                             source_execution_id, approval_hash, verifier_component, verified_at,
                             evidence_hash, evidence_json,
                             created_at, updated_at, expires_at, revoked_at,
-                            superseded_by, last_verified_at, access_count
+                            superseded_by, last_verified_at, access_count,
+                            canonical_unit_id, idempotency_key
                         )
-                        VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0)
+                        VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?)
                         """,
                         (
                             memory_id,
@@ -712,6 +822,8 @@ class ExperienceStore:
                             now,
                             prepared.expires_at,
                             last_verified_at,
+                            prepared.canonical_unit_id,
+                            prepared.idempotency_key,
                         ),
                     )
 
@@ -726,6 +838,8 @@ class ExperienceStore:
                     if fts_active:
                         self._sync_fts_active_row_tx(conn, created_record)
 
+                    new_ver_token = bump_store_version_token_tx(conn, now=now)
+
                     self._insert_audit_tx(
                         conn,
                         action=MemoryAuditAction.CREATE,
@@ -737,6 +851,7 @@ class ExperienceStore:
                             "source": prepared.source.value,
                             "scope_type": prepared.scope_type.value,
                             "scope_key": prepared.scope_key,
+                            "store_version_token": new_ver_token,
                         },
                         created_at=now,
                     )
@@ -976,18 +1091,22 @@ class ExperienceStore:
                         normalized_text=new_normalized,
                     )
 
-                    conflict = conn.execute(
-                        """
-                        SELECT memory_id FROM memories
-                        WHERE content_fingerprint = ? AND status = 'ACTIVE' AND memory_id != ?
-                        LIMIT 1
-                        """,
-                        (new_fingerprint, clean_id),
-                    ).fetchone()
-                    if conflict is not None:
-                        raise MemoryDuplicateError(
-                            f"La revisión colisiona con el recuerdo activo '{conflict['memory_id']}'."
-                        )
+                    if current.source != MemorySource.EXECUTION_VERIFIED:
+                        conflict = conn.execute(
+                            """
+                            SELECT memory_id FROM memories
+                            WHERE content_fingerprint = ?
+                              AND status = 'ACTIVE'
+                              AND source != 'EXECUTION_VERIFIED'
+                              AND memory_id != ?
+                            LIMIT 1
+                            """,
+                            (new_fingerprint, clean_id),
+                        ).fetchone()
+                        if conflict is not None:
+                            raise MemoryDuplicateError(
+                                f"La revisión colisiona con el recuerdo activo '{conflict['memory_id']}'."
+                            )
 
                     now = utc_now_iso()
                     new_rev_num = current.revision_number + 1
@@ -1063,13 +1182,19 @@ class ExperienceStore:
                     if fts_active:
                         self._sync_fts_active_row_tx(conn, updated)
 
+                    new_ver_token = bump_store_version_token_tx(conn, now=now)
+
                     self._insert_audit_tx(
                         conn,
                         action=MemoryAuditAction.REVISE,
                         memory_id=clean_id,
                         actor=clean_actor,
                         reason=clean_reason,
-                        details={"revision_id": revision_id, "revision_number": new_rev_num},
+                        details={
+                            "revision_id": revision_id,
+                            "revision_number": new_rev_num,
+                            "store_version_token": new_ver_token,
+                        },
                         created_at=now,
                     )
                     conn.execute("COMMIT")
@@ -1093,6 +1218,125 @@ class ExperienceStore:
             reason=reason,
             actor=actor,
         )
+
+    def invalidate_by_execution(
+        self,
+        execution_id: str,
+        *,
+        reason: str = "rollback_execution",
+        actor: str = "system",
+        private_mode: bool = False,
+    ) -> ExecutionInvalidationResult:
+        """
+        Invalida lógicamente (`REVOKED`) los recuerdos `EXECUTION_VERIFIED` activos asociados
+        a `execution_id`, purgándolos de `memory_fts` de forma idempotente y auditable.
+
+        Justificación técnica junior:
+        Se utiliza `REVOKED` y nunca `SUPERSEDED` porque la máquina de estados N8 exige un
+        `superseded_by` válido hacia otro registro. Si no existen recuerdos activos para esa
+        ejecución (o ya fueron invalidados antes), no muta datos ni avanza `store_version_token`.
+        """
+        self.policy.assert_write_allowed(private_mode=private_mode)
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise MemoryValidationError("execution_id no puede estar vacío.")
+        clean_exec_id = sanitize_memory_text(
+            execution_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="execution_id",
+            check_secrets=True,
+        )
+        clean_reason = sanitize_memory_text(
+            reason,
+            max_chars=240,
+            allow_newlines=False,
+            field_name="reason",
+            check_secrets=True,
+        )
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+
+        with self.acquire_lock():
+            with self._open_connection(enable_wal=True) as conn:
+                fts_active = self._ensure_ready(conn)
+                now = utc_now_iso()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    active_rows = conn.execute(
+                        """
+                        SELECT memory_id FROM memories
+                        WHERE source = 'EXECUTION_VERIFIED'
+                          AND source_execution_id = ?
+                          AND status = 'ACTIVE'
+                        ORDER BY created_at ASC, memory_id ASC
+                        """,
+                        (clean_exec_id,),
+                    ).fetchall()
+                    already_row = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM memories
+                        WHERE source = 'EXECUTION_VERIFIED'
+                          AND source_execution_id = ?
+                          AND status != 'ACTIVE'
+                        """,
+                        (clean_exec_id,),
+                    ).fetchone()
+                    already_inactive = int(already_row[0]) if already_row else 0
+
+                    invalidated_ids: list[str] = []
+                    if active_rows:
+                        new_token = bump_store_version_token_tx(conn, now=now)
+                        for row in active_rows:
+                            mem_id = str(row["memory_id"])
+                            conn.execute(
+                                """
+                                UPDATE memories
+                                SET status = 'REVOKED',
+                                    updated_at = ?,
+                                    revoked_at = ?
+                                WHERE memory_id = ?
+                                """,
+                                (now, now, mem_id),
+                            )
+                            if fts_active:
+                                conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (mem_id,))
+                            self._insert_audit_tx(
+                                conn,
+                                action=MemoryAuditAction.REVOKE,
+                                memory_id=mem_id,
+                                actor=clean_actor,
+                                reason=clean_reason,
+                                details={
+                                    "from_status": MemoryStatus.ACTIVE.value,
+                                    "to_status": MemoryStatus.REVOKED.value,
+                                    "source_execution_id": clean_exec_id,
+                                    "invalidation_kind": "rollback_execution",
+                                    "store_version_token": new_token,
+                                },
+                                created_at=now,
+                            )
+                            invalidated_ids.append(mem_id)
+                    else:
+                        _, _, new_token = read_store_version_components(conn)
+
+                    conn.execute("COMMIT")
+                    return ExecutionInvalidationResult(
+                        execution_id=clean_exec_id,
+                        invalidated_count=len(invalidated_ids),
+                        invalidated_memory_ids=tuple(invalidated_ids),
+                        already_inactive_count=already_inactive,
+                        store_version_token=new_token,
+                        reason=clean_reason,
+                    )
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
 
     def transition_status(
         self,
@@ -1190,6 +1434,8 @@ class ExperienceStore:
                     if fts_active:
                         conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (clean_id,))
 
+                    new_ver_token = bump_store_version_token_tx(conn, now=now)
+
                     audit_action = {
                         MemoryStatus.REVOKED: MemoryAuditAction.REVOKE,
                         MemoryStatus.EXPIRED: MemoryAuditAction.EXPIRE,
@@ -1205,6 +1451,7 @@ class ExperienceStore:
                             "from_status": current.status.value,
                             "to_status": target_status.value,
                             "superseded_by": sup_id,
+                            "store_version_token": new_ver_token,
                         },
                         created_at=now,
                     )
@@ -1287,10 +1534,34 @@ class ExperienceStore:
     ) -> list[MemorySearchCandidate]:
         """
         Primitiva de almacenamiento para buscar recuerdos ACTIVOS mediante FTS5 con respaldo SQL LIKE.
+        """
+        candidates, _ = self.search_text_candidates_with_version(
+            query,
+            scope_type=scope_type,
+            scope_key=scope_key,
+            categories=categories,
+            exclude_pending=exclude_pending,
+            max_tokens=max_tokens,
+            limit=limit,
+            force_sql_fallback=force_sql_fallback,
+        )
+        return candidates
 
-        Justificación técnica junior:
-        Permite limitar la cantidad máxima de tokens consultados y filtrar recuerdos pendientes de
-        confirmación para que `MemoryRetriever` (N8.2) aplique su ranking ponderado y presupuestos.
+    def search_text_candidates_with_version(
+        self,
+        query: str,
+        *,
+        scope_type: MemoryScopeType | None = None,
+        scope_key: str | None = None,
+        categories: tuple[MemoryCategory, ...] | None = None,
+        exclude_pending: bool = False,
+        max_tokens: int | None = None,
+        limit: int = 20,
+        force_sql_fallback: bool = False,
+    ) -> tuple[list[MemorySearchCandidate], str]:
+        """
+        Busca candidatos ACTIVOS y lee atómicamente `store_version_token` dentro del mismo
+        `ExperienceStoreLock` y conexión de instantánea.
         """
         self.policy.assert_enabled()
         if not isinstance(query, str):
@@ -1311,7 +1582,7 @@ class ExperienceStore:
                 break
 
         if not tokens:
-            return []
+            return [], ""
 
         eff_limit = max(1, min(200, int(limit)))
         filter_clauses: list[str] = ["m.status = 'ACTIVE'"]
@@ -1346,6 +1617,7 @@ class ExperienceStore:
         with self.acquire_lock():
             with self._open_connection() as conn:
                 fts_active = self._ensure_ready(conn)
+                _, _, ver_token = read_store_version_components(conn)
                 use_fts = fts_active and not force_sql_fallback
 
                 if use_fts:
@@ -1359,14 +1631,17 @@ class ExperienceStore:
                         LIMIT ?
                     """
                     rows = conn.execute(sql, (fts_expr, *filter_params, eff_limit)).fetchall()
-                    return [
-                        MemorySearchCandidate(
-                            record=_row_to_memory_record(r),
-                            match_backend="fts5",
-                            raw_score=float(r["rank_score"]),
-                        )
-                        for r in rows
-                    ]
+                    return (
+                        [
+                            MemorySearchCandidate(
+                                record=_row_to_memory_record(r),
+                                match_backend="fts5",
+                                raw_score=float(r["rank_score"]),
+                            )
+                            for r in rows
+                        ],
+                        ver_token,
+                    )
 
                 # Respaldo SQL determinista con LIKE parametrizado y ESCAPE explícito.
                 like_clauses: list[str] = []
@@ -1390,14 +1665,17 @@ class ExperienceStore:
                 """
                 full_params = [*like_params, *filter_params, *like_params, eff_limit]
                 rows = conn.execute(sql_fallback, tuple(full_params)).fetchall()
-                return [
-                    MemorySearchCandidate(
-                        record=_row_to_memory_record(r),
-                        match_backend="sql_like",
-                        raw_score=float(r["hit_score"]),
-                    )
-                    for r in rows
-                ]
+                return (
+                    [
+                        MemorySearchCandidate(
+                            record=_row_to_memory_record(r),
+                            match_backend="sql_like",
+                            raw_score=float(r["hit_score"]),
+                        )
+                        for r in rows
+                    ],
+                    ver_token,
+                )
 
     def _quarantine_corrupt_files_locked(self) -> list[Path]:
         """
@@ -1418,6 +1696,30 @@ class ExperienceStore:
                 os.replace(str(src), str(dst))
                 moved.append(dst)
         return moved
+
+    @staticmethod
+    def _check_fts_sync(conn: sqlite3.Connection) -> tuple[bool, str]:
+        """Comprueba que `memory_fts` contenga exactamente los recuerdos `ACTIVE` actuales."""
+        active_db = int(
+            conn.execute("SELECT COUNT(*) FROM memories WHERE status = 'ACTIVE'").fetchone()[0]
+        )
+        fts_total = int(conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0])
+        stale_in_fts = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM memory_fts
+                LEFT JOIN memories ON memories.memory_id = memory_fts.memory_id
+                WHERE memories.memory_id IS NULL OR memories.status != 'ACTIVE'
+                """
+            ).fetchone()[0]
+        )
+        fts_sync_ok = (active_db == fts_total) and (stale_in_fts == 0)
+        details = (
+            ""
+            if fts_sync_ok
+            else f"fts_desync(active={active_db}, fts={fts_total}, stale={stale_in_fts})"
+        )
+        return fts_sync_ok, details
 
     def verify_integrity(
         self,
@@ -1465,28 +1767,12 @@ class ExperienceStore:
                     sync_details = ""
 
                     if not missing_tables and check_fts_sync and fts_active:
-                        active_db = int(
-                            conn.execute(
-                                "SELECT COUNT(*) FROM memories WHERE status = 'ACTIVE'"
-                            ).fetchone()[0]
-                        )
-                        fts_total = int(
-                            conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0]
-                        )
-                        stale_in_fts = int(
-                            conn.execute(
-                                """
-                                SELECT COUNT(*) FROM memory_fts
-                                LEFT JOIN memories ON memories.memory_id = memory_fts.memory_id
-                                WHERE memories.memory_id IS NULL OR memories.status != 'ACTIVE'
-                                """
-                            ).fetchone()[0]
-                        )
-                        fts_sync_ok = (active_db == fts_total) and (stale_in_fts == 0)
-                        if not fts_sync_ok:
-                            sync_details = (
-                                f"fts_desync(active={active_db}, fts={fts_total}, stale={stale_in_fts})"
-                            )
+                        fts_sync_ok, sync_details = self._check_fts_sync(conn)
+
+                    token_ok = True
+                    if not missing_tables and schema_ver == CURRENT_SCHEMA_VERSION:
+                        _, _, current_token = read_store_version_components(conn)
+                        token_ok = bool(current_token)
 
                     overall_ok = (
                         ic_ok
@@ -1494,6 +1780,7 @@ class ExperienceStore:
                         and not missing_tables
                         and schema_ver == CURRENT_SCHEMA_VERSION
                         and fts_sync_ok
+                        and token_ok
                     )
 
                     details_parts: list[str] = []
@@ -1503,8 +1790,12 @@ class ExperienceStore:
                         details_parts.append(f"foreign_key_violations={len(fk_rows)}")
                     if missing_tables:
                         details_parts.append(f"missing_tables={missing_tables}")
+                    if schema_ver != CURRENT_SCHEMA_VERSION:
+                        details_parts.append(f"schema_version={schema_ver}!={CURRENT_SCHEMA_VERSION}")
                     if sync_details:
                         details_parts.append(sync_details)
+                    if not token_ok:
+                        details_parts.append("missing_store_version_token")
 
                     report = IntegrityReport(
                         ok=overall_ok,
@@ -1582,6 +1873,7 @@ class ExperienceStore:
 
                 rev_count = int(conn.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0])
                 aud_count = int(conn.execute("SELECT COUNT(*) FROM memory_audit").fetchone()[0])
+                _, _, ver_token = read_store_version_components(conn)
                 total = sum(counts.values())
 
                 return StoreStats(
@@ -1597,6 +1889,7 @@ class ExperienceStore:
                     expired_memories=counts[MemoryStatus.EXPIRED.value],
                     total_revisions=rev_count,
                     total_audit_entries=aud_count,
+                    store_version_token=ver_token,
                 )
 
     # ------------------------------------------------------------------
@@ -1727,6 +2020,8 @@ class ExperienceStore:
                     if fts_active:
                         self._sync_fts_active_row_tx(conn, updated)
 
+                    new_ver_token = bump_store_version_token_tx(conn, now=now)
+
                     self._insert_audit_tx(
                         conn,
                         action=MemoryAuditAction.REVISE,
@@ -1737,6 +2032,7 @@ class ExperienceStore:
                             "revision_id": revision_id,
                             "revision_number": new_rev_num,
                             "was_pending": was_pending,
+                            "store_version_token": new_ver_token,
                         },
                         created_at=now,
                     )
@@ -1826,6 +2122,8 @@ class ExperienceStore:
 
                     conn.execute("DELETE FROM memories WHERE memory_id = ?", (clean_id,))
 
+                    new_ver_token = bump_store_version_token_tx(conn, now=now)
+
                     id_digest = hashlib.sha256(clean_id.encode("utf-8")).hexdigest()
                     self._insert_audit_tx(
                         conn,
@@ -1838,6 +2136,7 @@ class ExperienceStore:
                             "purge_reason_hash": hashlib.sha256(clean_reason.encode("utf-8")).hexdigest()[:16],
                             "revisions_deleted": revs_deleted,
                             "audit_rows_deleted": aud_deleted,
+                            "store_version_token": new_ver_token,
                         },
                         created_at=now,
                     )
@@ -2130,12 +2429,17 @@ class ExperienceStore:
             preserved_main_db: Path | None = None
             staging_db = self.db_path.parent / f"{self.db_path.name}.restore_staging_{uuid4().hex[:10]}"
 
+            prev_live_seq = 0
+
             try:
-                # Si la DB actual existe y abre sin error, intentamos checkpoint WAL para consolidarla.
+                # Si la DB actual existe y abre sin error, consolidamos WAL y leemos su secuencia previa
+                # para que el token rotado tras restaurar un backup antiguo nunca reutilice versiones previas.
                 if self.db_path.exists():
                     try:
                         with self._open_connection() as cur_conn:
                             cur_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                            if table_exists(cur_conn, "store_metadata"):
+                                _, prev_live_seq, _ = read_store_version_components(cur_conn)
                     except (MemoryCorruptionError, MemoryPersistenceError, sqlite3.Error):
                         pass
 
@@ -2171,7 +2475,7 @@ class ExperienceStore:
 
                 os.replace(str(staging_db), str(self.db_path))
 
-                # Verificación integral sobre la DB restaurada dentro del mismo lock exclusivo.
+                # Verificación integral, migración v1->v2 si aplica, chequeo FTS5 y rotación de token post-swap.
                 with self._open_connection(enable_wal=True) as restored_conn:
                     ic_rows = restored_conn.execute("PRAGMA integrity_check").fetchall()
                     ic_res = ", ".join(str(r[0]) for r in ic_rows) if ic_rows else "empty"
@@ -2180,33 +2484,60 @@ class ExperienceStore:
                     schema_ver = int(uv_row[0]) if uv_row else 0
                     missing_tables = [t for t in CORE_TABLES if not table_exists(restored_conn, t)]
 
-                    if ic_res.strip().lower() != "ok" or fk_rows or missing_tables:
+                    if (
+                        ic_res.strip().lower() != "ok"
+                        or fk_rows
+                        or missing_tables
+                        or schema_ver < 1
+                        or schema_ver > CURRENT_SCHEMA_VERSION
+                    ):
                         raise MemoryRestoreError(
-                            f"La DB restaurada falló verificación post-swap (ic={ic_res}, fk={len(fk_rows)})."
+                            f"La DB restaurada falló verificación post-swap "
+                            f"(ic={ic_res}, fk={len(fk_rows)}, schema={schema_ver}, missing={missing_tables})."
                         )
 
-                    now = utc_now_iso()
-                    fts_active = self._is_fts_active(restored_conn)
-                    report = IntegrityReport(
-                        ok=True,
-                        integrity_check_result=ic_res,
-                        foreign_keys_ok=True,
-                        fts_available=fts5_available(restored_conn),
-                        fts_active=fts_active,
-                        fts_sync_ok=True,
-                        schema_version=schema_ver,
-                        details="ok",
-                    )
+                    migrated_from_version: int | None = None
+                    if schema_ver < CURRENT_SCHEMA_VERSION:
+                        migrated_from_version = schema_ver
+                        mig_res = apply_migrations(
+                            restored_conn,
+                            enable_fts5=self.enable_fts5,
+                            busy_timeout_ms=self.busy_timeout_ms,
+                        )
+                        schema_ver = mig_res.schema_version
 
+                    fts_avail = fts5_available(restored_conn)
+                    fts_active = self._is_fts_active(restored_conn)
+                    fts_sync_ok = True
+                    if fts_active:
+                        fts_sync_ok, sync_details = self._check_fts_sync(restored_conn)
+                        if not fts_sync_ok:
+                            raise MemoryRestoreError(
+                                f"La DB restaurada falló verificación FTS5 post-swap ({sync_details})."
+                            )
+
+                    now = utc_now_iso()
                     restored_conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # Rotamos epoch y garantizamos seq > prev_live_seq para invalidar caches tras restaurar.
+                        rotated_token = rotate_store_version_token_tx(
+                            restored_conn,
+                            min_seq=prev_live_seq,
+                            now=now,
+                        )
                         self._insert_audit_tx(
                             restored_conn,
                             action=MemoryAuditAction.INTEGRITY_CHECK,
                             memory_id=None,
                             actor=clean_actor,
                             reason="backup_restored_verified",
-                            details={"backup_id": backup_id, "sha256": resolved_expected_hash},
+                            details={
+                                "backup_id": backup_id,
+                                "sha256": resolved_expected_hash,
+                                "migrated_from_version": migrated_from_version,
+                                "schema_version": schema_ver,
+                                "store_version_token": rotated_token,
+                            },
                             created_at=now,
                         )
                         restored_conn.execute("COMMIT")
@@ -2214,6 +2545,17 @@ class ExperienceStore:
                         if restored_conn.in_transaction:
                             restored_conn.execute("ROLLBACK")
                         raise
+
+                    report = IntegrityReport(
+                        ok=True,
+                        integrity_check_result=ic_res,
+                        foreign_keys_ok=True,
+                        fts_available=fts_avail,
+                        fts_active=fts_active,
+                        fts_sync_ok=fts_sync_ok,
+                        schema_version=schema_ver,
+                        details="ok",
+                    )
 
                 return RestoreResult(
                     restored=True,

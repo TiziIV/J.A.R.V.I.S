@@ -1,8 +1,8 @@
-# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2)
+# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Subfase 1)
 
 > [!IMPORTANT]
-> **Alcance implementado actualmente:** Este documento cubre las fases **N8.1** (persistencia base, modelos, políticas y locking) y **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración).
-> Las capacidades de **N8.3** (captura automática post-ejecución `EXECUTION_VERIFIED`, persistencia de referencias en `GoalStore` e integración en `GoalEngine`/`ExecutionSupervisor`), embeddings y consolidación por LLM **permanecen desactivadas y reservadas**.
+> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración) y **N8.3 Subfase 1** (migración SQLite v1 -> v2, idempotencia estricta para `EXECUTION_VERIFIED`, `store_version_token` monótono e `invalidate_by_execution()`).
+> Permanecen reservadas y sin activar las subfases siguientes de **N8.3** (`ExperienceCaptureService` en N5/N6, captura automática `N8_AUTO_CAPTURE_ENABLED`, `EphemeralGoalStore`, integración en `GoalEngine`/`BrainManager` y `MemorySnapshotGuard`), así como embeddings y consolidación por LLM.
 
 ---
 
@@ -34,12 +34,12 @@ flowchart LR
 
 | Archivo | Fase | Responsabilidad |
 | :--- | :---: | :--- |
-| [models.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/models.py) | N8.1/N8.2 | Enumeraciones, máquina de estados (`ACTIVE`, `SUPERSEDED`, `REVOKED`, `EXPIRED`), excepciones tipadas (`MemorySubsystemError`, `MemoryPrivateModeError`, `MemoryBackupError`, `MemoryRestoreError`, `MemoryLockTimeoutError`, etc.) y contratos DTO (`ExecutionVerificationEvidence`, `MemoryRetrievalResult`, `PurgeResult`, `BackupInfo`, `RestoreResult`, `PreferenceImportPreview`). |
-| [policy.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/policy.py) | N8.1/N8.2 | `MemoryPolicy`, `sanitize_memory_text()`, detección sin exposición de secretos (`assert_no_secrets` + `redact_secrets`), bloqueo de `INFERENCE`, validación `EXECUTION_VERIFIED`, validación de rutas Windows (`validate_safe_local_db_path`, `validate_safe_backup_dir`, `validate_safe_read_json_path`) y sandbox `JARVIS_ENV=test`. |
-| [migrations.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/migrations.py) | N8.1 | Esquema SQLite versionado v1 (`schema_migrations`, `store_metadata`, `memories`, `memory_revisions`, `memory_audit`, `memory_fts`), tokenizer `unicode61 remove_diacritics 2`, índices parciales únicos y pragmas `WAL` + `synchronous=FULL` + `secure_delete=ON` + `foreign_keys=ON`. |
-| [store.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/store.py) | N8.1/N8.2 | `ExperienceStoreLock` y `ExperienceStore`: CRUD transaccional (`BEGIN IMMEDIATE`), dedupe, revisiones inmutables, confirmación de pendientes (`confirm_memory`), revocación lógica (`revoke_memory`), purga física (`purge_memory`), backup (`create_backup`), restauración (`restore_from_backup`) y `verify_integrity`. |
-| [retriever.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/retriever.py) | N8.2 | Recuperación determinista FTS5/BM25 + fallback SQL `LIKE`, filtrado previo por estado/vigencia/ámbito, ranking ponderado, no fusión de experiencias distintas y presupuestos por canal. |
-| [engine.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/engine.py) | N8.2 | API central que coordina políticas, modo privado, ciclo de vida completo, backups/restauración e importación manual read-only desde JSON legacy. |
+| [models.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/models.py) | N8.1/N8.2/N8.3-S1 | Enumeraciones (`MemoryAuditAction.REJECT_IDEMPOTENCY_CONFLICT`), máquina de estados, excepciones tipadas (`MemoryIdempotencyConflictError`, etc.) y contratos DTO (`ExecutionVerificationEvidence` con `canonical_unit_id`, `MemoryCreateInput`, `MemoryRecord`, `ExecutionInvalidationResult`, `MemoryRetrievalResult` y `StoreStats` con `store_version_token`). |
+| [policy.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/policy.py) | N8.1/N8.2/N8.3-S1 | `MemoryPolicy`, `sanitize_memory_text()`, detección sin exposición de secretos (`assert_no_secrets` + `redact_secrets`), bloqueo de `INFERENCE`, validación `EXECUTION_VERIFIED`, derivación determinista `compute_default_canonical_unit_id()` / `compute_execution_idempotency_key()` y sandbox `JARVIS_ENV=test`. |
+| [migrations.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/migrations.py) | N8.1/N8.3-S1 | Esquema SQLite versionado v1 -> v2 (`canonical_unit_id`, `idempotency_key`, reconstrucción de `memory_audit`, índices de idempotencia/ejecución, `store_version_epoch` / `store_version_seq` / `store_version_token`), tokenizer `unicode61 remove_diacritics 2` y pragmas `WAL` + `synchronous=FULL` + `secure_delete=ON` + `foreign_keys=ON`. |
+| [store.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/store.py) | N8.1/N8.2/N8.3-S1 | `ExperienceStoreLock` y `ExperienceStore`: CRUD transaccional (`BEGIN IMMEDIATE`), idempotencia estricta `EXECUTION_VERIFIED` sin fusión entre ejecuciones, dedupe convencional por `content_fingerprint`, actualización atómica de `store_version_token`, `invalidate_by_execution()`, backups y restauración compatible v1/v2 con verificación inmediata. |
+| [retriever.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/retriever.py) | N8.2/N8.3-S1 | Recuperación determinista FTS5/BM25 + fallback SQL `LIKE` junto con lectura atómica del `store_version_token` del snapshot recuperado. |
+| [engine.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/engine.py) | N8.2/N8.3-S1 | API central `MemoryEngine`: coordinación de políticas, modo privado, ciclo de vida completo, `get_store_version_token()`, `invalidate_by_execution()`, backups/restauración e importación manual read-only desde JSON legacy. |
 | [console.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/console.py) | N8.2 | Comandos de consola `/memoria`, `/privado` e `/incognito` con validación de argumentos, vistas previas y confirmación interactiva antes de acciones destructivas. |
 
 ---
@@ -132,12 +132,44 @@ La protección no depende de instrucciones al modelo LLM sino de controles estru
 - **Concurrencia real:** Todas las operaciones (`create`, `revise`, `confirm`, `revoke`, `purge`, `backup`, `restore`, `verify_integrity`, `retrieve`) comparten `ExperienceStoreLock` (RLock modular por ruta canónica + `msvcrt.locking` en Windows / `fcntl.flock` en POSIX). Validado mediante subprocesos independientes reales en `writer-vs-purge` y `writer-vs-restore`.
 - **Protección Git:** `.gitignore` y `src/utils/git_guard.py` (`GitSafetyGuard`) bloquean `data/`, `experiences.db*`, `-wal`, `-shm`, `-journal`, `.db.lock`, `.backup.json`, `.db.sha256`, `data/backups/memory/`, `.restore_staging_*`, `.pre_restore_*` y `*.corrupt.*`.
 - **Aislamiento de tests (`JARVIS_ENV=test`):** redirige DB y backups bajo `temp/jarvis_test_isolated/` y prohíbe acceder a `data/memory_store.json`, `data/experiences.db` o `data/backups/` reales.
-- **Límites respecto a N8.3:** no se implementa en N8.2 captura automática post-ejecución, persistencia de referencias N8 en `GoalStore`, cambios en `GoalEngine`/`ExecutionSupervisor`, embeddings ni consolidación LLM.
+- **Límites respecto a subfases siguientes de N8.3:** todavía no se integran `ExperienceCaptureService`, captura automática (`N8_AUTO_CAPTURE_ENABLED=False`), referencias N8 en `GoalStore` / `EphemeralGoalStore`, cambios en `GoalEngine` / `BrainManager` / `ExecutionSupervisor`, `MemorySnapshotGuard`, embeddings ni consolidación LLM.
+
+---
+
+## 9. Esquema SQLite v2, Idempotencia Estricta y Coherencia de Snapshot (N8.3 Subfase 1)
+
+1. **Migración incremental v1 -> v2 (`apply_migrations`):**
+   - Añade columnas `canonical_unit_id` e `idempotency_key` a `memories` y ejecuta backfill determinista sobre filas `EXECUTION_VERIFIED` previas respetando unidades activas e inactivas.
+   - Reconstruye `memory_audit` preservando filas históricas para ampliar el `CHECK` con `REJECT_IDEMPOTENCY_CONFLICT`.
+   - Reemplaza `idx_memories_active_exec_provenance` por:
+     - `idx_memories_idempotency_key` (`UNIQUE` sobre `idempotency_key WHERE idempotency_key IS NOT NULL`, cubriendo todos los estados para impedir resurrecciones silenciosas tras rollback).
+     - `idx_memories_active_exec_unit` (`UNIQUE` sobre `(source_layer, source_execution_id, COALESCE(source_plan_id, ''), COALESCE(source_task_id, ''), canonical_unit_id)` cuando `source = 'EXECUTION_VERIFIED' AND status = 'ACTIVE'`).
+     - `idx_memories_source_execution_id` para invalidación indexada en rollbacks.
+   - Restringe `idx_memories_active_fingerprint` a `WHERE status = 'ACTIVE' AND source != 'EXECUTION_VERIFIED'`.
+
+2. **Separación entre dedupe convencional e idempotencia `EXECUTION_VERIFIED`:**
+   - Orígenes convencionales (`USER_EXPLICIT`, `DECISION_CONFIRMED`): continúan aplicando deduplicación canónica por `content_fingerprint` únicamente frente a registros convencionales `ACTIVE`.
+   - Origen `EXECUTION_VERIFIED`: nunca colisiona por `content_fingerprint` entre ejecuciones diferentes; primero valida `idempotency_key`:
+     - Si existe y el payload + evidencia coinciden -> devuelve `DEDUPE_HIT` (`matched_reason="idempotency_key"`) sin mutar estado ni avanzar `store_version_token`.
+     - Si existe con evidencia o payload incompatible -> registra `REJECT_IDEMPOTENCY_CONFLICT` en `memory_audit` sin exponer secretos, mantiene `memories` y `store_version_token` intactos, y lanza `MemoryIdempotencyConflictError`.
+     - Una misma tarea/ejecución puede registrar múltiples unidades independientes (`canonical_unit_id` distintos, e incluso `EXPERIENCE` + `FACT` por unidad predeterminada) sin colapsar.
+
+3. **`store_version_token` (`<epoch>:<seq>`) persistente y atómico:**
+   - Persistido en `store_metadata` (`store_version_epoch`, `store_version_seq`, `store_version_token`).
+   - Las operaciones de solo lectura, `DEDUPE_HIT`, `REJECT_IDEMPOTENCY_CONFLICT`, `invalidate_by_execution` con 0 afectadas y los rollbacks transaccionales dejan el token intacto.
+   - Toda mutación efectiva (`create_memory`, `update_memory_with_revision`, `confirm_memory`, `transition_status`, `revoke_memory`, `invalidate_by_execution` > 0, `purge_memory`) incrementa atómicamente `store_version_seq` dentro de la misma transacción `BEGIN IMMEDIATE`.
+   - `restore_from_backup()` valida y migra automáticamente snapshots v1 o v2, verifica sincronía FTS5, rota `store_version_epoch` garantizando `seq > prev_live_seq` (sin reutilizar jamás tokens previos aun restaurando backups antiguos) y deja `verify_integrity()` listo para aprobar de inmediato.
+   - `MemoryRetriever.retrieve()` lee candidatos y `store_version_token` bajo el mismo snapshot bloqueado para habilitar validación futura en N8.3.
+
+4. **Invalidación por ejecución revertida (`invalidate_by_execution`):**
+   - `MemoryEngine.invalidate_by_execution()` / `ExperienceStore.invalidate_by_execution()` revoca lógicamente (`REVOKED`) los recuerdos `EXECUTION_VERIFIED` activos asociados a `source_execution_id`, los purga de inmediato de `memory_fts`, conserva la auditoría histórica (`REVOKE`) y retorna `ExecutionInvalidationResult`.
+   - Repetir la llamada sobre la misma ejecución es idempotente (sin revocaciones adicionales y sin modificar `store_version_token`).
+   - Está bloqueada en modo privado (`MemoryPrivateModeError`). Un retry idempotente posterior con la misma clave devuelve el registro `REVOKED` sin resucitarlo.
 
 ### Ejecución de tests
 
 ```powershell
 $env:JARVIS_ENV = "test"
-.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle -v
+.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence -v
 .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q
 ```

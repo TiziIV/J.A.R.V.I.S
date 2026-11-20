@@ -1169,3 +1169,39 @@ Se completó **N8.2 — Long-Term Memory & Experience** sobre la base N8.1 (`dat
 
 - N8.3 (captura automática `EXECUTION_VERIFIED` post-ejecución e integración de referencias N8 en N6/`GoalStore`) queda sin implementar y desactivada por política.
 - Purga física limita su garantía al almacenamiento SQLite (`secure_delete=ON`, `wal_checkpoint`, `VACUUM`), sin garantía sobre wear-leveling SSD, NTFS ni copias VSS/OS previas.
+
+---
+
+## Fase N8.3 Subfase 1 — Persistencia SQLite v2, Idempotencia Estricta, `store_version_token` e Invalidación por Ejecución (2026-11-20)
+
+### 1. Resumen de Implementación
+
+Se implementó exclusivamente la base de persistencia v2 necesaria para habilitar las siguientes subfases de **N8.3 — Long-Term Memory & Experience**, manteniendo intactos `data/memory_store.json`, `N5`, `N6`, `N7`, los flujos de voz y `N8_AUTO_CAPTURE_ENABLED=False`. No se implementaron aún `ExperienceCaptureService`, `EphemeralGoalStore`, `MemorySnapshotGuard` ni integraciones en `GoalEngine` / `BrainManager` / `ChainOrchestrator` (reservados para Subfases 2, 3 y 4).
+
+### 2. Archivos Creados y Modificados
+
+- **Actualizados (`src/memory/`):**
+  - `src/memory/models.py`: añadidos `MemoryAuditAction.REJECT_IDEMPOTENCY_CONFLICT`, `MemoryIdempotencyConflictError`, `ExecutionInvalidationResult`, campo opcional `canonical_unit_id` en `ExecutionVerificationEvidence` (excluido de `canonical_payload()` cuando es `None` para preservar hashes v1), `canonical_unit_id` e `idempotency_key` en `MemoryCreateInput` y `MemoryRecord`, y `store_version_token` en `StoreStats` y `MemoryRetrievalResult`.
+  - `src/memory/policy.py`: añadidos `compute_default_canonical_unit_id()`, `compute_execution_idempotency_key()` y validación/derivación determinista en `MemoryPolicy.prepare_create()` (restringida estrictamente a `EXECUTION_VERIFIED`).
+  - `src/memory/migrations.py`: subida de esquema `CURRENT_SCHEMA_VERSION = 2` y migración incremental/idempotente v1 -> v2 (`canonical_unit_id`, `idempotency_key`, backfill determinista sobre filas `EXECUTION_VERIFIED` previas, reemplazo de `idx_memories_active_exec_provenance` y restricción de `idx_memories_active_fingerprint` a `source != 'EXECUTION_VERIFIED'`, nuevos índices `idx_memories_idempotency_key`, `idx_memories_active_exec_unit` e `idx_memories_source_execution_id`, reconstrucción de `memory_audit` con preservación de historial para `REJECT_IDEMPOTENCY_CONFLICT`, y gestión atómica de `store_version_epoch` / `store_version_seq` / `store_version_token` en `store_metadata`).
+  - `src/memory/store.py`: separada la idempotencia estricta `EXECUTION_VERIFIED` (verificación por `idempotency_key` + `_execution_payload_matches` + `REJECT_IDEMPOTENCY_CONFLICT` auditable sin alterar recuerdos ni `store_version_token`) del dedupe convencional por `content_fingerprint`; añadido `get_store_version_token()`, `invalidate_by_execution()`, `search_text_candidates_with_version()`, actualización atómica de `store_version_token` en todas las mutaciones y compatibilidad en `restore_from_backup()` para restaurar backups v1 y v2 con migración automática, chequeo FTS5 vía `_check_fts_sync()`, rotación de epoch garantizando secuencia creciente y `verify_integrity()` inmediato.
+  - `src/memory/retriever.py`, `src/memory/engine.py`, `src/memory/__init__.py`: propagado `store_version_token` atómico en `MemoryRetriever.retrieve()`, expuestos `get_store_version_token()` e `invalidate_by_execution()` (bloqueado en modo privado con `MemoryPrivateModeError`) en `MemoryEngine` y actualizadas las exportaciones públicas.
+- **Pruebas y Documentación:**
+  - `tests/test_memory_n8_persistence.py`: actualizadas las 2 aserciones v1-específicas (`schema_migrations` `[1, 2]` y nueva semántica de cohabitación `EXPERIENCE`/`FACT` + conflicto auditable de idempotencia en v2).
+  - `tests/test_memory_n8_v2_persistence.py`: nueva suite aislada de 5 pruebas integrales bajo `JARVIS_ENV=test` y `temp/jarvis_test_isolated/` (migración v1 -> v2 preservando datos y restauración de backup v1 con `verify_integrity()` inmediato, matriz completa de idempotencia y separación de dedupe, monotonía y rollback transaccional de `store_version_token`, `invalidate_by_execution()` idempotente y aislado por ejecución/privacidad, y concurrencia multihilo y multiproceso real).
+  - `docs/N8_LONG_TERM_MEMORY.md`: documentado esquema v2, migración v1 -> v2, matriz de idempotencia, ciclo `store_version_token` y contrato de invalidación por rollback.
+  - `prompts_history.txt`: registrado el prompt íntegro de N8.3 Subfase 1 (no versionado).
+
+### 3. Verificaciones Realmente Ejecutadas (N8.3 Subfase 1)
+
+- `py_compile` sobre todos los módulos de `src/memory/` y suites N8: **OK (código 0)**.
+- Verificación de arranque liviano (`MemoryEngine` / `ExperienceStore` sin cargar `faster_whisper`, `sounddevice` ni `pyttsx3`): **OK (`lightweight_ok`)**.
+- Suites aisladas N8 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence -v`): **34 pruebas en 46.154s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **625 pruebas en 161.886s — OK (0 fallos, 0 errores, 0 omitidas)** frente a línea base de 620 (+5 pruebas nuevas sin regresiones).
+- Integridad de datos reales verificada post-tests: `data/` contiene únicamente `memory_store.json` (**1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`); no existen `data/experiences.db` ni `data/backups/`.
+
+### 4. Límites y Pendientes (Siguientes Subfases N8.3)
+
+- **Pendiente Subfase 2:** `ExperienceCaptureService` y ganchos desacoplados en N5/N6 (`ChainOrchestrator` / `TransactionManager` / `FileEditorSkill` / `GoalSupervisor`) controlados por `N8_AUTO_CAPTURE_ENABLED`.
+- **Pendiente Subfase 3:** persistencia efímera / referencias N8 en `EphemeralGoalStore` (`GoalStore`).
+- **Pendiente Subfase 4:** integración consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` con `MemorySnapshotGuard` validado por `store_version_token` y pruebas E2E integrales.
