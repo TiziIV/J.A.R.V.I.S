@@ -88,6 +88,8 @@ SENSITIVE_EXTENSIONS: tuple[str, ...] = (
     ".sqlite.lock",
     ".sqlite3.lock",
     ".tmp",
+    ".db.sha256",
+    ".backup.json",
 )
 
 # Patrones para detectar valores reales de claves API o tokens dentro de un diff de Git.
@@ -146,7 +148,12 @@ def is_sensitive_path(rel_path: str) -> bool:
     if name_lower.startswith(".env.") or name_lower.endswith(".env"):
         return True
 
-    if ".corrupt." in name_lower or ".db.backup" in name_lower:
+    if (
+        ".corrupt." in name_lower
+        or ".db.backup" in name_lower
+        or ".restore_staging_" in name_lower
+        or ".pre_restore_" in name_lower
+    ):
         return True
 
     if any(name_lower.endswith(ext) for ext in SENSITIVE_EXTENSIONS):

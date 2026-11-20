@@ -25,7 +25,7 @@ El núcleo cognitivo coordina múltiples motores locales y en la nube bajo una i
 | **N5 — Gobernanza Transaccional y Ejecución Segura** (`v5.2.0`) | **Cerrada y Auditada** | `TransactionManager` WAL-First encadenado por SHA-256, `PolicyEngine`, `ChainOrchestrator`, `FileEditorSkill`, tokens de aprobación interactiva de un solo uso y aislamiento determinista de memoria (`JARVIS_ENV=test`). Documentado en [docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md](docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md). |
 | **N6 — Autonomous Goal & Planning Engine** | **Cerrada y Verificada** | Comprensión de objetivos (`GoalUnderstandingEngine`), descomposición y validación DAG (`GoalPlanningEngine`), selector de riesgos (`GoalSkillSelector`), supervisión con timeouts/reintentos/replanificación (`ExecutionSupervisor`) y persistencia aislada (`GoalStore`). Documentado en [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](docs/N6_AUTONOMOUS_GOAL_ENGINE.md). |
 | **N7 — Context Awareness Engine** | **Remediada y en verificación final** | Observación estructurada y estrictamente de **solo lectura** del entorno Windows, integrada opcionalmente con N6; remediaciones M1/M2 y B1–B4 en validación, documentadas en [docs/N7_CONTEXT_AWARENESS_ENGINE.md](docs/N7_CONTEXT_AWARENESS_ENGINE.md). |
-| **N8.1 — Persistencia Base de Memoria a Largo Plazo** | **Implementada y Verificada** | Almacén SQLite independiente (`data/experiences.db`, modo WAL + `synchronous=FULL` + `secure_delete=ON`), FTS5 con respaldo SQL `LIKE`, políticas estrictas (`INFERENCE` bloqueada, `sanitize_memory_text()`, validación `EXECUTION_VERIFIED`, rechazo de secretos y modo privado) y protocolo `ExperienceStoreLock` (C4) en `src/memory/`. Documentado en [docs/N8_LONG_TERM_MEMORY.md](docs/N8_LONG_TERM_MEMORY.md); N8.2 y N8.3 siguen reservadas. |
+| **N8 — Memoria de Largo Plazo y Aprendizaje por Experiencia (N8.1 + N8.2)** | **N8.2 Implementada y Verificada** | Almacén SQLite independiente (`data/experiences.db`, WAL + FTS5 + respaldo SQL), políticas estrictas (`INFERENCE` bloqueada), recuperación determinista con ranking y presupuestos (`MemoryRetriever`), API central (`MemoryEngine`), consola (`/memoria`, `/privado`, `/incognito`), aislamiento real de modo privado, importación manual, purga física y backups/restauración con SHA-256. Documentado en [docs/N8_LONG_TERM_MEMORY.md](docs/N8_LONG_TERM_MEMORY.md); N8.3 (captura automática post-ejecución e integración N6) sigue reservada. |
 
 ---
 
@@ -109,6 +109,8 @@ En el modo consola interactiva (`.\venv\Scripts\python.exe main.py`):
 | `/optimizar <juego>` | **N5** | Planifica y simula ajustes de configuración sobre archivos autorizados bajo `ChainOrchestrator`. |
 | `/rollback <id>` | **N5** | Revierte transaccionalmente un cambio aplicado verificando hashes SHA-256 y backups. |
 | `/limpiar` (o `/clear`) | Memoria | Limpia el historial conversacional de corto plazo en memoria. |
+| `/memoria ayuda` (y subcomandos) | **N8.2** | Administra memoria a largo plazo (`buscar`, `listar`, `ver`, `corregir`, `confirmar`, `olvidar`, `purgar`, `importar-preferencias`, `backup`, `restaurar`). |
+| `/privado` / `/incognito` | **N8.2** | Activa o desactiva aislamiento privado en RAM (Opción A o `--sin-historial`), bloqueando escrituras JSON/SQLite. |
 | `salir` (o `exit` / `quit`) | Sistema | Cierra de forma ordenada la sesión de consola. |
 
 ---

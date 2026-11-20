@@ -1,12 +1,15 @@
 """
-Paquete `src.memory`: base de persistencia, modelos y políticas de N8.1 (Memoria a Largo Plazo).
+Paquete `src.memory`: persistencia, políticas, recuperación, consola y ciclo de vida N8.1 + N8.2.
 
-En N8.1 este paquete entrega únicamente el núcleo de persistencia segura en `data/experiences.db`,
-políticas de ingesta/sanitización, migraciones SQLite y protocolo `ExperienceStoreLock`.
-Los componentes de recuperación (`MemoryRetriever`), motor completo (`MemoryEngine`), consola
-(`/memoria`, `/privado`) e integración consultiva con N6/Multi-Brain quedan reservados para N8.2/N8.3.
+En N8.1 se estableció `data/experiences.db`, políticas de ingesta, migraciones y `ExperienceStoreLock`.
+En N8.2 se completan la recuperación determinista (`MemoryRetriever`), la API central (`MemoryEngine`),
+la consola administrativa (`/memoria`, `/privado`, `/incognito`), la importación manual de preferencias,
+la purga física controlada y los backups/restauraciones verificados por SHA-256.
+La captura automática post-ejecución e integración profunda con N6 (N8.3) permanecen reservadas.
 """
 
+from src.memory.console import MemoryConsoleHandler
+from src.memory.engine import MemoryEngine
 from src.memory.migrations import (
     CURRENT_SCHEMA_VERSION,
     MigrationResult,
@@ -17,10 +20,12 @@ from src.memory.migrations import (
 from src.memory.models import (
     ALLOWED_MEMORY_TRANSITIONS,
     VALID_VERIFICATION_SOURCE_LAYERS,
+    BackupInfo,
     ExecutionVerificationEvidence,
     IntegrityReport,
     MemoryAuditAction,
     MemoryAuditEntry,
+    MemoryBackupError,
     MemoryCategory,
     MemoryCorruptionError,
     MemoryCreateInput,
@@ -33,7 +38,12 @@ from src.memory.models import (
     MemoryProvenance,
     MemoryQueryFilter,
     MemoryRecord,
+    MemoryRestoreError,
+    MemoryRetrievalItem,
+    MemoryRetrievalResult,
+    MemoryRetrievalTarget,
     MemoryRevision,
+    MemoryScopeContext,
     MemoryScopeType,
     MemorySearchCandidate,
     MemorySource,
@@ -42,6 +52,11 @@ from src.memory.models import (
     MemoryTransitionError,
     MemoryValidationError,
     MemoryWriteResult,
+    PreferenceImportItem,
+    PreferenceImportPreview,
+    PreferenceImportResult,
+    PurgeResult,
+    RestoreResult,
     StoreStats,
     canonical_json,
     generate_memory_id,
@@ -61,12 +76,16 @@ from src.memory.policy import (
     reject_malformed_or_untrusted_payload,
     resolve_test_sandbox_root,
     sanitize_memory_text,
+    validate_safe_backup_dir,
     validate_safe_local_db_path,
+    validate_safe_read_json_path,
 )
+from src.memory.retriever import MemoryRetriever
 from src.memory.store import ExperienceStore, ExperienceStoreLock
 
 __all__ = [
     "ALLOWED_MEMORY_TRANSITIONS",
+    "BackupInfo",
     "CURRENT_SCHEMA_VERSION",
     "ExecutionVerificationEvidence",
     "ExperienceStore",
@@ -74,10 +93,13 @@ __all__ = [
     "IntegrityReport",
     "MemoryAuditAction",
     "MemoryAuditEntry",
+    "MemoryBackupError",
     "MemoryCategory",
+    "MemoryConsoleHandler",
     "MemoryCorruptionError",
     "MemoryCreateInput",
     "MemoryDuplicateError",
+    "MemoryEngine",
     "MemoryLockTimeoutError",
     "MemoryNotFoundError",
     "MemoryPersistenceError",
@@ -87,7 +109,13 @@ __all__ = [
     "MemoryProvenance",
     "MemoryQueryFilter",
     "MemoryRecord",
+    "MemoryRestoreError",
+    "MemoryRetrievalItem",
+    "MemoryRetrievalResult",
+    "MemoryRetrievalTarget",
+    "MemoryRetriever",
     "MemoryRevision",
+    "MemoryScopeContext",
     "MemoryScopeType",
     "MemorySearchCandidate",
     "MemorySource",
@@ -97,7 +125,12 @@ __all__ = [
     "MemoryValidationError",
     "MemoryWriteResult",
     "MigrationResult",
+    "PreferenceImportItem",
+    "PreferenceImportPreview",
+    "PreferenceImportResult",
     "PreparedMemoryCreate",
+    "PurgeResult",
+    "RestoreResult",
     "SOURCE_ALLOWED_CATEGORIES",
     "StoreStats",
     "VALID_VERIFICATION_SOURCE_LAYERS",
@@ -117,5 +150,7 @@ __all__ = [
     "resolve_test_sandbox_root",
     "sanitize_memory_text",
     "utc_now_iso",
+    "validate_safe_backup_dir",
     "validate_safe_local_db_path",
+    "validate_safe_read_json_path",
 ]

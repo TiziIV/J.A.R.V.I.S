@@ -137,6 +137,14 @@ class MemoryTransitionError(MemoryPolicyError):
     """Transición de ciclo de vida no permitida por la máquina de estados N8."""
 
 
+class MemoryBackupError(MemoryPersistenceError):
+    """Fallo al crear, verificar o retener snapshots de respaldo N8."""
+
+
+class MemoryRestoreError(MemoryPersistenceError):
+    """Fallo de integridad, hash o reemplazo atómico durante una restauración."""
+
+
 # ------------------------------------------------------------------------------
 # Utilidades deterministas de tiempo, IDs y serialización
 # ------------------------------------------------------------------------------
@@ -421,6 +429,7 @@ class MemoryCreateInput:
     expires_at: str | None = None
     provenance: MemoryProvenance | None = None
     verification_evidence: ExecutionVerificationEvidence | None = None
+    pending_confirmation: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, MemoryCategory):
@@ -489,6 +498,11 @@ class MemoryRecord:
     superseded_by: str | None = None
     last_verified_at: str | None = None
     access_count: int = 0
+
+    @property
+    def is_pending_confirmation(self) -> bool:
+        """Indica si el recuerdo aguarda confirmación explícita antes de participar en recuperación normal."""
+        return dict(self.metadata).get("confirmation_state") == "pending"
 
     def to_dict(self) -> dict[str, Any]:
         """Serializa el recuerdo completo de manera determinista."""
@@ -685,3 +699,130 @@ class StoreStats:
             "total_revisions": self.total_revisions,
             "total_audit_entries": self.total_audit_entries,
         }
+
+
+# ------------------------------------------------------------------------------
+# Contratos N8.2: recuperación determinista, purga física, backups e importación
+# ------------------------------------------------------------------------------
+
+
+class MemoryRetrievalTarget(str, Enum):
+    """Canal destino que determina el presupuesto máximo de resultados y texto."""
+
+    NORMAL = "NORMAL"
+    VOICE = "VOICE"
+    LOCAL_3B = "LOCAL_3B"
+
+
+@dataclass(frozen=True)
+class MemoryScopeContext:
+    """Contexto de ámbito consultado durante una recuperación determinista."""
+
+    project_key: str | None = None
+    app_or_game_key: str | None = None
+    include_global: bool = True
+
+
+@dataclass(frozen=True)
+class MemoryRetrievalItem:
+    """Recuerdo recuperado junto con su puntuación determinista y extracto acotado."""
+
+    record: MemoryRecord
+    score: float
+    score_breakdown: dict[str, float]
+    match_backend: str
+    rendered_excerpt: str
+
+
+@dataclass(frozen=True)
+class MemoryRetrievalResult:
+    """Resultado acotado de recuperación N8.2 con sobre no confiable explícito."""
+
+    query: str
+    target: MemoryRetrievalTarget
+    items: tuple[MemoryRetrievalItem, ...]
+    total_candidates: int
+    returned_count: int
+    total_chars: int
+    budget_max_items: int
+    budget_max_chars: int
+    truncated_by_budget: bool
+    blocked_by_history_policy: bool = False
+    untrusted_advisory_json: str = ""
+    backend_used: str = "none"
+
+
+@dataclass(frozen=True)
+class PurgeResult:
+    """Resultado explícito de una purga física controlada con aviso de límites reales de almacenamiento."""
+
+    memory_id: str
+    purged: bool
+    revisions_deleted: int
+    audit_rows_deleted: int
+    wal_checkpointed: bool
+    vacuum_executed: bool
+    limitations_notice: str
+
+
+@dataclass(frozen=True)
+class BackupInfo:
+    """Metadatos verificados de un snapshot SQLite consistente."""
+
+    backup_id: str
+    backup_path: str
+    metadata_path: str
+    sha256: str
+    size_bytes: int
+    created_at: str
+    schema_version: int
+    memory_count: int
+    integrity_ok: bool
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    """Resultado verificable de una restauración atómica desde backup SHA-256."""
+
+    restored: bool
+    backup_id: str
+    backup_sha256: str
+    preserved_previous_paths: tuple[str, ...]
+    integrity_report: IntegrityReport
+    details: str
+
+
+@dataclass(frozen=True)
+class PreferenceImportItem:
+    """Elemento clasificado en la vista previa de importación manual de preferencias."""
+
+    key: str
+    value_summary: str
+    classification: str  # NEW | DUPLICATE | CONFLICT | REJECTED
+    reason: str
+    existing_memory_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PreferenceImportPreview:
+    """Previsualización previa a confirmación explícita de `/memoria importar-preferencias`."""
+
+    source_path: str
+    valid: bool
+    new_items: tuple[PreferenceImportItem, ...]
+    duplicates: tuple[PreferenceImportItem, ...]
+    conflicts: tuple[PreferenceImportItem, ...]
+    rejected: tuple[PreferenceImportItem, ...]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PreferenceImportResult:
+    """Resumen auditable tras confirmar una importación manual de preferencias."""
+
+    imported_count: int
+    skipped_duplicates: int
+    conflicts_resolved: int
+    conflicts_skipped: int
+    rejected_count: int
+    created_memory_ids: tuple[str, ...]

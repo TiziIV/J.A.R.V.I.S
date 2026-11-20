@@ -441,15 +441,25 @@ class IntentRouter:
             if is_provider_error(raw_response):
                 raise RuntimeError("LLM primario no disponible o devolvió respuesta no válida.")
         except Exception as primary_error:
+            is_priv = getattr(self.memory, "is_private_mode", False) is True
             if self.fallback_llm is not None:
-                print(f"[IntentRouter] Primario falló ({primary_error}). Derivando a fallback...")
+                if is_priv:
+                    print("[IntentRouter] Primario falló (detalle omitido por modo privado). Derivando a fallback...")
+                else:
+                    print(f"[IntentRouter] Primario falló ({primary_error}). Derivando a fallback...")
                 try:
                     raw_response = self.fallback_llm.generate_response(sanitized_user_text, system_prompt=system_prompt)
                 except Exception as fallback_error:
-                    print(f"[IntentRouter] Fallback también falló ({fallback_error}). Retornando chat por defecto.")
+                    if is_priv:
+                        print("[IntentRouter] Fallback también falló (detalle omitido por modo privado). Retornando chat por defecto.")
+                    else:
+                        print(f"[IntentRouter] Fallback también falló ({fallback_error}). Retornando chat por defecto.")
                     return fallback
             else:
-                print(f"[IntentRouter] Primario falló ({primary_error}) y no hay fallback configurado.")
+                if is_priv:
+                    print("[IntentRouter] Primario falló (detalle omitido por modo privado) y no hay fallback configurado.")
+                else:
+                    print(f"[IntentRouter] Primario falló ({primary_error}) y no hay fallback configurado.")
                 return fallback
 
         try:
@@ -461,7 +471,10 @@ class IntentRouter:
             plain = self._plain_text_decision(raw_response)
             if plain is not None:
                 return plain
-            print(f"[IntentRouter] Info/Fallback: {e} | Crudo: '{raw_response}'")
+            if getattr(self.memory, "is_private_mode", False) is True:
+                print("[IntentRouter] Info/Fallback (contenido omitido por modo privado).")
+            else:
+                print(f"[IntentRouter] Info/Fallback: {e} | Crudo: '{raw_response}'")
             return fallback
 
     def _plain_text_decision(self, raw_response: object) -> dict | None:

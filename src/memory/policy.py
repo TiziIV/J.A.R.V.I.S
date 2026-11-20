@@ -149,29 +149,23 @@ def _is_path_symlink_or_reparse(path: Path) -> bool:
     return False
 
 
-def validate_safe_local_db_path(
-    db_path: Path | str,
+def _validate_local_safe_path(
+    raw_path: Path | str,
     *,
+    allowed_suffixes: frozenset[str] | None = None,
     allow_production_in_tests: bool = False,
+    label: str = "almacenamiento N8",
 ) -> Path:
     """
-    Valida que la ruta SQLite sea estrictamente local, segura y respete el aislamiento de pruebas.
-
-    Rechaza:
-    - Rutas vacías o con byte NUL.
-    - Rutas UNC / SMB (`\\\\servidor\\recurso`, `//servidor/recurso`, `\\\\?\\UNC\\...`).
-    - Variables de entorno sin expandir (`%APPDATA%`) y saltos `..`.
-    - Nombres reservados de dispositivos Windows (`CON`, `NUL`, `COM1`, etc.).
-    - Symlinks y reparse points NTFS.
-    - Prefijos críticos del sistema (`C:\\Windows`, `C:\\Program Files`, etc.).
-    - En `JARVIS_ENV=test`, cualquier acceso a `data/` real fuera de `temp/`.
+    Valida que una ruta de archivo o directorio sea estrictamente local, libre de UNC/SMB,
+    traversal, nombres reservados de Windows, reparse points NTFS y respete el sandbox de pruebas.
     """
-    if not isinstance(db_path, (str, Path)):
-        raise MemoryValidationError("La ruta de la base de datos debe ser str o Path.")
+    if not isinstance(raw_path, (str, Path)):
+        raise MemoryValidationError(f"La ruta de {label} debe ser str o Path.")
 
-    raw_text = str(db_path).strip()
+    raw_text = str(raw_path).strip()
     if not raw_text:
-        raise MemoryValidationError("La ruta de la base de datos no puede estar vacía.")
+        raise MemoryValidationError(f"La ruta de {label} no puede estar vacía.")
     if "\x00" in raw_text:
         raise MemoryPolicyError("Ruta rechazada por contener byte NUL.")
 
@@ -182,14 +176,14 @@ def validate_safe_local_db_path(
         or lowered_raw.startswith("\\\\?\\unc\\")
         or lowered_raw.startswith("\\\\.\\")
     ):
-        raise MemoryPolicyError("Se prohíben rutas UNC/SMB o de dispositivo para `experiences.db`.")
+        raise MemoryPolicyError(f"Se prohíben rutas UNC/SMB o de dispositivo para {label}.")
 
     if _UNEXPANDED_ENV_RE.search(raw_text):
-        raise MemoryPolicyError("Se prohíben variables de entorno sin expandir en la ruta SQLite.")
+        raise MemoryPolicyError(f"Se prohíben variables de entorno sin expandir en {label}.")
 
     win_parts = PureWindowsPath(raw_text).parts
     if ".." in win_parts:
-        raise MemoryPolicyError("Se prohíbe traversal '..' en rutas de almacenamiento N8.")
+        raise MemoryPolicyError(f"Se prohíbe traversal '..' en rutas de {label}.")
 
     for part in win_parts:
         stem = Path(part).stem.upper()
@@ -199,17 +193,18 @@ def validate_safe_local_db_path(
 
     abs_candidate = Path(os.path.abspath(raw_text))
     if _is_path_symlink_or_reparse(abs_candidate):
-        raise MemoryPolicyError("Se prohíben symlinks o NTFS reparse points en la ruta SQLite.")
+        raise MemoryPolicyError(f"Se prohíben symlinks o NTFS reparse points en {label}.")
 
     resolved = abs_candidate.resolve()
-    if resolved.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
-        raise MemoryValidationError("La base SQLite de N8 debe usar extensión '.db', '.sqlite' o '.sqlite3'.")
+    if allowed_suffixes is not None and resolved.suffix.lower() not in allowed_suffixes:
+        exts = ", ".join(sorted(allowed_suffixes))
+        raise MemoryValidationError(f"La ruta de {label} debe usar extensión válida ({exts}).")
 
     resolved_str = os.path.normcase(str(resolved))
     for prefix in settings.FORBIDDEN_SYSTEM_PREFIXES:
         norm_prefix = os.path.normcase(prefix.rstrip("\\/"))
         if resolved_str == norm_prefix or resolved_str.startswith(norm_prefix + os.sep):
-            raise MemoryPolicyError("No se permite ubicar la base N8 en directorios protegidos del SO.")
+            raise MemoryPolicyError(f"No se permite ubicar {label} en directorios protegidos del SO.")
 
     if is_test_environment() and not allow_production_in_tests:
         prod_data_dir = (settings.BASE_DIR / "data").resolve()
@@ -234,10 +229,52 @@ def validate_safe_local_db_path(
                 continue
         if not in_sandbox:
             raise MemoryPolicyError(
-                f"En JARVIS_ENV=test la base SQLite debe residir dentro de {sandbox_root}."
+                f"En JARVIS_ENV=test la ruta de {label} debe residir dentro de {sandbox_root}."
             )
 
     return resolved
+
+
+def validate_safe_local_db_path(
+    db_path: Path | str,
+    *,
+    allow_production_in_tests: bool = False,
+) -> Path:
+    """Valida que la ruta SQLite sea estrictamente local, segura y aislada en pruebas."""
+    return _validate_local_safe_path(
+        db_path,
+        allowed_suffixes=frozenset({".db", ".sqlite", ".sqlite3"}),
+        allow_production_in_tests=allow_production_in_tests,
+        label="base SQLite N8",
+    )
+
+
+def validate_safe_backup_dir(
+    backup_dir: Path | str,
+    *,
+    allow_production_in_tests: bool = False,
+) -> Path:
+    """Valida el directorio local de snapshots de respaldo sin permitir escapes ni `data/` en tests."""
+    return _validate_local_safe_path(
+        backup_dir,
+        allowed_suffixes=None,
+        allow_production_in_tests=allow_production_in_tests,
+        label="backups N8",
+    )
+
+
+def validate_safe_read_json_path(
+    json_path: Path | str,
+    *,
+    allow_production_in_tests: bool = False,
+) -> Path:
+    """Valida una ruta JSON local de lectura para importación manual de preferencias."""
+    return _validate_local_safe_path(
+        json_path,
+        allowed_suffixes=frozenset({".json"}),
+        allow_production_in_tests=allow_production_in_tests,
+        label="importación JSON N8",
+    )
 
 
 def _is_variation_selector(codepoint: int) -> bool:
@@ -648,7 +685,12 @@ class MemoryPolicy:
                 summary = summary[: max(1, self.max_summary_chars - 3)].rstrip() + "..."
 
         tags = self.sanitize_tags(payload.tags)
-        metadata = self.sanitize_metadata(payload.metadata)
+        raw_meta = self.sanitize_metadata(payload.metadata)
+        filtered_meta = [(k, v) for k, v in raw_meta if k != "confirmation_state"]
+        if payload.pending_confirmation:
+            filtered_meta.append(("confirmation_state", "pending"))
+        filtered_meta.sort(key=lambda pair: pair[0])
+        metadata = tuple(filtered_meta)
 
         evidence: ExecutionVerificationEvidence | None = payload.verification_evidence
         if payload.source == MemorySource.EXECUTION_VERIFIED:

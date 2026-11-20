@@ -13,11 +13,13 @@ Justificación técnica junior:
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import threading
 import time
@@ -36,9 +38,11 @@ from src.memory.migrations import (
 )
 from src.memory.models import (
     ALLOWED_MEMORY_TRANSITIONS,
+    BackupInfo,
     IntegrityReport,
     MemoryAuditAction,
     MemoryAuditEntry,
+    MemoryBackupError,
     MemoryCategory,
     MemoryCorruptionError,
     MemoryCreateInput,
@@ -50,6 +54,7 @@ from src.memory.models import (
     MemoryProvenance,
     MemoryQueryFilter,
     MemoryRecord,
+    MemoryRestoreError,
     MemoryRevision,
     MemoryScopeType,
     MemorySearchCandidate,
@@ -58,6 +63,8 @@ from src.memory.models import (
     MemoryTransitionError,
     MemoryValidationError,
     MemoryWriteResult,
+    PurgeResult,
+    RestoreResult,
     StoreStats,
     canonical_json,
     generate_memory_id,
@@ -72,6 +79,7 @@ from src.memory.policy import (
     normalize_text_for_search,
     resolve_test_sandbox_root,
     sanitize_memory_text,
+    validate_safe_backup_dir,
     validate_safe_local_db_path,
 )
 
@@ -263,6 +271,20 @@ def _default_db_path() -> Path:
     if is_test_environment():
         return resolve_test_sandbox_root() / "experiences.db"
     return settings.EXPERIENCES_DB_PATH
+
+
+def _default_backup_dir() -> Path:
+    if is_test_environment():
+        return resolve_test_sandbox_root() / "backups" / "memory"
+    return settings.MEMORY_BACKUP_DIR
+
+
+def _compute_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest().lower()
 
 
 def _escape_sql_like(term: str) -> str:
@@ -762,6 +784,8 @@ class ExperienceStore:
         source: MemorySource | None = None,
         scope_type: MemoryScopeType | None = None,
         scope_key: str | None = None,
+        pending_only: bool = False,
+        exclude_pending: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> list[MemoryRecord]:
@@ -808,6 +832,11 @@ class ExperienceStore:
         elif flt.scope_key is not None:
             clauses.append("scope_key = ?")
             params.append(flt.scope_key.strip().lower())
+
+        if pending_only:
+            clauses.append("json_extract(metadata_json, '$.confirmation_state') = 'pending'")
+        elif exclude_pending:
+            clauses.append("COALESCE(json_extract(metadata_json, '$.confirmation_state'), 'confirmed') != 'pending'")
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
@@ -1251,6 +1280,8 @@ class ExperienceStore:
         scope_type: MemoryScopeType | None = None,
         scope_key: str | None = None,
         categories: tuple[MemoryCategory, ...] | None = None,
+        exclude_pending: bool = False,
+        max_tokens: int | None = None,
         limit: int = 20,
         force_sql_fallback: bool = False,
     ) -> list[MemorySearchCandidate]:
@@ -1258,15 +1289,17 @@ class ExperienceStore:
         Primitiva de almacenamiento para buscar recuerdos ACTIVOS mediante FTS5 con respaldo SQL LIKE.
 
         Justificación técnica junior:
-        N8.1 provee solo la consulta indexada segura en `ExperienceStore` (escapando sintaxis FTS5
-        con comillas dobles para evitar `fts5: syntax error`); la lógica de ranking ponderado y
-        presupuesto de caracteres para prompts pertenece a `MemoryRetriever` en N8.2.
+        Permite limitar la cantidad máxima de tokens consultados y filtrar recuerdos pendientes de
+        confirmación para que `MemoryRetriever` (N8.2) aplique su ranking ponderado y presupuestos.
         """
         self.policy.assert_enabled()
         if not isinstance(query, str):
             raise MemoryValidationError("query debe ser una cadena de texto.")
+        if "\x00" in query:
+            raise MemoryValidationError("query contiene byte NUL no permitido.")
 
         normalized_q = normalize_text_for_search(query)
+        token_cap = max(1, int(settings.N8_SEARCH_MAX_TOKENS if max_tokens is None else max_tokens))
         tokens: list[str] = []
         seen_tok: set[str] = set()
         for raw_tok in normalized_q.split():
@@ -1274,7 +1307,7 @@ class ExperienceStore:
             if len(tok) >= 2 and tok not in seen_tok:
                 seen_tok.add(tok)
                 tokens.append(tok)
-            if len(tokens) >= 12:
+            if len(tokens) >= token_cap:
                 break
 
         if not tokens:
@@ -1282,6 +1315,10 @@ class ExperienceStore:
 
         eff_limit = max(1, min(200, int(limit)))
         filter_clauses: list[str] = ["m.status = 'ACTIVE'"]
+        if exclude_pending:
+            filter_clauses.append(
+                "COALESCE(json_extract(m.metadata_json, '$.confirmation_state'), 'confirmed') != 'pending'"
+            )
         filter_params: list[Any] = []
 
         if scope_type is not None:
@@ -1561,3 +1598,647 @@ class ExperienceStore:
                     total_revisions=rev_count,
                     total_audit_entries=aud_count,
                 )
+
+    # ------------------------------------------------------------------
+    # Primitivas administrativas N8.2: confirmación, purga física, backup y restauración
+    # ------------------------------------------------------------------
+
+    def confirm_memory(
+        self,
+        memory_id: str,
+        *,
+        actor: str = "user",
+        reason: str = "manual_confirmation",
+        private_mode: bool = False,
+    ) -> MemoryRecord:
+        """
+        Confirma un recuerdo ACTIVE (pendiente o sin verificación explícita), registrando
+        revisión histórica y habilitándolo para recuperación normal.
+        """
+        self.policy.assert_write_allowed(private_mode=private_mode)
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise MemoryValidationError("memory_id no puede estar vacío.")
+        clean_id = memory_id.strip()
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+        clean_reason = sanitize_memory_text(
+            reason,
+            max_chars=240,
+            allow_newlines=False,
+            field_name="reason",
+            check_secrets=True,
+        )
+
+        with self.acquire_lock():
+            with self._open_connection() as conn:
+                fts_active = self._ensure_ready(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM memories WHERE memory_id = ?",
+                        (clean_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise MemoryNotFoundError(f"No existe el recuerdo '{clean_id}'.")
+
+                    current = _row_to_memory_record(row)
+                    if current.status != MemoryStatus.ACTIVE:
+                        raise MemoryTransitionError(
+                            f"Solo se pueden confirmar recuerdos ACTIVE (estado actual: {current.status.value})."
+                        )
+
+                    if current.revision_number >= self.policy.max_revisions_per_memory:
+                        raise MemoryPolicyError(
+                            f"Límite máximo de revisiones ({self.policy.max_revisions_per_memory}) alcanzado para '{clean_id}'."
+                        )
+
+                    now = utc_now_iso()
+                    meta_dict = {k: v for k, v in current.metadata}
+                    was_pending = meta_dict.get("confirmation_state") == "pending"
+                    meta_dict["confirmation_state"] = "confirmed"
+                    meta_dict["confirmed_by"] = clean_actor
+                    meta_dict["confirmed_at"] = now
+                    new_conf = max(current.confidence, 0.90) if was_pending else max(current.confidence, 0.85)
+                    new_rev_num = current.revision_number + 1
+                    revision_id = generate_memory_id("rev")
+
+                    conn.execute(
+                        """
+                        INSERT INTO memory_revisions (
+                            revision_id, memory_id, revision_number,
+                            previous_title, previous_content, previous_summary, previous_fingerprint,
+                            new_title, new_content, new_summary, new_fingerprint,
+                            change_reason, changed_by, changed_at, source
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            revision_id,
+                            clean_id,
+                            new_rev_num,
+                            current.title,
+                            current.content,
+                            current.summary,
+                            current.content_fingerprint,
+                            current.title,
+                            current.content,
+                            current.summary,
+                            current.content_fingerprint,
+                            clean_reason,
+                            clean_actor,
+                            now,
+                            current.source.value,
+                        ),
+                    )
+
+                    conn.execute(
+                        """
+                        UPDATE memories
+                        SET confidence = ?,
+                            revision_number = ?,
+                            metadata_json = ?,
+                            last_verified_at = ?,
+                            updated_at = ?
+                        WHERE memory_id = ?
+                        """,
+                        (
+                            new_conf,
+                            new_rev_num,
+                            canonical_json(meta_dict),
+                            now,
+                            now,
+                            clean_id,
+                        ),
+                    )
+
+                    updated_row = conn.execute(
+                        "SELECT * FROM memories WHERE memory_id = ?",
+                        (clean_id,),
+                    ).fetchone()
+                    if updated_row is None:
+                        raise MemoryPersistenceError("Fallo al leer recuerdo tras confirmación.")
+                    updated = _row_to_memory_record(updated_row)
+
+                    if fts_active:
+                        self._sync_fts_active_row_tx(conn, updated)
+
+                    self._insert_audit_tx(
+                        conn,
+                        action=MemoryAuditAction.REVISE,
+                        memory_id=clean_id,
+                        actor=clean_actor,
+                        reason="memory_confirmed",
+                        details={
+                            "revision_id": revision_id,
+                            "revision_number": new_rev_num,
+                            "was_pending": was_pending,
+                        },
+                        created_at=now,
+                    )
+                    conn.execute("COMMIT")
+                    return updated
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+    def purge_memory(
+        self,
+        memory_id: str,
+        *,
+        actor: str = "user",
+        reason: str = "manual_purge",
+        vacuum: bool = False,
+        private_mode: bool = False,
+    ) -> PurgeResult:
+        """
+        Eliminación física controlada de un recuerdo y todos sus rastros internos en SQLite
+        (`memory_fts`, `memory_revisions`, `memory_audit`, referencias y `memories`) bajo `ExperienceStoreLock`.
+        """
+        self.policy.assert_write_allowed(private_mode=private_mode)
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise MemoryValidationError("memory_id no puede estar vacío.")
+        clean_id = memory_id.strip()
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+        clean_reason = sanitize_memory_text(
+            reason,
+            max_chars=240,
+            allow_newlines=False,
+            field_name="reason",
+            check_secrets=True,
+        )
+        limitations = (
+            "Purga SQLite aplicada con PRAGMA secure_delete=ON y wal_checkpoint(TRUNCATE); "
+            "no es posible garantizar destrucción física irrecuperable en bloques SSD (wear-leveling), "
+            "metadatos NTFS, instantáneas VSS ni respaldos externos creados previamente."
+        )
+
+        with self.acquire_lock():
+            with self._open_connection(enable_wal=True) as conn:
+                fts_active = self._ensure_ready(conn)
+                now = utc_now_iso()
+                revs_deleted = 0
+                aud_deleted = 0
+
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    exists = conn.execute(
+                        "SELECT 1 FROM memories WHERE memory_id = ?",
+                        (clean_id,),
+                    ).fetchone()
+                    if exists is None:
+                        raise MemoryNotFoundError(f"No existe el recuerdo '{clean_id}'.")
+
+                    if fts_active:
+                        conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (clean_id,))
+
+                    conn.execute(
+                        "UPDATE memories SET superseded_by = NULL WHERE superseded_by = ?",
+                        (clean_id,),
+                    )
+
+                    rev_cur = conn.execute(
+                        "DELETE FROM memory_revisions WHERE memory_id = ?",
+                        (clean_id,),
+                    )
+                    revs_deleted = int(rev_cur.rowcount if rev_cur.rowcount is not None and rev_cur.rowcount >= 0 else 0)
+
+                    escaped_like = f"%{_escape_sql_like(clean_id)}%"
+                    aud_cur = conn.execute(
+                        """
+                        DELETE FROM memory_audit
+                        WHERE memory_id = ? OR details_json LIKE ? ESCAPE '\\'
+                        """,
+                        (clean_id, escaped_like),
+                    )
+                    aud_deleted = int(aud_cur.rowcount if aud_cur.rowcount is not None and aud_cur.rowcount >= 0 else 0)
+
+                    conn.execute("DELETE FROM memories WHERE memory_id = ?", (clean_id,))
+
+                    id_digest = hashlib.sha256(clean_id.encode("utf-8")).hexdigest()
+                    self._insert_audit_tx(
+                        conn,
+                        action=MemoryAuditAction.REVOKE,
+                        memory_id=None,
+                        actor=clean_actor,
+                        reason="physical_purge_completed",
+                        details={
+                            "purged_id_sha256": id_digest,
+                            "purge_reason_hash": hashlib.sha256(clean_reason.encode("utf-8")).hexdigest()[:16],
+                            "revisions_deleted": revs_deleted,
+                            "audit_rows_deleted": aud_deleted,
+                        },
+                        created_at=now,
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+                # Checkpoint WAL fuera de transacción para volcar cambios al archivo principal.
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                vacuum_done = False
+                if vacuum:
+                    conn.execute("VACUUM")
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    vacuum_done = True
+
+                return PurgeResult(
+                    memory_id=clean_id,
+                    purged=True,
+                    revisions_deleted=revs_deleted,
+                    audit_rows_deleted=aud_deleted,
+                    wal_checkpointed=True,
+                    vacuum_executed=vacuum_done,
+                    limitations_notice=limitations,
+                )
+
+    @staticmethod
+    def _validate_sqlite_snapshot_file(candidate_db: Path) -> tuple[int, int]:
+        """
+        Verifica integridad estructural SQLite de un archivo candidato a backup/restauración.
+        Devuelve `(schema_version, memory_count)` o lanza `MemoryRestoreError`.
+        """
+        if not candidate_db.exists() or not candidate_db.is_file():
+            raise MemoryRestoreError(f"Archivo de backup inexistente: '{candidate_db}'.")
+        try:
+            with closing(sqlite3.connect(str(candidate_db), timeout=2.0)) as check_conn:
+                check_conn.row_factory = sqlite3.Row
+                qc_rows = check_conn.execute("PRAGMA quick_check").fetchall()
+                qc_res = ", ".join(str(r[0]) for r in qc_rows) if qc_rows else "empty"
+                if qc_res.strip().lower() != "ok":
+                    raise MemoryRestoreError(f"Backup falló quick_check: {qc_res}")
+
+                ic_rows = check_conn.execute("PRAGMA integrity_check").fetchall()
+                ic_res = ", ".join(str(r[0]) for r in ic_rows) if ic_rows else "empty"
+                if ic_res.strip().lower() != "ok":
+                    raise MemoryRestoreError(f"Backup falló integrity_check: {ic_res}")
+
+                fk_rows = check_conn.execute("PRAGMA foreign_key_check").fetchall()
+                if fk_rows:
+                    raise MemoryRestoreError(f"Backup contiene violaciones de llaves foráneas ({len(fk_rows)}).")
+
+                uv = int(check_conn.execute("PRAGMA user_version").fetchone()[0])
+                if uv < 1 or uv > CURRENT_SCHEMA_VERSION:
+                    raise MemoryRestoreError(f"Versión de esquema incompatible en backup: {uv}")
+
+                missing = [t for t in CORE_TABLES if not table_exists(check_conn, t)]
+                if missing:
+                    raise MemoryRestoreError(f"Backup incompleto; faltan tablas: {missing}")
+
+                mem_count = int(check_conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+                return uv, mem_count
+        except MemoryRestoreError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise MemoryRestoreError(f"Archivo de backup SQLite inválido o corrupto: {exc}") from exc
+
+    def create_backup(
+        self,
+        backup_dir: Path | str | None = None,
+        *,
+        retention: int | None = None,
+        actor: str = "system",
+    ) -> BackupInfo:
+        """
+        Genera un backup consistente mediante `sqlite3.Connection.backup()`, lo valida
+        íntegramente antes de publicarlo vía `os.replace()` y aplica retención máxima.
+        """
+        self.policy.assert_enabled()
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+        target_dir = validate_safe_backup_dir(_default_backup_dir() if backup_dir is None else backup_dir)
+        max_keep = max(1, int(settings.N8_BACKUP_MAX_RETENTION if retention is None else retention))
+
+        with self.acquire_lock():
+            with self._open_connection(enable_wal=True) as src_conn:
+                self._ensure_ready(src_conn)
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+                now_iso = utc_now_iso()
+                stamp = now_iso.replace(":", "").replace("-", "").replace(".", "_")[:19]
+                backup_id = f"bkp_{stamp}_{uuid4().hex[:8]}"
+                tmp_db = target_dir / f".{backup_id}.db.tmp"
+                final_db = target_dir / f"{backup_id}.db"
+                tmp_meta = target_dir / f".{backup_id}.backup.json.tmp"
+                final_meta = target_dir / f"{backup_id}.backup.json"
+
+                try:
+                    with closing(sqlite3.connect(str(tmp_db), timeout=5.0)) as dst_conn:
+                        src_conn.backup(dst_conn)
+                        dst_conn.commit()
+
+                    schema_ver, mem_count = self._validate_sqlite_snapshot_file(tmp_db)
+                    sha256 = _compute_file_sha256(tmp_db)
+                    size_bytes = int(tmp_db.stat().st_size)
+
+                    os.replace(str(tmp_db), str(final_db))
+
+                    meta_payload = {
+                        "backup_id": backup_id,
+                        "backup_file": final_db.name,
+                        "sha256": sha256,
+                        "size_bytes": size_bytes,
+                        "created_at": now_iso,
+                        "schema_version": schema_ver,
+                        "memory_count": mem_count,
+                        "integrity_ok": True,
+                    }
+                    with open(tmp_meta, "x", encoding="utf-8") as fh:
+                        fh.write(canonical_json(meta_payload))
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(str(tmp_meta), str(final_meta))
+
+                    # Solo después de validar y publicar el nuevo snapshot recortamos históricos.
+                    existing = self._read_backup_entries_dir(target_dir)
+                    for obsolete in existing[max_keep:]:
+                        for victim in (Path(obsolete.backup_path), Path(obsolete.metadata_path)):
+                            if victim.exists():
+                                victim.unlink(missing_ok=True)
+
+                    src_conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._insert_audit_tx(
+                            src_conn,
+                            action=MemoryAuditAction.INTEGRITY_CHECK,
+                            memory_id=None,
+                            actor=clean_actor,
+                            reason="backup_created",
+                            details={"backup_id": backup_id, "sha256": sha256, "size_bytes": size_bytes},
+                            created_at=now_iso,
+                        )
+                        src_conn.execute("COMMIT")
+                    except Exception:
+                        if src_conn.in_transaction:
+                            src_conn.execute("ROLLBACK")
+                        raise
+
+                    return BackupInfo(
+                        backup_id=backup_id,
+                        backup_path=str(final_db),
+                        metadata_path=str(final_meta),
+                        sha256=sha256,
+                        size_bytes=size_bytes,
+                        created_at=now_iso,
+                        schema_version=schema_ver,
+                        memory_count=mem_count,
+                        integrity_ok=True,
+                    )
+                except MemoryBackupError:
+                    raise
+                except (MemoryRestoreError, OSError, sqlite3.Error) as exc:
+                    raise MemoryBackupError(f"No se pudo crear un backup válido de N8: {exc}") from exc
+                finally:
+                    for leftover in (tmp_db, tmp_meta):
+                        if leftover.exists():
+                            leftover.unlink(missing_ok=True)
+
+    @staticmethod
+    def _read_backup_entries_dir(target_dir: Path) -> list[BackupInfo]:
+        if not target_dir.exists() or not target_dir.is_dir():
+            return []
+        items: list[BackupInfo] = []
+        for meta_file in sorted(target_dir.glob("*.backup.json")):
+            try:
+                raw = json.loads(meta_file.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    continue
+                bkp_id = str(raw.get("backup_id") or "").strip()
+                bkp_name = str(raw.get("backup_file") or "").strip()
+                sha = str(raw.get("sha256") or "").strip().lower()
+                if not bkp_id or not bkp_name or len(sha) != 64:
+                    continue
+                db_candidate = (target_dir / bkp_name).resolve()
+                if db_candidate.parent != target_dir.resolve() or not db_candidate.exists():
+                    continue
+                items.append(
+                    BackupInfo(
+                        backup_id=bkp_id,
+                        backup_path=str(db_candidate),
+                        metadata_path=str(meta_file.resolve()),
+                        sha256=sha,
+                        size_bytes=int(raw.get("size_bytes", 0)),
+                        created_at=str(raw.get("created_at") or ""),
+                        schema_version=int(raw.get("schema_version", 1)),
+                        memory_count=int(raw.get("memory_count", 0)),
+                        integrity_ok=bool(raw.get("integrity_ok", False)),
+                    )
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        items.sort(key=lambda b: (b.created_at, b.backup_id), reverse=True)
+        return items
+
+    def list_backups(self, backup_dir: Path | str | None = None) -> list[BackupInfo]:
+        """Lista los backups disponibles en `backup_dir` ordenados del más reciente al más antiguo."""
+        self.policy.assert_enabled()
+        target_dir = validate_safe_backup_dir(_default_backup_dir() if backup_dir is None else backup_dir)
+        with self.acquire_lock():
+            return self._read_backup_entries_dir(target_dir)
+
+    def restore_from_backup(
+        self,
+        backup_ref: Path | str,
+        *,
+        backup_dir: Path | str | None = None,
+        expected_sha256: str | None = None,
+        actor: str = "user",
+        private_mode: bool = False,
+    ) -> RestoreResult:
+        """
+        Restaura `experiences.db` de forma atómica y recuperable bajo `ExperienceStoreLock`:
+        1. Valida SHA-256 esperado y verificación SQLite completa antes de tocar la DB activa.
+        2. Adquiere lock exclusivo inter-proceso.
+        3. Preserva una copia verificada de la DB actual (y WAL/SHM) aunque esté corrupta.
+        4. Prepara staging verificado en la misma carpeta, limpia WAL/SHM obsoletos y sustituye vía `os.replace()`.
+        5. Verifica integridad post-restauración y revierte a la copia preservada ante fallo.
+        """
+        self.policy.assert_write_allowed(private_mode=private_mode)
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+        target_dir = validate_safe_backup_dir(_default_backup_dir() if backup_dir is None else backup_dir)
+        ref_str = str(backup_ref).strip()
+        if not ref_str:
+            raise MemoryRestoreError("Debe especificar un backup_id o ruta válida para restaurar.")
+
+        candidate_by_id = target_dir / f"{ref_str}.db"
+        if candidate_by_id.exists() and not any(sep in ref_str for sep in ("/", "\\")):
+            backup_db = validate_safe_local_db_path(candidate_by_id)
+        else:
+            backup_db = validate_safe_local_db_path(backup_ref)
+
+        meta_file = backup_db.with_name(f"{backup_db.stem}.backup.json")
+        resolved_expected_hash = (expected_sha256 or "").strip().lower()
+        backup_id = backup_db.stem
+        if meta_file.exists():
+            try:
+                meta_raw = json.loads(meta_file.read_text(encoding="utf-8"))
+                meta_hash = str(meta_raw.get("sha256") or "").strip().lower()
+                if not resolved_expected_hash:
+                    resolved_expected_hash = meta_hash
+                elif meta_hash and resolved_expected_hash != meta_hash:
+                    raise MemoryRestoreError("El SHA-256 indicado no coincide con los metadatos del backup.")
+                if meta_raw.get("backup_id"):
+                    backup_id = str(meta_raw["backup_id"])
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise MemoryRestoreError(f"Metadatos de backup inválidos o ilegibles: {exc}") from exc
+
+        if len(resolved_expected_hash) != 64:
+            raise MemoryRestoreError(
+                "No se puede restaurar sin huella SHA-256 verificable (metadato `.backup.json` ausente o inválido)."
+            )
+
+        live_hash_before = _compute_file_sha256(backup_db)
+        if live_hash_before != resolved_expected_hash:
+            raise MemoryRestoreError(
+                "Validación SHA-256 fallida: el archivo de backup fue modificado o está dañado."
+            )
+
+        self._validate_sqlite_snapshot_file(backup_db)
+
+        with self.acquire_lock():
+            # Revalidación anti-TOCTOU dentro del lock exclusivo.
+            if _compute_file_sha256(backup_db) != resolved_expected_hash:
+                raise MemoryRestoreError("El archivo de backup cambió mientras se adquiría el lock.")
+            self._validate_sqlite_snapshot_file(backup_db)
+
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            preserved_paths: list[str] = []
+            preserved_main_db: Path | None = None
+            staging_db = self.db_path.parent / f"{self.db_path.name}.restore_staging_{uuid4().hex[:10]}"
+
+            try:
+                # Si la DB actual existe y abre sin error, intentamos checkpoint WAL para consolidarla.
+                if self.db_path.exists():
+                    try:
+                        with self._open_connection() as cur_conn:
+                            cur_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except (MemoryCorruptionError, MemoryPersistenceError, sqlite3.Error):
+                        pass
+
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    preserve_dir = target_dir / f"preserved_pre_restore_{uuid4().hex[:10]}"
+                    preserve_dir.mkdir(parents=True, exist_ok=True)
+                    for suffix in ("", "-wal", "-shm", "-journal"):
+                        src_art = Path(f"{self.db_path}{suffix}")
+                        if src_art.exists():
+                            dst_art = preserve_dir / src_art.name
+                            shutil.copy2(str(src_art), str(dst_art))
+                            if suffix == "":
+                                if _compute_file_sha256(dst_art) != _compute_file_sha256(src_art):
+                                    raise MemoryRestoreError(
+                                        "No se pudo verificar la copia de preservación previa a restaurar."
+                                    )
+                                preserved_main_db = dst_art
+                            preserved_paths.append(str(dst_art))
+
+                # Preparamos el archivo de staging en la misma partición/carpeta y verificamos fsync + hash.
+                with backup_db.open("rb") as src_f, open(staging_db, "xb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f, length=65536)
+                    dst_f.flush()
+                    os.fsync(dst_f.fileno())
+                if _compute_file_sha256(staging_db) != resolved_expected_hash:
+                    raise MemoryRestoreError("Fallo de verificación SHA-256 en archivo temporal de restauración.")
+
+                # Limpiamos WAL/SHM/journal residuales antes de reemplazar el archivo principal.
+                for side_ext in ("-wal", "-shm", "-journal"):
+                    side_file = Path(f"{self.db_path}{side_ext}")
+                    if side_file.exists():
+                        side_file.unlink()
+
+                os.replace(str(staging_db), str(self.db_path))
+
+                # Verificación integral sobre la DB restaurada dentro del mismo lock exclusivo.
+                with self._open_connection(enable_wal=True) as restored_conn:
+                    ic_rows = restored_conn.execute("PRAGMA integrity_check").fetchall()
+                    ic_res = ", ".join(str(r[0]) for r in ic_rows) if ic_rows else "empty"
+                    fk_rows = restored_conn.execute("PRAGMA foreign_key_check").fetchall()
+                    uv_row = restored_conn.execute("PRAGMA user_version").fetchone()
+                    schema_ver = int(uv_row[0]) if uv_row else 0
+                    missing_tables = [t for t in CORE_TABLES if not table_exists(restored_conn, t)]
+
+                    if ic_res.strip().lower() != "ok" or fk_rows or missing_tables:
+                        raise MemoryRestoreError(
+                            f"La DB restaurada falló verificación post-swap (ic={ic_res}, fk={len(fk_rows)})."
+                        )
+
+                    now = utc_now_iso()
+                    fts_active = self._is_fts_active(restored_conn)
+                    report = IntegrityReport(
+                        ok=True,
+                        integrity_check_result=ic_res,
+                        foreign_keys_ok=True,
+                        fts_available=fts5_available(restored_conn),
+                        fts_active=fts_active,
+                        fts_sync_ok=True,
+                        schema_version=schema_ver,
+                        details="ok",
+                    )
+
+                    restored_conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._insert_audit_tx(
+                            restored_conn,
+                            action=MemoryAuditAction.INTEGRITY_CHECK,
+                            memory_id=None,
+                            actor=clean_actor,
+                            reason="backup_restored_verified",
+                            details={"backup_id": backup_id, "sha256": resolved_expected_hash},
+                            created_at=now,
+                        )
+                        restored_conn.execute("COMMIT")
+                    except Exception:
+                        if restored_conn.in_transaction:
+                            restored_conn.execute("ROLLBACK")
+                        raise
+
+                return RestoreResult(
+                    restored=True,
+                    backup_id=backup_id,
+                    backup_sha256=resolved_expected_hash,
+                    preserved_previous_paths=tuple(preserved_paths),
+                    integrity_report=report,
+                    details=(
+                        f"Base restaurada y verificada desde '{backup_id}'. "
+                        f"Copia previa preservada: {len(preserved_paths)} artefacto(s)."
+                    ),
+                )
+            except Exception as exc:
+                # Si la sustitución o verificación post-swap falló y preservamos una copia previa, revertimos.
+                if preserved_main_db is not None and preserved_main_db.exists():
+                    rollback_tmp = self.db_path.parent / f"{self.db_path.name}.restore_rollback_{uuid4().hex[:8]}"
+                    try:
+                        shutil.copy2(str(preserved_main_db), str(rollback_tmp))
+                        os.replace(str(rollback_tmp), str(self.db_path))
+                    except OSError:
+                        if rollback_tmp.exists():
+                            rollback_tmp.unlink(missing_ok=True)
+                if isinstance(exc, MemoryRestoreError):
+                    raise
+                raise MemoryRestoreError(f"Error al restaurar backup '{backup_id}': {exc}") from exc
+            finally:
+                if staging_db.exists():
+                    staging_db.unlink(missing_ok=True)

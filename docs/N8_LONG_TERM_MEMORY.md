@@ -1,164 +1,143 @@
-# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (Fase N8.1)
+# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2)
 
 > [!IMPORTANT]
-> **Alcance implementado actualmente:** Este documento describe la base de persistencia, modelos, políticas y bloqueo de concurrencia implementada en **N8.1** (`src/memory/`).  
-> Las capacidades de recuperación consultiva (`MemoryRetriever`), consola (`/memoria`, `/privado`, `/incognito`), captura automática post-ejecución, backups/purga avanzada e integración con N6/Multi-Brain están **reservadas para N8.2 y N8.3** y **todavía no forman parte del flujo conversacional activo**.
+> **Alcance implementado actualmente:** Este documento cubre las fases **N8.1** (persistencia base, modelos, políticas y locking) y **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración).
+> Las capacidades de **N8.3** (captura automática post-ejecución `EXECUTION_VERIFIED`, persistencia de referencias en `GoalStore` e integración en `GoalEngine`/`ExecutionSupervisor`), embeddings y consolidación por LLM **permanecen desactivadas y reservadas**.
 
 ---
 
-## 1. Arquitectura de N8.1 y Fronteras entre Capas
-
-La separación conceptual del asistente se mantiene estricta:
+## 1. Arquitectura N8.1 + N8.2 y Separación entre Capas
 
 ```mermaid
 flowchart LR
-    N7["N7: Context Awareness (Observa estado actual)"]
-    N8["N8: Long-Term Memory (Recuerda historial autorizado)"]
-    N6["N6: Goal & Planning Engine (Planifica)"]
-    N5["N5: Gobernanza y Ejecución Segura (Autoriza y ejecuta)"]
-
-    N8 -->|"Solo datos consultivos (sin permisos)"| N6
-    N7 -->|"Solo snapshot actual"| N6
-    N6 -->|"Solicita plan"| N5
-    N5 -->|"Evidencia EXECUTION_VERIFIED (N8.3)"| N8
+    U["Consola (/memoria, /privado, /incognito)"] --> CON["MemoryConsoleHandler (src/memory/console.py)"]
+    BM["BrainManager (canal untrusted consultivo)"] -->|"solo lectura si allow_history"| ENG["MemoryEngine (src/memory/engine.py)"]
+    CON --> ENG
+    CON -->|"aislamiento RAM"| MEM["ConversationMemory (src/brain/memory.py)"]
+    ENG --> RET["MemoryRetriever (src/memory/retriever.py)"]
+    ENG --> POL["MemoryPolicy (src/memory/policy.py)"]
+    RET --> ST["ExperienceStore + ExperienceStoreLock (src/memory/store.py)"]
+    ENG --> ST
+    ST --> DB["data/experiences.db (SQLite WAL + FTS5)"]
+    ST --> BKP["data/backups/memory/ (.db + .backup.json SHA-256)"]
 ```
 
-**Principios de diseño vigentes en N8.1:**
-- N8 **nunca** otorga permisos, modifica políticas ni aprueba acciones de `N5`.
-- Su almacenamiento (`data/experiences.db`) es completamente **independiente** de `data/memory_store.json` (`ConversationMemory` efímera) y de la persistencia de N6 (`GoalStore`).
-- En N8.1 **no** se realiza migración ni modificación de `data/memory_store.json`.
-- El paquete `src/memory/` no importa módulos de audio, TTS, STT, consola ni clientes LLM.
+**Reglas arquitectónicas innegociables:**
+- N8 es estrictamente consultivo: **nunca** autoriza operaciones, aprueba planes, modifica políticas de N5 ni escribe archivos de usuario.
+- Los recuerdos recuperados se entregan encapsulados como **`untrusted_long_term_memory`** (`allow_system_prompt_promotion=False`, `allow_tool_execution_from_content=False`, `allow_permission_grant=False`); jamás ingresan al `system_prompt` como instrucciones privilegiadas.
+- N8 no duplica `GoalStore` (N6) ni altera `data/memory_store.json` de forma automática.
+- Inicializar `MemoryEngine`, `MemoryRetriever` o `MemoryConsoleHandler` **no carga** Whisper, micrófono, `AudioRecorder`, `WakeWordDetector` ni TTS.
 
 ---
 
-## 2. Módulos Implementados (`src/memory/`)
+## 2. Módulos del Paquete (`src/memory/`)
 
-| Archivo | Responsabilidad en N8.1 |
-| :--- | :--- |
-| [src/memory/models.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/models.py) | Enumeraciones (`MemoryCategory`, `MemorySource`, `MemoryStatus`, `MemoryScopeType`, `MemoryAuditAction`), máquina de estados `ALLOWED_MEMORY_TRANSITIONS`, excepciones tipadas, modelos inmutables (`MemoryRecord`, `MemoryRevision`, `MemoryAuditEntry`, `ExecutionVerificationEvidence`, `MemoryCreateInput`) y contratos DTO (`IntegrityReport`, `StoreStats`, `MemorySearchCandidate`). |
-| [src/memory/policy.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/policy.py) | `MemoryPolicy`, `sanitize_memory_text()`, `normalize_text_for_search()`, `normalize_scope()`, `compute_content_fingerprint()`, detección de secretos sin filtración (`assert_no_secrets` con apoyo de `redact_secrets`), bloqueo de `INFERENCE`, validación de `ExecutionVerificationEvidence`, modo privado y defensa de rutas Windows (`validate_safe_local_db_path`). |
-| [src/memory/migrations.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/migrations.py) | Esquema SQLite versionado v1 (`schema_migrations`, `store_metadata`, `memories`, `memory_revisions`, `memory_audit`, `memory_fts`), detección FTS5 (`unicode61 remove_diacritics 2`), índices B-tree/parciales y configuración `WAL` + `synchronous=FULL` + `secure_delete=ON` + `foreign_keys=ON`. |
-| [src/memory/store.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/store.py) | `ExperienceStoreLock` (C4) y `ExperienceStore` con CRUD transaccional (`BEGIN IMMEDIATE`), dedupe por huella y procedencia, revisiones históricas, revocación lógica con purga FTS5, búsqueda FTS5/SQL `LIKE`, `verify_integrity` con cuarentena opcional y estadísticas. |
-| [src/memory/__init__.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/__init__.py) | Superficie pública estable de contratos N8.1 preparada para N8.2 y N8.3. |
-
----
-
-## 3. Esquema SQLite y Migraciones (`data/experiences.db`)
-
-Versión actual del esquema: **`CURRENT_SCHEMA_VERSION = 1`**.
-
-### Tablas y relaciones
-
-1. **`schema_migrations`**: versión aplicada, nombre, fecha UTC y checksum SHA-256 del DDL.
-2. **`store_metadata`**: metadatos de formato (`store_format`), disponibilidad y activación de FTS5 (`fts_available`, `fts_active`, `fts_tokenizer`).
-3. **`memories`**: entidad principal con claves `CHECK` sobre `category`, `source`, `status`, `scope_type`, `confidence`, `importance`, `revision_number` y referencia autorreferencial `superseded_by -> memories(memory_id) ON DELETE SET NULL`.
-   - **Índice único parcial `idx_memories_active_fingerprint`**: evita duplicar dos recuerdos `ACTIVE` con la misma huella canónica `(category, scope_type, scope_key, normalized_text)`.
-   - **Índice único parcial `idx_memories_active_exec_provenance`**: evita reingestar la misma tarea verificada (`source_layer`, `source_execution_id`, `source_plan_id`, `source_task_id`) cuando ya existe un recuerdo `ACTIVE`.
-4. **`memory_revisions`**: historial inmutable append-only de modificaciones (`UNIQUE(memory_id, revision_number)`, `ON DELETE RESTRICT`).
-5. **`memory_audit`**: registro auditable de acciones (`CREATE`, `REVISE`, `REVOKE`, `EXPIRE`, `SUPERSEDE`, `DEDUPE_HIT`, `INTEGRITY_CHECK`, `MIGRATE`, `REJECT_PRIVATE_MODE`).
-6. **`memory_fts`** *(virtual table FTS5 opcional)*: `unicode61 remove_diacritics 2`. No usa triggers implícitos que indexen estados inactivos; `ExperienceStore` inserta o actualiza únicamente filas `ACTIVE` y ejecuta `DELETE FROM memory_fts WHERE memory_id = ?` dentro de la misma transacción `BEGIN IMMEDIATE` al revocar, expirar o sustituir.
-
-### Pragmas por conexión
-
-Cada conexión efímera ejecuta `configure_connection()`:
-- `PRAGMA foreign_keys = ON`
-- `PRAGMA busy_timeout = 5000` (configurable vía `JARVIS_N8_SQLITE_BUSY_TIMEOUT_MS`)
-- `PRAGMA secure_delete = ON` (sobrescribe con ceros páginas liberadas al purgar recuerdos de `memory_fts`)
-- `PRAGMA synchronous = FULL`
-- `PRAGMA temp_store = MEMORY`
-- `PRAGMA journal_mode = WAL` en inicialización/migración.
+| Archivo | Fase | Responsabilidad |
+| :--- | :---: | :--- |
+| [models.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/models.py) | N8.1/N8.2 | Enumeraciones, máquina de estados (`ACTIVE`, `SUPERSEDED`, `REVOKED`, `EXPIRED`), excepciones tipadas (`MemorySubsystemError`, `MemoryPrivateModeError`, `MemoryBackupError`, `MemoryRestoreError`, `MemoryLockTimeoutError`, etc.) y contratos DTO (`ExecutionVerificationEvidence`, `MemoryRetrievalResult`, `PurgeResult`, `BackupInfo`, `RestoreResult`, `PreferenceImportPreview`). |
+| [policy.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/policy.py) | N8.1/N8.2 | `MemoryPolicy`, `sanitize_memory_text()`, detección sin exposición de secretos (`assert_no_secrets` + `redact_secrets`), bloqueo de `INFERENCE`, validación `EXECUTION_VERIFIED`, validación de rutas Windows (`validate_safe_local_db_path`, `validate_safe_backup_dir`, `validate_safe_read_json_path`) y sandbox `JARVIS_ENV=test`. |
+| [migrations.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/migrations.py) | N8.1 | Esquema SQLite versionado v1 (`schema_migrations`, `store_metadata`, `memories`, `memory_revisions`, `memory_audit`, `memory_fts`), tokenizer `unicode61 remove_diacritics 2`, índices parciales únicos y pragmas `WAL` + `synchronous=FULL` + `secure_delete=ON` + `foreign_keys=ON`. |
+| [store.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/store.py) | N8.1/N8.2 | `ExperienceStoreLock` y `ExperienceStore`: CRUD transaccional (`BEGIN IMMEDIATE`), dedupe, revisiones inmutables, confirmación de pendientes (`confirm_memory`), revocación lógica (`revoke_memory`), purga física (`purge_memory`), backup (`create_backup`), restauración (`restore_from_backup`) y `verify_integrity`. |
+| [retriever.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/retriever.py) | N8.2 | Recuperación determinista FTS5/BM25 + fallback SQL `LIKE`, filtrado previo por estado/vigencia/ámbito, ranking ponderado, no fusión de experiencias distintas y presupuestos por canal. |
+| [engine.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/engine.py) | N8.2 | API central que coordina políticas, modo privado, ciclo de vida completo, backups/restauración e importación manual read-only desde JSON legacy. |
+| [console.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/console.py) | N8.2 | Comandos de consola `/memoria`, `/privado` e `/incognito` con validación de argumentos, vistas previas y confirmación interactiva antes de acciones destructivas. |
 
 ---
 
-## 4. Políticas de Ingesta y Modelo de Seguridad
+## 3. Recuperación Determinista, Ranking y Presupuestos (`MemoryRetriever`)
 
-| Regla | Implementación en N8.1 |
-| :--- | :--- |
-| **Categoría `INFERENCE`** | Bloqueada por defecto (`N8_ALLOW_INFERENCE_INGEST = False`). |
-| **Matriz origen/categoría** | `USER_EXPLICIT` admite `FACT`, `PREFERENCE`, `DECISION`, `EXPERIENCE`; `DECISION_CONFIRMED` admite `DECISION`, `PREFERENCE`, `FACT`; `EXECUTION_VERIFIED` **solo** admite `EXPERIENCE` y `FACT`. |
-| **Contrato `ExecutionVerificationEvidence`** | Exige `source_layer` en `{"N5_CHAIN_ORCHESTRATOR", "N6_EXECUTION_SUPERVISOR"}`, `execution_outcome == "verified"`, artefactos no vacíos, timestamp UTC válido, `approval_hash` SHA-256 de 64 hex obligatorio para N5 y verificación de integridad `evidence_sha256` contra carga canónica. |
-| **Sanitización específica (`sanitize_memory_text`)** | No reutiliza `sanitize_untrusted_label()` de N7. Normaliza con `NFKC`, elimina caracteres invisibles `Cf`, `U+034F`, selectores de variación y secuencias de control/ANSI; preserva prosa técnica multilínea dentro de los presupuestos (`N8_MAX_TITLE_CHARS`, `N8_MAX_CONTENT_CHARS`, `N8_MAX_SUMMARY_CHARS`). |
-| **Rechazo de secretos y transcripciones** | Detecta tokens/claves reutilizando `src/brain/exceptions.redact_secrets()` + encabezados PEM y asignaciones `.env`; bloquea claves de metadata sensibles mediante `is_sensitive_key()` sin exponer nunca el valor del secreto en mensajes de error. También rechaza delimitadores de prompt (`<\|im_start\|>`, `<script>`) y transcripciones conversacionales completas. |
-| **Modo privado** | Cualquier escritura con `private_mode=True` lanza `MemoryPrivateModeError` antes de persistir datos ni dejar huella en tablas o auditoría. |
-| **Protección de rutas Windows** | `validate_safe_local_db_path()` rechaza rutas UNC/SMB (`\\servidor\...`, `//...`, `\\?\UNC\...`), nombres reservados (`CON`, `NUL`, `COM1..9`, `LPT1..9`), variables `%...%` sin expandir, traversal `..`, symlinks/NTFS reparse points y directorios críticos del SO. |
-| **Aislamiento de tests (`JARVIS_ENV=test`)** | Bloquea el acceso a `data/` real y redirige las bases de prueba al sandbox `temp/jarvis_test_isolated/`. |
-| **Protección Git** | `.gitignore` y `GitSafetyGuard` (`src/utils/git_guard.py`) bloquean `*.db`, `*-wal`, `*-shm`, `*-journal`, `*.db.lock`, `*.corrupt.*`, `data/` y `data/memory_backups/`. |
+1. **Motores:** FTS5 con `bm25(memory_fts)` y tokenizer `unicode61 remove_diacritics 2`, con respaldo automático parametrizado SQL `LIKE ESCAPE '\'` sobre `normalized_text`.
+2. **Filtros obligatorios previos al ranking:**
+   - Solo estado `ACTIVE` (salvo consultas administrativas explícitas en `store.list_memories`).
+   - Excluye `REVOKED`, `SUPERSEDED`, `EXPIRED`, recuerdos con `expires_at` vencido y recuerdos en espera de confirmación (`pending_confirmation=True`) hasta su confirmación explícita.
+   - Respeta el ámbito solicitado: `GLOBAL`, `PROJECT` o `APP_OR_GAME` sin mezclar proyectos ni juegos ajenos.
+3. **Límite de tokens de búsqueda:** `tokenize_query()` normaliza Unicode y acota la consulta a `N8_SEARCH_MAX_TOKENS` (`10` tokens por defecto).
+4. **Fórmula de ranking determinista** *(sin LLM ni embeddings; no fusiona dos recuerdos con distinto `memory_id` por similitud textual)*:
+   - `0.40` relevancia textual (cobertura de tokens + señal BM25/SQL)
+   - `0.20` coincidencia exacta de ámbito (`PROJECT` / `APP_OR_GAME` supera a `GLOBAL`)
+   - `0.15` confianza declarada (`0.0..1.0`)
+   - `0.15` confiabilidad de fuente (`EXECUTION_VERIFIED=1.00`, `DECISION_CONFIRMED=0.90`, `USER_EXPLICIT=0.85`)
+   - `0.07` vigencia/recencia e importancia
+   - `0.03` estado verificado (`last_verified_at`).
+5. **Presupuestos iniciales (`config/settings.py`):**
 
----
-
-## 5. Protocolo de Concurrencia `ExperienceStoreLock` (C4)
-
-```mermaid
-sequenceDiagram
-    participant H1 as Hilo/Instancia A (Proceso 1)
-    participant Reg as _LOCK_REGISTRY (módulo, clave canónica)
-    participant OS as <db>.lock (msvcrt.locking / flock)
-    participant DB as SQLite WAL (efímera)
-
-    H1->>Reg: acquire() sobre RLock canónico
-    alt Primera entrada del hilo (reentry_depth == 0)
-        Reg->>OS: Lock byte 0 no bloqueante con polling hasta timeout
-        OS-->>Reg: OK (owner_thread_id = H1, depth = 1)
-    else Reentrada en mismo hilo (otra instancia B incluida)
-        Reg-->>Reg: reentry_depth += 1 (sin re-invocar msvcrt.locking)
-    end
-    H1->>DB: Abrir conexión efímera -> BEGIN IMMEDIATE -> COMMIT/ROLLBACK -> conn.close()
-    H1->>Reg: release()
-    Note over Reg,OS: Solo al volver reentry_depth a 0 se desbloquea y cierra fd antes de soltar RLock
-```
-
-Todas las operaciones de lectura, escritura, migración y mantenimiento (`verify_integrity`, `get_stats`) usan este mismo protocolo.
+| Destino (`MemoryRetrievalTarget`) | Máximo de recuerdos | Máximo de caracteres |
+| :--- | :---: | :---: |
+| `NORMAL` (consulta estándar) | `5` (`N8_TEXT_MAX_ITEMS`) | `1500` (`N8_TEXT_MAX_CHARS`) |
+| `VOICE` / `LOCAL_3B` (voz y modelo local 3B) | `3` (`N8_VOICE_MAX_ITEMS`) | `600` (`N8_VOICE_MAX_CHARS`) |
 
 ---
 
-## 6. Configuración (`config/settings.py`)
+## 4. Ciclo de Vida Completo y Comandos de Consola
 
-| Variable `.env` | Constante Python | Valor por defecto | Propósito |
-| :--- | :--- | :--- | :--- |
-| `JARVIS_N8_DB_PATH` | `EXPERIENCES_DB_PATH` | `data/experiences.db` | Ruta de producción (bloqueada en `JARVIS_ENV=test`). |
-| `JARVIS_N8_BACKUP_DIR` | `MEMORY_BACKUP_DIR` | `data/memory_backups` | Carpeta reservada para respaldos N8.2. |
-| `JARVIS_N8_ENABLED` | `N8_ENABLED` | `True` | Interruptor maestro del subsistema N8. |
-| `JARVIS_N8_AUTO_CAPTURE_ENABLED` | `N8_AUTO_CAPTURE_ENABLED` | `False` | Reservado para N8.3 (desactivado en N8.1). |
-| `JARVIS_N8_ALLOW_INFERENCE_INGEST` | `N8_ALLOW_INFERENCE_INGEST` | `False` | Mantiene `INFERENCE` deshabilitada en N8.1. |
-| `JARVIS_N8_LOCK_TIMEOUT_SEC` | `N8_LOCK_TIMEOUT_SEC` | `5.0` | Timeout de espera para `ExperienceStoreLock`. |
-| `JARVIS_N8_SQLITE_BUSY_TIMEOUT_MS` | `N8_SQLITE_BUSY_TIMEOUT_MS` | `5000` | Timeout interno SQLite (`PRAGMA busy_timeout`). |
-| `JARVIS_N8_MAX_ACTIVE_MEMORIES` | `N8_MAX_ACTIVE_MEMORIES` | `5000` | Tope de recuerdos `ACTIVE`. |
-| `JARVIS_N8_MAX_TITLE_CHARS` | `N8_MAX_TITLE_CHARS` | `120` | Límite de título. |
-| `JARVIS_N8_MAX_CONTENT_CHARS` | `N8_MAX_CONTENT_CHARS` | `1200` | Límite de contenido sanitizado. |
-| `JARVIS_N8_MAX_SUMMARY_CHARS` | `N8_MAX_SUMMARY_CHARS` | `280` | Límite de resumen breve. |
-| `JARVIS_N8_MAX_REVISIONS_PER_MEMORY` | `N8_MAX_REVISIONS_PER_MEMORY` | `50` | Tope de revisiones por recuerdo. |
-| `JARVIS_N8_FTS5_ENABLED` | `N8_FTS5_ENABLED` | `True` | Activa FTS5 si la compilación local lo soporta. |
-| `JARVIS_N8_TEXT_MAX_*` / `N8_VOICE_MAX_*` | `N8_TEXT_MAX_ITEMS`, `N8_TEXT_MAX_CHARS`, `N8_VOICE_MAX_ITEMS`, `N8_VOICE_MAX_CHARS` | `5 / 1600 / 3 / 600` | Presupuestos reservados para recuperación N8.2/N8.3. |
+| Comando | Operación | Confirmación previa | Efecto principal |
+| :--- | :--- | :---: | :--- |
+| `/memoria ayuda` | Ayuda | No | Lista sintaxis de comandos N8.2 y modo privado. |
+| `/memoria buscar <consulta>` | Consulta rankeada | No | Recupera `ACTIVE` confirmados dentro de presupuesto (`--voz`, `--proyecto`, `--app`). |
+| `/memoria listar [filtro]` | Listado administrativo | No | Lista `activos`, `pendientes`, `revocados`, `expirados` o `todos`. |
+| `/memoria ver <id>` | Detalle e historial | No | Muestra contenido, metadatos, revisión actual e historial previo. |
+| `/memoria corregir <id> [texto]` | Revisión inmutable | No | Incrementa `revision_number` y guarda el estado anterior en `memory_revisions`. |
+| `/memoria confirmar <id>` | Confirmación | No | Promueve recuerdos pendientes (o revalida activos) con `last_verified_at`. |
+| `/memoria olvidar <id> [motivo]` | Revocación lógica | No | Cambia a `REVOKED`, purga fila de `memory_fts` y conserva trazabilidad legal/auditoría. |
+| `/memoria purgar <id>` | Eliminación física SQLite | **Sí** | Borra registro, `memory_fts`, `memory_revisions` y filas de `memory_audit` asociadas. |
+| `/memoria importar-preferencias [ruta]` | Importación manual JSON | **Sí (preview)** | Lee JSON en solo lectura, clasifica `NEW`/`DUPLICATE`/`CONFLICT`/`REJECTED` y aplica solo tras confirmar. |
+| `/memoria backup` | Snapshot consistente | No | Ejecuta `sqlite3.Connection.backup()`, valida integridad y guarda SHA-256. |
+| `/memoria restaurar [id\|num]` | Restauración atómica | **Sí** | Valida SHA-256 + SQLite, preserva DB previa y reemplaza mediante `os.replace()`. |
+| `/privado` / `/incognito` | Alternar privacidad | No | Activa Opción A (lectura permitida, cero escrituras/auto-save) o sale descartando buffers RAM. |
+| `/privado --sin-historial` / `/incognito --sin-historial` | Aislamiento estricto | No | Modo privado sin lectura de recuerdos históricos N8 ni memoria conversacional previa. |
 
 ---
 
-## 7. Ejecución de Tests
+## 5. Modo Privado — Aislamiento Real (Opción A y `--sin-historial`)
 
-En PowerShell con entorno virtual activo y aislamiento obligatorio:
+La protección no depende de instrucciones al modelo LLM sino de controles estructurales en código:
+
+1. **Buffers separados en RAM (`ConversationMemory`):** `_private_mode`, `_private_allow_history`, `_private_messages`, `_private_message_metadata`, `_private_external_references` y `_private_metadata`.
+2. **Bloqueo incondicional de persistencia:** mientras `_private_mode=True`:
+   - `ConversationMemory._save_to_disk()` y `save_to_disk()` retornan `False` inmediatamente sin tocar archivos ni crear `.tmp`.
+   - `MemoryEngine` bloquea toda escritura (`create_memory`, `correct_memory`, `confirm_memory`, `revoke_memory`, `purge_memory`, `create_backup`, `restore_backup`, `commit_preferences_import`) lanzando `MemoryPrivateModeError`.
+   - En `main.py`, operaciones persistentes externas como `/optimizar`, `/rollback`, `/goal` y mutaciones `/plan` se rechazan de forma explícita durante `/privado`.
+3. **Sin historial (`--sin-historial`):** desactiva lecturas previas en `ConversationMemory` y bloquea `MemoryEngine.retrieve()` devolviendo resultado vacío con `blocked_by_history_policy=True`.
+4. **Cero fugas en logs y herramientas:** `SkillManager.set_private_mode(True)` y `IntentRouter` omiten argumentos crudos, respuestas crudas y `traceback` cuando el modo privado está activo.
+5. **Salida limpia:** `exit_private_mode()` vacía y descarta todos los buffers `_private_*` sin mezclarlos jamás con `self._messages` ni `self.preferences`; los guardados posteriores (`auto_save=True`) excluyen todo turno privado previo.
+
+---
+
+## 6. Importación Manual de Preferencias (`data/memory_store.json`)
+
+- **Nunca automática al iniciar.** Solo se ejecuta bajo `/memoria importar-preferencias`.
+- Abre el JSON origen estrictamente en **solo lectura** y **jamás modifica el archivo origen**.
+- Rechaza JSON corrupto o estructuras inesperadas sin campo diccionario `preferences` sin sobrescribir nada.
+- No importa mensajes conversacionales sueltos (`messages`), objetos complejos, claves sensibles (`api_key`, `password`, `token`, etc.), secretos ni marcadores de inferencia.
+- Muestra vista previa diferenciando `NEW`, `DUPLICATE`, `CONFLICT` y `REJECTED`, exigiendo confirmación explícita (`skip` conservador por defecto o `sobrescribir` marcando el previo como `SUPERSEDED`).
+- En `JARVIS_ENV=test`, rechaza por política intentar leer el archivo real `data/memory_store.json` (`MemoryPolicyError`).
+
+---
+
+## 7. Revocación Lógica, Purga Física y Backups / Restauración
+
+### Purga física (`purge_memory`) y limitaciones reales
+- Bajo `ExperienceStoreLock`, borra transaccionalmente (`BEGIN IMMEDIATE`) filas en `memory_fts`, referencias `superseded_by`, `memory_revisions`, filas de `memory_audit` vinculadas al `memory_id` (dejando solo un tombstone anonimizado con SHA-256 del ID sin texto del recuerdo) y el registro en `memories`; luego ejecuta `PRAGMA wal_checkpoint(TRUNCATE)` (con `PRAGMA secure_delete=ON` activo en todas las conexiones) y `VACUUM` opcional.
+- **Limitación documentada honestamente:** aunque SQLite sobrescribe con ceros sus páginas libres, ningún software de aplicación puede garantizar borrado irrecuperable frente a wear-leveling de SSDs, journals/MFT de NTFS, instantáneas Shadow Copies (VSS) de Windows ni backups previos creados fuera o antes de la purga.
+
+### Backups (`data/backups/memory/`) y restauración atómica
+- **Creación (`create_backup`):** usa `sqlite3.Connection.backup()` bajo `ExperienceStoreLock` hacia archivo temporal, valida `PRAGMA quick_check == 'ok'`, `integrity_check == 'ok'`, `foreign_key_check == []`, calcula `SHA-256`, publica con `os.replace()` junto a su descriptor `.backup.json` sin credenciales y **solo tras validar el nuevo backup** aplica retención máxima (`N8_BACKUP_MAX_RETENTION = 5`).
+- **Restauración (`restore_from_backup`):** verifica `SHA-256` + integridad SQLite del snapshot antes de adquirir bloqueo exclusivo; dentro de `ExperienceStoreLock`, consolida WAL si la DB actual es legible, guarda una copia previa verificada por SHA-256 en `preserved_pre_restore_<uuid>/` (incluso si la DB activa estaba corrupta), limpia `-wal`/`-shm`/`-journal` obsoletos, sustituye atómicamente vía archivo staging sincronizado con `os.fsync()` + `os.replace()` y verifica integridad post-swap (revirtiendo a la copia preservada si fallara).
+- **Limitación en sistema de archivos:** en Windows, la sustitución atómica `os.replace()` exige que el archivo temporal de staging resida en el mismo volumen que `data/experiences.db` (garantizado ubicándolo en `db_path.parent`) y presupone que ningún proceso externo ajeno a J.A.R.V.I.S. mantenga abierto sin lock el archivo `.db`.
+
+---
+
+## 8. Concurrencia, Configuración, Protección de Datos y Límites N8.3
+
+- **Concurrencia real:** Todas las operaciones (`create`, `revise`, `confirm`, `revoke`, `purge`, `backup`, `restore`, `verify_integrity`, `retrieve`) comparten `ExperienceStoreLock` (RLock modular por ruta canónica + `msvcrt.locking` en Windows / `fcntl.flock` en POSIX). Validado mediante subprocesos independientes reales en `writer-vs-purge` y `writer-vs-restore`.
+- **Protección Git:** `.gitignore` y `src/utils/git_guard.py` (`GitSafetyGuard`) bloquean `data/`, `experiences.db*`, `-wal`, `-shm`, `-journal`, `.db.lock`, `.backup.json`, `.db.sha256`, `data/backups/memory/`, `.restore_staging_*`, `.pre_restore_*` y `*.corrupt.*`.
+- **Aislamiento de tests (`JARVIS_ENV=test`):** redirige DB y backups bajo `temp/jarvis_test_isolated/` y prohíbe acceder a `data/memory_store.json`, `data/experiences.db` o `data/backups/` reales.
+- **Límites respecto a N8.3:** no se implementa en N8.2 captura automática post-ejecución, persistencia de referencias N8 en `GoalStore`, cambios en `GoalEngine`/`ExecutionSupervisor`, embeddings ni consolidación LLM.
+
+### Ejecución de tests
 
 ```powershell
 $env:JARVIS_ENV = "test"
-.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence -v
+.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle -v
+.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q
 ```
-
-Para validar la suite completa del repositorio:
-
-```powershell
-$env:JARVIS_ENV = "test"
-.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
-```
-
----
-
-## 8. Contratos Preparados para N8.2 y N8.3 (Sin Implementar en N8.1)
-
-- **Para N8.2 (`MemoryRetriever`, backups, purga, consola `/memoria`, `/privado`):**
-  - `ExperienceStore.search_text_candidates()`, `list_memories(MemoryQueryFilter)`, `get_memory()`, `revoke_memory()`, `update_memory_with_revision()`, `transition_status()`, `verify_integrity()`, `get_stats()`, `acquire_lock()` y presupuestos `N8_TEXT_MAX_*` / `N8_VOICE_MAX_*`.
-- **Para N8.3 (captura post-ejecución `EXECUTION_VERIFIED` e integración consultiva N6/Multi-Brain):**
-  - Contrato estructurado `ExecutionVerificationEvidence` (validación SHA-256 de aprobación y artefactos), dedupe automático por `(source_layer, source_execution_id, source_plan_id, source_task_id)` y aislamiento de estado privado (`MemoryPrivateModeError`).
-
-## 9. Limitaciones Conocidas en N8.1
-
-- Aún no existe motor de ranking por relevancia/ámbito/antigüedad (`MemoryRetriever` pertenece a N8.2).
-- `verify_integrity(quarantine_on_corruption=True)` aísla bases corruptas en `.corrupt.<uuid>`, mientras que la restauración automática desde snapshots de respaldo (`MEMORY_BACKUP_DIR`) y los comandos de purga manual pertenecen a N8.2.
-- En pruebas donde un proceso distinto mantiene bloqueado un archivo de forma prolongada más allá de `N8_LOCK_TIMEOUT_SEC`, el contendedor falla de forma controlada con `MemoryLockTimeoutError` sin degradar el archivo de base de datos.

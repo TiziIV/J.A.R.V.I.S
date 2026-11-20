@@ -27,11 +27,21 @@ class SkillManager:
         """
         # Diccionario interno para almacenar las instancias de las skills indexadas por su nombre
         self.skills: dict[str, BaseSkill] = {}
-        
+        self._private_mode: bool = False
+
         # Registramos las habilidades del sistema por defecto
         self._register_default_skills()
-        
+
         print(f"SkillManager inicializado con {len(self.skills)} habilidades registradas.")
+
+    @property
+    def is_private_mode(self) -> bool:
+        """Indica si el aislamiento de logs/trazas de modo privado está activo."""
+        return self._private_mode
+
+    def set_private_mode(self, enabled: bool) -> None:
+        """Habilita o deshabilita el filtrado estricto de logs y trazas durante modo privado."""
+        self._private_mode = bool(enabled)
 
     def register_skill(self, skill: BaseSkill) -> None:
         """
@@ -111,15 +121,21 @@ class SkillManager:
         exec_args.update(kwargs)
 
         try:
-            print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {exec_args}")
+            if self._private_mode:
+                print(f"[SkillManager] Ejecutando skill: '{skill_name}' (argumentos omitidos por modo privado)")
+            else:
+                print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {exec_args}")
             # Ejecutamos el método execute de la skill concreta
             result = skill_instance.execute(**exec_args)
             return result
-            
+
         except Exception as e:
             # Capturamos cualquier error interno de la skill para mantener la resiliencia de la app
-            print(f"[X] Error al ejecutar la skill '{skill_name}': {e}")
-            traceback.print_exc()
+            if self._private_mode:
+                print(f"[X] Error al ejecutar la skill '{skill_name}' (detalle omitido por modo privado).")
+            else:
+                print(f"[X] Error al ejecutar la skill '{skill_name}': {e}")
+                traceback.print_exc()
             return f"Lo siento señor, ocurrió un error interno al ejecutar la habilidad {skill_name}."
 
     def execute_skill_with_envelope(
@@ -147,15 +163,21 @@ class SkillManager:
         exec_args.update(kwargs)
 
         try:
-            print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {exec_args}")
+            if self._private_mode:
+                print(f"[SkillManager] Ejecutando skill: '{skill_name}' (argumentos omitidos por modo privado)")
+            else:
+                print(f"[SkillManager] Ejecutando skill: '{skill_name}' con argumentos: {exec_args}")
             if hasattr(skill_instance, "execute_with_envelope"):
                 text_out, envelope, _report = skill_instance.execute_with_envelope(exec_args)
                 return text_out, envelope
             result = skill_instance.execute(**exec_args)
             return result, None
         except Exception as e:
-            print(f"[X] Error al ejecutar la skill '{skill_name}': {e}")
-            traceback.print_exc()
+            if self._private_mode:
+                print(f"[X] Error al ejecutar la skill '{skill_name}' (detalle omitido por modo privado).")
+            else:
+                print(f"[X] Error al ejecutar la skill '{skill_name}': {e}")
+                traceback.print_exc()
             return (
                 f"Lo siento señor, ocurrió un error interno al ejecutar la habilidad {skill_name}.",
                 None,

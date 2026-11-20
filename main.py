@@ -104,6 +104,8 @@ def run_console_session(
     output_fn: Callable[[str], None] = print,
     tts_factory: Optional[Callable[[], Any]] = None,
     orchestrator: Optional[Any] = None,
+    memory_engine: Optional[Any] = None,
+    memory_handler: Optional[Any] = None,
 ) -> None:
     """
     Ejecuta el bucle interactivo por consola (modo texto o texto + TTS).
@@ -119,6 +121,55 @@ def run_console_session(
     goal_console_handler: Any = None
     context_engine_instance: Any = None
     context_console_handler: Any = None
+    memory_engine_instance: Any = memory_engine or getattr(brain_manager, "memory_engine", None)
+    memory_console_handler: Any = memory_handler
+
+    def _is_private_mode_active() -> bool:
+        conv_priv = (
+            brain_manager.memory is not None
+            and getattr(brain_manager.memory, "is_private_mode", False) is True
+        )
+        eng_priv = (
+            memory_engine_instance is not None
+            and getattr(memory_engine_instance, "is_private_mode", False) is True
+        )
+        return conv_priv or eng_priv
+
+    def _ensure_memory_engine() -> Any:
+        nonlocal memory_engine_instance
+        if memory_engine_instance is None:
+            from src.memory.engine import MemoryEngine
+
+            conv_mem = brain_manager.memory
+            memory_engine_instance = MemoryEngine(
+                is_private_mode_fn=(
+                    (lambda: getattr(conv_mem, "is_private_mode", False) is True)
+                    if conv_mem is not None
+                    else None
+                ),
+                allow_history_in_private_fn=(
+                    (lambda: getattr(conv_mem, "private_allow_history", True) is not False)
+                    if conv_mem is not None
+                    else None
+                ),
+            )
+            if getattr(brain_manager, "memory_engine", None) is None:
+                brain_manager.memory_engine = memory_engine_instance
+        return memory_engine_instance
+
+    def _ensure_memory_handler() -> Any:
+        nonlocal memory_console_handler
+        if memory_console_handler is None:
+            from src.memory.console import MemoryConsoleHandler
+
+            memory_console_handler = MemoryConsoleHandler(
+                memory_engine=_ensure_memory_engine(),
+                conversation_memory=brain_manager.memory,
+                skill_manager=getattr(brain_manager, "skill_manager", None),
+                input_fn=input_fn,
+                output_fn=output_fn,
+            )
+        return memory_console_handler
 
     def _ensure_context_engine() -> Any:
         nonlocal context_engine_instance
@@ -193,12 +244,19 @@ def run_console_session(
 
     output_fn("=======================================================")
     output_fn(" J.A.R.V.I.S. — Consola Interactiva Multi-Brain")
-    output_fn(" Comandos: /modo | /voz | /contexto | /goal <objetivo> | /plan | /optimizar <juego> | /rollback <id> | /limpiar | salir")
+    output_fn(" Comandos: /modo | /voz | /contexto | /memoria | /privado | /goal | /plan | /optimizar | /rollback | /limpiar | salir")
     output_fn("=======================================================")
 
     try:
         while True:
-            prompt_label = f"Tu [Modo: {brain_manager.global_mode}] > "
+            priv_badge = ""
+            if _is_private_mode_active():
+                allow_hist = (
+                    brain_manager.memory is None
+                    or getattr(brain_manager.memory, "private_allow_history", True) is not False
+                )
+                priv_badge = " | PRIVADO" if allow_hist else " | PRIVADO:sin-historial"
+            prompt_label = f"Tu [Modo: {brain_manager.global_mode}{priv_badge}] > "
             try:
                 user_raw = input_fn(prompt_label)
             except (EOFError, KeyboardInterrupt):
@@ -284,6 +342,12 @@ def run_console_session(
 
             # 4b. Comando /optimizar <juego o ruta> -> ejecuta simulación y solicita aprobación explícita
             if lowered == "/optimizar" or lowered.startswith("/optimizar "):
+                if _is_private_mode_active():
+                    output_fn(
+                        "JARVIS: Operación '/optimizar' rechazada durante el modo privado porque "
+                        "requiere registrar journals y respaldos persistentes en disco. Salga de `/privado` antes, señor."
+                    )
+                    continue
                 target_arg = text[len("/optimizar") :].strip()
                 if not target_arg:
                     msg = (
@@ -370,6 +434,12 @@ def run_console_session(
 
             # 4c. Comando /rollback <execution_id> -> restaura los archivos desde sus backups verificados
             if lowered == "/rollback" or lowered.startswith("/rollback "):
+                if _is_private_mode_active():
+                    output_fn(
+                        "JARVIS: Operación '/rollback' rechazada durante el modo privado porque "
+                        "modifica el estado persistente del journal transaccional. Salga de `/privado` antes, señor."
+                    )
+                    continue
                 exec_id_arg = text[len("/rollback") :].strip()
                 if not exec_id_arg:
                     output_fn(
@@ -395,6 +465,15 @@ def run_console_session(
 
             # 4.5 Comandos N6 (/goal y /plan) -> motor autónomo de objetivos con confirmación explícita
             if lowered == "/goal" or lowered.startswith("/goal ") or lowered == "/plan" or lowered.startswith("/plan "):
+                if _is_private_mode_active():
+                    goal_sub = text[len("/plan") :].strip().lower() if lowered.startswith("/plan") else ""
+                    # Solo las consultas de lectura sobre un plan previo quedan permitidas; toda escritura WAL se rechaza.
+                    if lowered == "/goal" or lowered.startswith("/goal ") or goal_sub not in {"estado", "ver", "mostrar", ""}:
+                        output_fn(
+                            "JARVIS: Operación '/goal' o mutación '/plan' rechazada durante el modo privado para "
+                            "evitar escribir registros persistentes (.goal.json / .wal.jsonl). Salga de `/privado` primero, señor."
+                        )
+                        continue
                 handler = _ensure_goal_handler()
                 goal_reply = handler.handle_command(text, input_fn=input_fn, output_fn=output_fn)
                 if tts_active and tts_engine is not None and goal_reply:
@@ -420,6 +499,24 @@ def run_console_session(
                 if tts_active and tts_engine is not None and ctx_reply:
                     try:
                         _speak_blocking(tts_engine, ctx_reply)
+                    except Exception:
+                        pass
+                continue
+
+            # 4.7 Comandos N8.2 (/memoria, /privado, /incognito) -> ciclo de vida de memoria y modo privado
+            if (
+                lowered == "/memoria"
+                or lowered.startswith("/memoria ")
+                or lowered == "/privado"
+                or lowered.startswith("/privado ")
+                or lowered == "/incognito"
+                or lowered.startswith("/incognito ")
+            ):
+                mem_handler = _ensure_memory_handler()
+                mem_reply = mem_handler.handle_command(text, input_fn=input_fn, output_fn=output_fn)
+                if tts_active and tts_engine is not None and mem_reply and not _is_private_mode_active():
+                    try:
+                        _speak_blocking(tts_engine, mem_reply)
                     except Exception:
                         pass
                 continue

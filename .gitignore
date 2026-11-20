@@ -75,4 +75,9 @@ exports/
 *.sqlite.lock
 *.sqlite3.lock
 *.corrupt.*
+*.restore_staging_*
+*.pre_restore_*
+*.db.sha256
+*.backup.json
+data/backups/
 memory_backups/

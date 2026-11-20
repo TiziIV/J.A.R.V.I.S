@@ -1135,3 +1135,37 @@ Se implementó el núcleo independiente `src/memory/` para **N8.1 — Long-Term 
 - **Pendiente N8.2:** `MemoryRetriever` (ranking ponderado y presupuesto por voz/texto), backups automatizados y restauración, comandos de consola (`/memoria`, `/privado`, `/incognito`) y purga controlada.
 - **Pendiente N8.3:** captura automática `EXECUTION_VERIFIED` post-ejecución desde N5/N6 y síntesis consultiva aislada hacia N6/Multi-Brain.
 - En esta iteración N8.1 solo se publica commit verificado (sin crear tag nuevo, reservando los tags anotados según la cadencia de cierre por bloques/fases de `AGENTS.md`).
+
+---
+
+## Fase N8.2 — Ciclo de Vida, Recuperación, Consola, Modo Privado, Backups y Concurrencia Real (2026-11-20)
+
+### 1. Resumen de Implementación
+
+Se completó **N8.2 — Long-Term Memory & Experience** sobre la base N8.1 (`data/experiences.db`), manteniendo intactos `data/memory_store.json`, `N5`, `N6`, `N7` y `N8.1`, sin implementar aún **N8.3** (captura automática post-ejecución, referencias N8 en `GoalStore`, cambios en `GoalEngine`/`ExecutionSupervisor`, embeddings ni consolidación LLM).
+
+### 2. Archivos Creados y Modificados
+
+- **Nuevos (`src/memory/` y `tests/`):**
+  - `src/memory/retriever.py`: `MemoryRetriever` con FTS5/BM25 y respaldo SQL `LIKE`, filtrado previo por estado (`ACTIVE`, exclusión de `REVOKED`/`SUPERSEDED`/`EXPIRED`/`expires_at` y pendientes sin confirmar), ámbitos `GLOBAL`/`PROJECT`/`APP_OR_GAME`, acotado de tokens (`N8_SEARCH_MAX_TOKENS=10`), ranking determinista de 6 factores sin fusión de experiencias distintas, presupuestos (`5 / 1500` normal; `3 / 600` voz y modelos locales 3B) y sobre consultivo `untrusted_long_term_memory` no promocionable al `system_prompt`.
+  - `src/memory/engine.py`: API central `MemoryEngine` que coordina políticas N8.1, recuperación, corrección con revisiones, confirmación de pendientes, revocación lógica, purga física confirmada, backups/restauración e importación manual en solo lectura desde JSON legacy.
+  - `src/memory/console.py`: `MemoryConsoleHandler` para `/memoria ayuda`, `buscar`, `listar`, `ver`, `corregir`, `confirmar`, `olvidar`, `purgar`, `importar-preferencias`, `backup`, `restaurar`, `/privado`, `/privado --sin-historial` e `/incognito` (con vistas previas y confirmación explícita para purga, importación y restauración).
+  - `tests/test_memory_n8_lifecycle.py`: suite aislada de 10 pruebas integrales bajo `JARVIS_ENV=test` y `temp/jarvis_test_isolated/` incluyendo pruebas reales por `subprocess` `writer-vs-purge` y `writer-vs-restore`.
+- **Actualizados:**
+  - `src/memory/models.py`, `src/memory/policy.py`, `src/memory/store.py`, `src/memory/__init__.py`: soporte para `pending_confirmation` (`confirm_memory`), purga física transaccional con `wal_checkpoint(TRUNCATE)` y `VACUUM` opcional (`purge_memory`), `create_backup()` vía `sqlite3.Connection.backup()` con `quick_check`/`integrity_check`/SHA-256 y retención máxima (5), `restore_from_backup()` con verificación previa, preservación verificada de la DB previa y reemplazo atómico vía staging + `os.replace()`.
+  - `src/brain/memory.py`: aislamiento real de modo privado (`_private_mode`, `_private_allow_history`, `_private_messages`, `_private_message_metadata`, `_private_external_references`, `_private_metadata`), `enter_private_mode()`, `exit_private_mode()` y bloqueo incondicional de `_save_to_disk()` / `save_to_disk()`.
+  - `src/tools/skill_manager.py`, `src/brain/intent_router.py`, `src/brain/brain_manager.py`, `main.py`: propagación de modo privado (supresión de argumentos, respuestas crudas y `traceback` en consola/logs durante modo privado; lectura booleana estricta segura frente a `MagicMock`), consulta consultiva acotada en canal `untrusted_context`, despacho perezoso `/memoria`, `/privado`, `/incognito` sin importar Whisper/audio y bloqueo en modo privado de operaciones persistentes externas (`/optimizar`, `/rollback`, `/goal` y mutaciones `/plan`).
+  - `config/settings.py`, `.gitignore`, `src/utils/git_guard.py`, `docs/N8_LONG_TERM_MEMORY.md`, `README.md`, `prompts_history.txt`.
+
+### 3. Verificaciones Realmente Ejecutadas (N8.2)
+
+- `py_compile` sobre los 16 módulos Python nuevos y modificados: **OK (código 0)**.
+- Suite aislada N8.2 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_memory_n8_lifecycle -v`): **10 pruebas en 16.762s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite aislada N8.1 (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence -v`): **19 pruebas en 16.923s — OK (0 fallos, 0 errores, 0 omitidas)**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **620 pruebas en 145.645s — OK (0 fallos, 0 errores, 0 omitidas)** frente a línea base de 610 (+10 pruebas nuevas, 0 regresiones).
+- Integridad de datos reales: `data/memory_store.json` conserva **1.218 bytes**, SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`; `data/` contiene únicamente `memory_store.json` (sin `data/experiences.db` ni `data/backups/`).
+
+### 4. Límites y Pendientes (N8.3)
+
+- N8.3 (captura automática `EXECUTION_VERIFIED` post-ejecución e integración de referencias N8 en N6/`GoalStore`) queda sin implementar y desactivada por política.
+- Purga física limita su garantía al almacenamiento SQLite (`secure_delete=ON`, `wal_checkpoint`, `VACUUM`), sin garantía sobre wear-leveling SSD, NTFS ni copias VSS/OS previas.
