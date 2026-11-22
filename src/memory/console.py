@@ -43,6 +43,7 @@ class MemoryConsoleHandler:
         conversation_memory: Any = None,
         skill_manager: Any = None,
         default_import_path: Optional[Path | str] = None,
+        on_private_mode_changed: Optional[Callable[[bool, bool], None]] = None,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
     ) -> None:
@@ -50,6 +51,7 @@ class MemoryConsoleHandler:
         self._conversation_memory: Any = conversation_memory
         self._skill_manager: Any = skill_manager
         self._default_import_path: Optional[Path | str] = default_import_path
+        self._on_private_mode_changed: Optional[Callable[[bool, bool], None]] = on_private_mode_changed
         self._input_fn: Callable[[str], str] = input_fn
         self._output_fn: Callable[[str], None] = output_fn
 
@@ -94,6 +96,12 @@ class MemoryConsoleHandler:
 
         if self._skill_manager is not None and hasattr(self._skill_manager, "set_private_mode"):
             self._skill_manager.set_private_mode(enabled)
+
+        if self._on_private_mode_changed is not None:
+            try:
+                self._on_private_mode_changed(bool(enabled), bool(allow_history))
+            except Exception:
+                pass
 
     def _ask_confirmation(
         self,

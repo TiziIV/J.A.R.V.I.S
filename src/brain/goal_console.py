@@ -30,6 +30,9 @@ class GoalConsoleHandler:
         context_engine: Any = None,
         ensure_orchestrator_fn: Optional[Callable[[], Any]] = None,
         memory_capture_service: Any = None,
+        memory_engine: Any = None,
+        is_private_mode_fn: Optional[Callable[[], bool]] = None,
+        allow_history_in_private_fn: Optional[Callable[[], bool]] = None,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
     ) -> None:
@@ -39,8 +42,22 @@ class GoalConsoleHandler:
         self._context_engine = context_engine
         self._ensure_orchestrator_fn = ensure_orchestrator_fn
         self._memory_capture_service = memory_capture_service
+        self._memory_engine = memory_engine
+        self._is_private_mode_fn = is_private_mode_fn
+        self._allow_history_in_private_fn = allow_history_in_private_fn
         self._input_fn = input_fn
         self._output_fn = output_fn
+
+    def set_memory_engine(self, memory_engine: Any) -> None:
+        """Conecta la instancia única de `MemoryEngine` sin duplicar SQLite."""
+        self._memory_engine = memory_engine
+        if self._goal_engine is not None:
+            self._goal_engine.set_memory_engine(memory_engine)
+
+    def sync_private_mode_exit(self) -> None:
+        """Notifica salida de modo privado para descartar almacén efímero y sobres RAM N8."""
+        if self._goal_engine is not None:
+            self._goal_engine.on_private_mode_exited()
 
     @property
     def engine(self) -> GoalEngine:
@@ -50,6 +67,9 @@ class GoalConsoleHandler:
                 brain_manager=self._brain_manager,
                 context_engine=self._context_engine,
                 memory_capture_service=self._memory_capture_service,
+                memory_engine=self._memory_engine,
+                is_private_mode_fn=self._is_private_mode_fn,
+                allow_history_in_private_fn=self._allow_history_in_private_fn,
                 use_ai=False,
             )
         return self._goal_engine
@@ -157,7 +177,7 @@ class GoalConsoleHandler:
                     active_out(f"JARVIS:\n{msg}")
                     return msg
 
-                if rest_lower == "ejecutar":
+                if rest_lower in {"ejecutar", "reanudar"}:
                     active = self.engine.get_active_plan()
                     if active is None:
                         msg = "No hay ningún plan activo para ejecutar. Usa `/goal <objetivo>` primero."
@@ -196,12 +216,21 @@ class GoalConsoleHandler:
                             self.engine.set_chain_orchestrator(self._ensure_orchestrator_fn())
                         return confirmed
 
-                    result = self.engine.execute_plan(
-                        active,
-                        approval_callback=_console_approval,
-                        input_fn=active_in,
-                        strict_approval=False,
-                    )
+                    if rest_lower == "reanudar":
+                        result = self.engine.resume_plan(
+                            active,
+                            execute=True,
+                            approval_callback=_console_approval,
+                            input_fn=active_in,
+                            strict_approval=False,
+                        )
+                    else:
+                        result = self.engine.execute_plan(
+                            active,
+                            approval_callback=_console_approval,
+                            input_fn=active_in,
+                            strict_approval=False,
+                        )
                     if result.stopped_for_approval:
                         msg = (
                             f"Ejecución detenida sin aplicar cambios sensibles: "
@@ -216,7 +245,7 @@ class GoalConsoleHandler:
 
                 msg = (
                     "Subcomando desconocido para /plan. Opciones: "
-                    "/plan | /plan ejecutar | /plan estado | /plan cancelar | /plan aclarar <texto>"
+                    "/plan | /plan ejecutar | /plan reanudar | /plan estado | /plan cancelar | /plan aclarar <texto>"
                 )
                 active_out(f"JARVIS: {msg}")
                 return msg

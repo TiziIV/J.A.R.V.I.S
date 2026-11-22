@@ -12,20 +12,31 @@ Garantías de arquitectura y seguridad:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 import uuid
 
 from config.settings import BASE_DIR, GOAL_STORE_DIR
 from src.brain.exceptions import is_sensitive_key, redact_secrets
+from src.brain.goal_memory import (
+    FORBIDDEN_PERSISTED_N8_KEYS,
+    build_skeleton_task_labels,
+    collect_grounded_anchors,
+    sanitize_n8_context_extra_for_persistence,
+    separate_grounded_skill_params,
+    strip_volatile_n8_keys_recursive,
+)
 from src.brain.goal_models import (
+    Constraints,
     GoalPersistenceError,
     GoalPlan,
+    GoalTask,
     utc_now_iso,
 )
 
@@ -98,39 +109,265 @@ def _sanitize_identifier(identifier: str, label: str = "id") -> str:
     return clean
 
 
-# Campos de contexto volátil/privado que no deben persistirse en archivos .goal.json (F4).
+# Campos de contexto volátil/privado y de memoria RAM N8 que no deben persistirse en archivos .goal.json.
 _VOLATILE_CONTEXT_KEYS: frozenset[str] = frozenset(
     {
         "visible_windows",
         "foreground_window",
         "top_processes",
+        *FORBIDDEN_PERSISTED_N8_KEYS,
+    }
+)
+
+_SAFE_PERSISTED_TASK_META_KEYS: frozenset[str] = frozenset(
+    {
+        "replan_for",
+        "proposed_by_ai",
+        "use_chain_orchestrator",
+        "modifies_files",
+        "provenance_origin",
+        "n8_influenced",
+        "n8_query_id",
+        "ephemeral_details_in_ram",
     }
 )
 
 
 def _redact_nested_data(value: Any) -> Any:
     """Redacta recursivamente posibles secretos y suprime campos volátiles antes de persistir."""
-    if isinstance(value, str):
-        return redact_secrets(value)
-    if isinstance(value, list):
-        return redact_secrets(value)
-    if isinstance(value, dict):
+    cleaned_n8 = strip_volatile_n8_keys_recursive(value)
+    if isinstance(cleaned_n8, dict):
         cleaned: dict[str, Any] = {}
-        for k, v in value.items():
+        for k, v in cleaned_n8.items():
             if str(k) in _VOLATILE_CONTEXT_KEYS:
                 continue
-            # Un valor escalar bajo una clave sensible (password, token, ...) se oculta por completo.
             if is_sensitive_key(str(k)) and isinstance(v, (str, int, float)) and not isinstance(v, bool) and v != "":
                 cleaned[str(k)] = "[REDACTED]"
             else:
                 cleaned[str(k)] = _redact_nested_data(v)
         return cleaned
-    return value
+    return redact_secrets(cleaned_n8) if isinstance(cleaned_n8, (str, list)) else cleaned_n8
+
+
+def sanitize_wal_payload(payload: Mapping[str, Any] | dict[str, Any]) -> dict[str, Any]:
+    """Limpia un payload WAL excluyendo claves N8 volátiles, textos de recuerdos y redactando secretos."""
+    if not isinstance(payload, Mapping):
+        return {}
+    cleaned = strip_volatile_n8_keys_recursive(dict(payload))
+    if not isinstance(cleaned, dict):
+        return {}
+    if cleaned.get("n8_influenced") or cleaned.get("provenance_origin") == "llm_with_n8":
+        if "reason" in cleaned:
+            cleaned["reason"] = "Detalle contextual N8 mantenido solo en RAM."
+        if "message" in cleaned:
+            cleaned["message"] = "Evento contextual N8 mantenido solo en RAM."
+        if "summary" in cleaned:
+            cleaned["summary"] = "Resumen contextual N8 mantenido solo en RAM."
+    out: dict[str, Any] = {}
+    for k, v in cleaned.items():
+        if str(k) in _VOLATILE_CONTEXT_KEYS:
+            continue
+        out[str(k)] = _redact_nested_data(v)
+    return out
+
+
+def extract_persistable_plan_dict(
+    plan: GoalPlan,
+    *,
+    allow_private_ram: bool = False,
+) -> dict[str, Any]:
+    """
+    Frontera estructural determinista entre `persistable_skeleton` y `ephemeral_annotations`.
+
+    Garantías:
+    1. Rechaza persistir en disco planes creados durante el modo privado (`is_ephemeral_private`).
+    2. Elimina cualquier sobre RAM o clave volátil N8 (`_VOLATILE_CONTEXT_KEYS`).
+    3. En `goal.context.extra` conserva exclusivamente referencias mínimas verificadas (`n8_query_id`,
+       `n8_memory_refs`, `n8_trust_boundary`, `n8_last_revalidated_at`) junto a metadatos N7 válidos.
+    4. Si el objetivo, una tarea o una replanificación estuvieron expuestos a N8 y el dato no posee
+       procedencia independiente probada (`anchors` previos al LLM/N8), descarta prosa/paráfrasis
+       o parámetros no anclados de la serialización persistente y preserva el esqueleto válido.
+    """
+    if not allow_private_ram and getattr(plan, "is_ephemeral_private", False):
+        raise GoalPersistenceError(
+            "Violación de aislamiento privado: no se permite transferir ni persistir un plan privado en GoalStore."
+        )
+
+    cloned = _sanitize_runtime_strings(plan.to_dict())
+    anchors = collect_grounded_anchors(plan.goal)
+
+    # 1. Frontera estructural de Goal
+    goal_dict = cloned.get("goal")
+    n8_goal_exposed = bool(
+        getattr(plan.goal, "_n8_exposed_during_planning", False)
+        or getattr(plan, "n8_context_exposed", False)
+    )
+    if isinstance(goal_dict, dict):
+        ctx_dict = goal_dict.get("context")
+        if isinstance(ctx_dict, dict):
+            ctx_dict["extra"] = sanitize_n8_context_extra_for_persistence(ctx_dict.get("extra"))
+            ctx_dict["hardware"] = _redact_nested_data(ctx_dict.get("hardware") or {})
+            ctx_dict["environment"] = _redact_nested_data(ctx_dict.get("environment") or {})
+
+        baseline = getattr(plan.goal, "_deterministic_baseline", None)
+        if n8_goal_exposed and isinstance(baseline, Mapping):
+            goal_dict["interpreted_summary"] = str(baseline.get("interpreted_summary") or goal_dict.get("raw_input") or "")
+            goal_dict["missing_info"] = [str(x) for x in (baseline.get("missing_info") or [])]
+            if isinstance(goal_dict.get("success_criteria"), dict):
+                goal_dict["success_criteria"]["required_outcomes"] = [
+                    str(x) for x in (baseline.get("required_outcomes") or [])
+                ]
+            if isinstance(ctx_dict, dict):
+                ctx_dict["target_app"] = baseline.get("target_app")
+
+        if n8_goal_exposed and isinstance(goal_dict.get("error_summary"), str):
+            goal_dict["error_summary"] = "Ejecución con incidencias (detalle contextual N8 mantenido solo en RAM)."
+
+    # 2. Frontera estructural de GoalTask (`persistable_skeleton`)
+    task_objs = {t.task_id: t for t in plan.tasks}
+    canonical_dirty = False
+    clean_task_models: list[GoalTask] = []
+
+    for task_dict in cloned.get("tasks") or []:
+        if not isinstance(task_dict, dict):
+            continue
+        tid = str(task_dict.get("task_id") or "")
+        t_obj = task_objs.get(tid)
+        meta = dict(task_dict.get("metadata") or {})
+        meta_cleaned = _redact_nested_data(meta)
+        if not isinstance(meta_cleaned, dict):
+            meta_cleaned = {}
+
+        task_tainted = bool(
+            meta_cleaned.get("n8_influenced")
+            or meta_cleaned.get("provenance_origin") == "llm_with_n8"
+            or (t_obj is not None and (t_obj.n8_influenced or t_obj.provenance_origin == "llm_with_n8"))
+        )
+        exec_tainted = bool(
+            task_tainted
+            or (t_obj is not None and getattr(t_obj, "n8_exposed_at_exec", False))
+            or (
+                isinstance(task_dict.get("execution_evidence"), dict)
+                and task_dict["execution_evidence"].get("n8_exposed_at_exec")
+            )
+            or (
+                task_dict.get("skill_name") is None
+                and getattr(plan, "n8_context_exposed", False)
+            )
+        )
+
+        # Limpieza incondicional de untrusted_envelope si contiene datos de memoria N8.
+        env_raw = task_dict.get("untrusted_envelope")
+        if isinstance(env_raw, dict):
+            if env_raw.get("trust_level") == "untrusted_long_term_memory" or env_raw.get("provenance") == "n8_memory":
+                task_dict["untrusted_envelope"] = None
+            else:
+                task_dict["untrusted_envelope"] = _redact_nested_data(env_raw)
+
+        if task_tainted:
+            stage_label = "replanning" if int(task_dict.get("replan_generation") or 0) > 0 else "planning"
+            skel_title, skel_desc, skel_exp = build_skeleton_task_labels(
+                task_id=tid,
+                skill_name=task_dict.get("skill_name"),
+                stage=stage_label,
+            )
+            grounded_params, _ = separate_grounded_skill_params(
+                task_dict.get("skill_params"),
+                anchors=anchors,
+            )
+            if (
+                task_dict.get("title") != skel_title
+                or task_dict.get("description") != skel_desc
+                or task_dict.get("expected_output") != skel_exp
+                or (task_dict.get("skill_params") or {}) != grounded_params
+            ):
+                canonical_dirty = True
+                task_dict["title"] = skel_title
+                task_dict["description"] = skel_desc
+                task_dict["expected_output"] = skel_exp
+                task_dict["skill_params"] = grounded_params
+
+            safe_meta: dict[str, Any] = {}
+            for mk, mv in meta_cleaned.items():
+                if mk in _SAFE_PERSISTED_TASK_META_KEYS:
+                    safe_meta[mk] = mv
+                elif mk == "target_app" and isinstance(mv, str) and mv.lower() in anchors.get("grounded_scalars", set()):
+                    safe_meta[mk] = mv
+                elif mk == "file_path" and isinstance(mv, str) and mv in (anchors.get("target_paths") or []):
+                    safe_meta[mk] = mv
+            safe_meta["ephemeral_details_in_ram"] = True
+            task_dict["metadata"] = safe_meta
+        else:
+            task_dict["skill_params"] = _redact_nested_data(task_dict.get("skill_params") or {})
+            task_dict["metadata"] = meta_cleaned
+
+        if exec_tainted:
+            if isinstance(task_dict.get("output_summary"), str) and task_dict["output_summary"].strip():
+                task_dict["output_summary"] = (
+                    "Resultado procesado bajo frontera consultiva N8 (contenido mantenido solo en RAM)."
+                )
+            if isinstance(task_dict.get("last_error"), str) and task_dict["last_error"].strip():
+                task_dict["last_error"] = "Error de ejecución aislado por frontera N8 (ver estado en RAM)."
+            if task_dict.get("error_history"):
+                task_dict["error_history"] = ["Error aislado por frontera N8"]
+            if isinstance(task_dict.get("execution_evidence"), dict):
+                ev_clean = dict(task_dict["execution_evidence"])
+                for noisy_k in ("summary", "notes", "upstream_snippets"):
+                    if noisy_k in ev_clean:
+                        ev_clean[noisy_k] = "[RAM-ONLY]"
+                task_dict["execution_evidence"] = _redact_nested_data(ev_clean)
+
+        clean_task_models.append(GoalTask.from_dict(task_dict))
+
+    # Si un llamador construyó un plan con tareas contaminadas sin separarlas previamente,
+    # jamás mutamos silenciosamente un hash aprobado: rechazamos o recalculamos el esqueleto limpio.
+    if canonical_dirty:
+        if cloned.get("approval_bound_hash") is not None:
+            raise GoalPersistenceError(
+                "No se puede persistir un plan aprobado cuya estructura contiene campos N8 sin aislar."
+            )
+        canonical_payload = {
+            "plan_id": cloned["plan_id"],
+            "goal_id": plan.goal.goal_id,
+            "goal_type": plan.goal.goal_type.value,
+            "constraints": Constraints.from_dict((goal_dict or {}).get("constraints")).to_dict(),
+            "version": int(cloned.get("version", 1)),
+            "tasks": [t.canonical_definition_dict() for t in clean_task_models],
+        }
+        serialized = json.dumps(
+            canonical_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        cloned["plan_hash"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    # 3. Frontera en replan_history e history
+    for decision in cloned.get("replan_history") or []:
+        if not isinstance(decision, dict):
+            continue
+        if n8_goal_exposed or "n8" in str(decision.get("strategy") or "").lower():
+            decision["reason"] = "Replanificación ejecutada bajo contexto consultivo N8 (detalle mantenido en RAM)."
+
+    for entry in cloned.get("history") or []:
+        if not isinstance(entry, dict):
+            continue
+        details = entry.get("details")
+        if isinstance(details, dict):
+            cleaned_details = sanitize_wal_payload(details)
+            entry["details"] = cleaned_details
+        if entry.get("event_type") == "plan_replanned" and n8_goal_exposed:
+            entry["message"] = "Replanificación controlada ejecutada (anotaciones N8 mantenidas solo en RAM)."
+            if isinstance(entry.get("details"), dict) and "reason" in entry["details"]:
+                entry["details"]["reason"] = "Replanificación ejecutada bajo contexto consultivo N8 (detalle mantenido en RAM)."
+
+    return cloned
 
 
 def _sanitize_runtime_strings(payload: dict[str, Any]) -> dict[str, Any]:
     """Redacta posibles secretos en mensajes de error, contexto e historial antes de persistir."""
-    cloned = json.loads(json.dumps(payload, ensure_ascii=False))
+    precleaned = strip_volatile_n8_keys_recursive(payload)
+    cloned = json.loads(json.dumps(precleaned, ensure_ascii=False))
     goal_dict = cloned.get("goal")
     if isinstance(goal_dict, dict):
         if isinstance(goal_dict.get("error_summary"), str):
@@ -197,6 +434,8 @@ def _atomic_write_json(target_path: Path, data: dict[str, Any]) -> None:
 class GoalStore:
     """Repositorio aislado para guardar, auditar y recuperar planes de objetivos N6."""
 
+    is_ephemeral: bool = False
+
     def __init__(self, store_dir: Optional[Path | str] = None) -> None:
         self._lock = threading.RLock()
         self.store_dir: Path = _validate_store_dir(store_dir)
@@ -222,7 +461,7 @@ class GoalStore:
                     f"Se rechazó persistir GoalPlan '{plan.plan_id}': hash estructural inválido."
                 )
             snapshot_path = self._plan_snapshot_path(plan.plan_id)
-            sanitized = _sanitize_runtime_strings(plan.to_dict())
+            sanitized = extract_persistable_plan_dict(plan, allow_private_ram=False)
             _atomic_write_json(snapshot_path, sanitized)
 
             if set_active:
@@ -239,11 +478,12 @@ class GoalStore:
         """Agrega un evento incremental redactado al WAL JSONL del plan."""
         with self._lock:
             wal_path = self._plan_wal_path(plan_id)
+            clean_payload = sanitize_wal_payload(payload)
             record = {
                 "timestamp": utc_now_iso(),
                 "plan_id": _sanitize_identifier(plan_id, "plan_id"),
                 "event_type": str(event_type),
-                "payload": payload,
+                "payload": clean_payload,
             }
             # Redactamos antes de serializar para que las claves sensibles sigan siendo estructura,
             # no texto JSON ambiguo que pueda evadir la detección.
@@ -331,3 +571,120 @@ class GoalStore:
                         "updated_at": utc_now_iso(),
                     },
                 )
+
+
+class EphemeralGoalStore:
+    """Almacén N6 exclusivamente en RAM para aislamiento real durante el modo privado.
+
+    Garantías estrictas:
+    - Cero operaciones de disco: jamás crea `.goal.json`, `.wal.jsonl`, `active_goal.json` ni directorios.
+    - Nunca referencia ni muta ninguna instancia persistente de `GoalStore`.
+    - Mantiene compatibilidad con la API de `GoalStore` para crear, actualizar, ejecutar,
+      pausar y reanudar objetivos privados dentro de la misma sesión privada.
+    - Al invocar `clear()` / `discard()` (al salir de `/privado` o finalizar la sesión),
+      elimina íntegramente todos los planes, eventos WAL y punteros privados de RAM.
+    """
+
+    is_ephemeral: bool = True
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.store_dir: Optional[Path] = None
+        self.plans_dir: Optional[Path] = None
+        self.wal_dir: Optional[Path] = None
+        self.index_path: Optional[Path] = None
+        self._plans: dict[str, dict[str, Any]] = {}
+        self._wal_events: dict[str, list[dict[str, Any]]] = {}
+        self._active_index: Optional[dict[str, Any]] = None
+
+    def save_plan(self, plan: GoalPlan, *, set_active: bool = True) -> Path:
+        """Guarda una copia aislada en RAM marcando el plan como privado/no persistible."""
+        with self._lock:
+            if not plan.verify_integrity():
+                raise GoalPersistenceError(
+                    f"Se rechazó guardar GoalPlan efímero '{plan.plan_id}': hash estructural inválido."
+                )
+            plan.is_ephemeral_private = True
+            safe_id = _sanitize_identifier(plan.plan_id, "plan_id")
+            sanitized = extract_persistable_plan_dict(plan, allow_private_ram=True)
+            self._plans[safe_id] = json.loads(json.dumps(sanitized, ensure_ascii=False))
+            if set_active:
+                self._active_index = {
+                    "active_plan_id": safe_id,
+                    "active_goal_id": plan.goal.goal_id,
+                    "goal_status": plan.goal.status.value,
+                    "updated_at": utc_now_iso(),
+                }
+            # Ruta virtual simbólica no utilizable como archivo real (cero escritura en disco).
+            return Path(f"<ephemeral-ram>/plans/{safe_id}.goal.json")
+
+    def append_wal_event(self, plan_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Registra evento WAL exclusivamente en RAM con redacción y limpieza N8."""
+        with self._lock:
+            safe_id = _sanitize_identifier(plan_id, "plan_id")
+            clean_payload = sanitize_wal_payload(payload)
+            record = {
+                "timestamp": utc_now_iso(),
+                "plan_id": safe_id,
+                "event_type": str(event_type),
+                "payload": clean_payload,
+            }
+            bucket = self._wal_events.setdefault(safe_id, [])
+            bucket.append(json.loads(json.dumps(redact_secrets(record), ensure_ascii=False)))
+
+    def load_plan(self, plan_id: str) -> GoalPlan:
+        """Reconstruye desde RAM un `GoalPlan` privado validando `plan_hash`."""
+        with self._lock:
+            safe_id = _sanitize_identifier(plan_id, "plan_id")
+            data = self._plans.get(safe_id)
+            if not isinstance(data, dict):
+                raise GoalPersistenceError(f"No existe ningún plan efímero en RAM con id '{plan_id}'.")
+            cloned = json.loads(json.dumps(data, ensure_ascii=False))
+            plan = GoalPlan.from_dict(cloned)
+            plan.is_ephemeral_private = True
+            return plan
+
+    def load_active_plan(self) -> Optional[GoalPlan]:
+        """Recupera el último plan privado activo en RAM para reanudarlo durante la sesión privada."""
+        with self._lock:
+            if not self._active_index:
+                return None
+            plan_id = self._active_index.get("active_plan_id")
+            if not plan_id:
+                return None
+            return self.load_plan(str(plan_id))
+
+    def list_plan_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._plans.keys())
+
+    def read_wal_events(self, plan_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            safe_id = _sanitize_identifier(plan_id, "plan_id")
+            events = self._wal_events.get(safe_id) or []
+            return [json.loads(json.dumps(ev, ensure_ascii=False)) for ev in events]
+
+    def clear_active_pointer(self) -> None:
+        with self._lock:
+            if self._active_index is not None:
+                self._active_index = {
+                    "active_plan_id": None,
+                    "active_goal_id": None,
+                    "goal_status": None,
+                    "updated_at": utc_now_iso(),
+                }
+
+    def clear(self) -> None:
+        """Descarta todo rastro privado en RAM al salir del modo privado o cerrar sesión."""
+        with self._lock:
+            self._plans.clear()
+            self._wal_events.clear()
+            self._active_index = None
+
+    def discard(self) -> None:
+        """Alias explícito de `clear()` para cierre de sesión privada."""
+        self.clear()
+
+    def active_plan_count(self) -> int:
+        with self._lock:
+            return len(self._plans)

@@ -1242,5 +1242,54 @@ Se implementó **N8.3 Subfase 2** conectando de forma desacoplada las ejecucione
 
 ### 4. Límites y Pendientes (Siguientes Subfases N8.3)
 
-- **Pendiente Subfase 3:** persistencia efímera / referencias N8 en `EphemeralGoalStore` (`GoalStore`).
-- **Pendiente Subfase 4:** integración consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` con `MemorySnapshotGuard` validado por `store_version_token` y pruebas E2E integrales.
+- **Subfase 3 completada *(2026-11-22)*:** integración consultiva N8 <-> N6, `EphemeralGoalStore`, sobres RAM-only `RuntimeN8Envelope`, separación estructural en `GoalStore`, modo privado completo y revalidación estricta.
+- **Pendiente Subfase 4:** `MemorySnapshotGuard` validado por `store_version_token` y validación de vigencia de snapshot en `BrainManager` junto con pruebas E2E de cierre de N8.3.
+
+---
+
+## Proyecto J.A.R.V.I.S. — N8.3 Subfase 3 (2026-11-22): Integración Consultiva N8 <-> N6, Aislamiento de Contexto y Modo Privado
+
+**Estado:** Implementada, verificada y lista para commit sobre `main` (después de `269e09d`). **N8.3 no se declara completa hasta cerrar la Subfase 4.**
+
+### 1. Cambios Implementados
+
+- **Puente consultivo y frontera estructural (`src/brain/goal_memory.py` — nuevo módulo):**
+  - Implementados `GoalMemoryBridge`, `RuntimeN8Envelope`, `RuntimeN8MemoryItem`, `N8MemoryReference`, `RevisionMismatchPolicy.STRICT_INVALIDATE` y `RevalidationReport`.
+  - `_runtime_n8_envelopes` conserva en RAM textos/resúmenes de recuerdos recuperados, redactados en `__repr__` y `__str__` para prevenir fugas en logs o tracebacks, aislados por `plan_id`/`goal_id` y liberados al finalizar/cancelar/reemplazar/salir de modo privado.
+  - En `GoalStore` y eventos WAL solo se admiten referencias trazables mínimas (`ALLOWED_PERSISTED_N8_EXTRA_KEYS`: `n8_query_id`, `n8_memory_refs`, `n8_trust_boundary`, `n8_last_revalidated_at`), excluyendo toda clave prohibida (`FORBIDDEN_PERSISTED_N8_KEYS`), anotaciones RAM LLM+N8 (`ephemeral_annotations`) y parámetros de skills no anclados de forma independiente (`collect_grounded_anchors()` / `separate_grounded_skill_params()`), sin heurísticas n-gram.
+  - Presupuestos por modelo: `NORMAL` (`N8_TEXT_MAX_ITEMS=5`, `N8_TEXT_MAX_CHARS=1500`) y `LOCAL_3B` (`N8_VOICE_MAX_ITEMS=3`, `N8_VOICE_MAX_CHARS=600`), alcance `PROJECT > APP_OR_GAME > GLOBAL` y tolerancia a fallos de N8 sin bloquear N6.
+  - Revalidación obligatoria caso a caso mediante `MemoryEngine.get_memory()` antes de planificación/síntesis/replanificación/reanudación, rechazando `REVOKED`, `EXPIRED` (por estado y timestamp), `SUPERSEDED`, purgados, pendientes y revisiones/hashes modificados sin auto-sustitución. Documentada la semántica de frontera TOCTOU por etapas y reservado `MemorySnapshotGuard` + vigencia en `BrainManager` para la Subfase 4.
+
+- **Almacén efímero en RAM y endurecimiento de persistencia (`src/brain/goal_models.py`, `src/brain/goal_persistence.py`):**
+  - Añadido `EphemeralGoalStore` 100 % en RAM (cambia automáticamente cuando `is_private_mode` está activo, con cero `.goal.json`/`.wal.jsonl`/auxiliares y descarte limpio en `on_private_mode_exited()`). Planes marcados `is_ephemeral_private=True` lanzan `GoalPersistenceError` si intentan guardarse en `GoalStore`.
+  - Endurecidos `GoalStore`, `extract_persistable_plan_dict` y `sanitize_wal_payload` conservando intacto `n7_untrusted_envelope` para N7 y eliminando claves N8/N7 volátiles.
+
+- **Integración real en planificación, supervisión, consola y modo privado (`src/brain/goal_understanding.py`, `src/brain/goal_planner.py`, `src/brain/goal_supervisor.py`, `src/brain/goal_engine.py`, `src/brain/goal_console.py`, `src/memory/console.py`, `main.py`):**
+  - Consulta consultiva integrada en planificación inicial (`create_goal_and_plan`, `clarify_pending_goal`, `interpret_goal`), replanificación (`ExecutionSupervisor._attempt_replan`) y reanudación (`GoalEngine.resume_plan`, comando `/plan reanudar`), evitando consultas redundantes dentro del mismo objetivo.
+  - Propagación estricta de recuerdos únicamente vía `BrainManager.query_raw(..., untrusted_context=...)` (jamás `system_prompt`), subordinados a restricciones N5 (`read_only`, `requires_approval`) y al estado real observado por N7.
+  - Propagación bidireccional de `/privado` (Opción A), `/privado --sin-historial` (bloqueo total + limpieza RAM) y `/privado off` entre consola N8, API Python (`set_private_mode`, `is_private_mode_fn`) y N6 compartiendo una única instancia perezosa de `MemoryEngine` en `main.py` sin importar módulos de voz.
+
+- **Reconciliación de diseño N8.2 -> N8.3 y pruebas integrales (`tests/test_memory_n8_consultative_n6.py`, `tests/test_memory_n8_lifecycle.py`, `tests/test_memory_n8_capture_and_rollback.py`):**
+  - Actualizada la expectativa histórica de N8.2 en `tests/test_memory_n8_lifecycle.py` (`test_private_mode_no_log_or_exception_leaks_and_blocks_persistent_commands`): anteriormente en N8.2 `/goal` se rechazaba durante `/privado` por no existir aún `EphemeralGoalStore`; ahora `/optimizar` y `/rollback` siguen bloqueados mientras `/goal` opera exclusivamente en RAM mediante `EphemeralGoalStore` (bajo `JARVIS_ENV=test` y `JARVIS_TEST_TEMP_ROOT` aislado) sin crear archivos en disco y descartándose en `/privado off`.
+  - Aislado `JARVIS_TEST_TEMP_ROOT` en `tests/test_memory_n8_capture_and_rollback.py` respecto a su directorio temporal de test.
+  - Creada `tests/test_memory_n8_consultative_n6.py` (7 suites integrales sobre EphemeralGoalStore, presupuestos 3B/Normal, sobres RAM, frontera estructural adversarial, límites de confianza N7/N5/`system_prompt`, revalidación completa/TOCTOU/reanudación y modo privado `/privado` vs `--sin-historial` E2E).
+
+### 2. Documentación Actualizada
+
+- [docs/N8_LONG_TERM_MEMORY.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N8_LONG_TERM_MEMORY.md): actualizada cabecera de alcance, tabla de módulos (`src/brain/goal_memory.py`, `src/brain/goal_persistence.py`, `src/memory/console.py`), Sección 11 completa y comandos de verificación.
+- [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N6_AUTONOMOUS_GOAL_ENGINE.md): incorporados `goal_memory.py`, `EphemeralGoalStore`, `/plan reanudar` y regla de integración consultiva N8 / modo privado.
+- `prompts_history.txt`: agregado el prompt exacto de N8.3 Subfase 3 (excluido de Git).
+
+### 3. Verificaciones Realmente Ejecutadas (N8.3 Subfase 3)
+
+- `py_compile` sobre todos los módulos modificados/nuevos y tests de Subfase 3: **OK (código 0)**.
+- Suite aislada N8.3 Subfase 3 (`tests.test_memory_n8_consultative_n6`): **7 pruebas en 13.283s — OK**.
+- Batería combinada N8 + N6 + N7 + N5 (`tests.test_memory_n8_persistence`, `tests.test_memory_n8_lifecycle`, `tests.test_memory_n8_v2_persistence`, `tests.test_memory_n8_capture_and_rollback`, `tests.test_memory_n8_consultative_n6`, `tests.test_goal_engine`, `tests.test_context_awareness_n7`, `tests.test_file_editor_and_chain`, `tests.test_transaction_recovery`): **213 pruebas en 157.946s — OK**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **640 pruebas en 219.348s — OK (0 fallos, 0 errores, 0 omitidas)** (línea base previa 633 -> +7 pruebas nuevas).
+- Verificación de arranque liviano (`import main, src.brain.goal_engine, src.memory` + subprocesos sin voz): **`VOICE_LOADED: []`** (`faster_whisper`, `sounddevice`, `pyttsx3`, `speech_recognition` sin cargar).
+- Integridad de `data/` verificada tras la suite completa: `data/memory_store.json` intacto en **1.218 bytes** (SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`); entradas presentes en `data/`: únicamente `['file_editor_audit.jsonl', 'memory_store.json']` (ausentes `data/experiences.db` y `data/goals/`).
+- Pruebas físicas de hardware de audio/micrófono/altavoz: **no ejecutadas ni aplicables** en esta subfase (sin cambios en módulos de voz; arranque textual validado explícitamente sin carga de audio).
+
+### 4. Límites y Pendientes (Siguiente Subfase N8.3)
+
+- **Pendiente Subfase 4 (cierre N8.3):** `MemorySnapshotGuard` validado por `store_version_token`, validación de vigencia de snapshot en `BrainManager` y pruebas E2E de cierre integral N8.3.

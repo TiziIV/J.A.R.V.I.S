@@ -33,10 +33,11 @@ flowchart TD
 | `src/brain/goal_skill_selector.py` | Validación contra `SkillManager`, compatibilidad de parámetros y clasificación en 3 niveles de riesgo | Nunca inventa tools inexistentes |
 | `src/brain/goal_understanding.py` | Comprensión NL, detección de ambigüedad (`AWAITING_CLARIFICATION`), extracción de restricciones (`read_only`, `offline`) e información faltante | Fallback determinista completo sin internet |
 | `src/brain/goal_planner.py` | Descomposición en subtareas, validación DAG mediante algoritmo de Kahn, cota de profundidad (`max_depth`) y cantidad (`max_tasks`) | Planificar jamás otorga aprobación |
-| `src/brain/goal_persistence.py` | Persistencia aislada con WAL JSONL + snapshots atómicos (`flush` + `fsync` + `os.replace`) y redacción de secretos | Nunca lee ni toca `data/memory_store.json`; confinado bajo `temp/jarvis_test_isolated/` en test |
-| `src/brain/goal_supervisor.py` | Supervisión DAG, prevención de duplicados, timeouts por tarea y globales, reintentos acotados, cancelación y replanificación preservando completadas | Delegación obligatoria a `ChainOrchestrator` + `PolicyEngine` para edición de archivos |
-| `src/brain/goal_engine.py` | Fachada unificada de alto nivel para consola y API Python | Cero carga de módulos de voz (`stt`, `tts`, `recorder`, `faster_whisper`) |
-| `src/brain/goal_console.py` | Parsing e interacción segura de `/goal`, `/plan`, `/plan ejecutar`, `/plan estado`, `/plan cancelar`, `/plan aclarar` | Confirmación explícita por defecto denegatoria (`default-deny`) |
+| `src/brain/goal_persistence.py` | Persistencia aislada con WAL JSONL + snapshots atómicos (`flush` + `fsync` + `os.replace`), redacción de secretos, bloqueo estructural contra contenido N8/N7 volátil (`extract_persistable_plan_dict`, `sanitize_wal_payload`) y `EphemeralGoalStore` 100 % RAM-only en modo privado | Nunca lee ni toca `data/memory_store.json`; confinado bajo `temp/jarvis_test_isolated/` en test |
+| `src/brain/goal_memory.py` | Puente consultivo `GoalMemoryBridge`, sobres volátiles `RuntimeN8Envelope`, referencias mínimas `N8MemoryReference`, revalidación `STRICT_INVALIDATE` y separación de procedencia (`persistable_skeleton` vs `ephemeral_annotations`) | Solo lee vía `MemoryEngine` pública; jamás accede directo a SQLite ni escribe recuerdos |
+| `src/brain/goal_supervisor.py` | Supervisión DAG, prevención de duplicados, timeouts por tarea y globales, reintentos acotados, cancelación, revalidación N8 en replanificación/síntesis y limpieza de sobres RAM | Delegación obligatoria a `ChainOrchestrator` + `PolicyEngine` para edición de archivos |
+| `src/brain/goal_engine.py` | Fachada unificada de alto nivel para consola y API Python con soporte `resume_plan()` y reconciliación automática de modo privado | Cero carga de módulos de voz (`stt`, `tts`, `recorder`, `faster_whisper`) |
+| `src/brain/goal_console.py` | Parsing e interacción segura de `/goal`, `/plan`, `/plan ejecutar`, `/plan reanudar`, `/plan estado`, `/plan cancelar`, `/plan aclarar` | Confirmación explícita por defecto denegatoria (`default-deny`); usa `EphemeralGoalStore` en `/privado` |
 
 ---
 
@@ -89,6 +90,7 @@ stateDiagram-v2
 - `/plan`: muestra el plan activo, subtareas, dependencias, niveles de riesgo y resultados parciales.
 - `/plan aclarar <texto>`: aporta contexto adicional cuando el objetivo quedó en `AWAITING_CLARIFICATION`.
 - `/plan ejecutar`: supervisa la ejecución del plan activo en orden topológico; detiene y solicita confirmación interactiva explícita antes de cualquier operación sensible.
+- `/plan reanudar`: reanuda un plan pausado/pendiente reconstruyendo y revalidando sobres consultivos N8 frescos sin reutilizar resúmenes antiguos.
 - `/plan estado`: informa avance actual, tareas completadas, aprobaciones pendientes y replanificaciones.
 - `/plan cancelar [motivo]`: cancela ordenadamente el objetivo activo preservando el trabajo ya completado en historial.
 
@@ -98,4 +100,5 @@ stateDiagram-v2
 
 - **Memoria conversacional intacta**: `GoalStore` utiliza `data/goals/` en producción y `temp/jarvis_test_isolated/` en pruebas (`JARVIS_ENV=test` / `testing`), sin leer ni modificar `data/memory_store.json`.
 - **Aislamiento de contenido web no confiable**: cualquier salida de `web_extraction` conserva su sobre estructurado en `GoalTask.untrusted_envelope` y se etiqueta explícitamente como dato pasivo durante síntesis posteriores.
+- **Integración consultiva con N8 y Modo Privado (N8.3 Subfase 3)**: `GoalEngine` consulta `GoalMemoryBridge` en planificación, replanificación y reanudación bajo presupuestos `NORMAL`/`LOCAL_3B`, aislando textos en sobres RAM `RuntimeN8Envelope`, persistiendo solo referencias mínimas verificables (`N8MemoryReference`) en `GoalStore` y conmutando automáticamente a `EphemeralGoalStore` en `/privado` y `/privado --sin-historial` (véase [docs/N8_LONG_TERM_MEMORY.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N8_LONG_TERM_MEMORY.md#L196-L220)).
 - **Compatibilidad Multi-Brain**: `BrainManager.query_raw(...)` permite consultar Ollama, Gemini, Codex u OpenAI respetando cadenas de fallback y redacción de secretos sin contaminar el historial conversacional del usuario. El motor determinista garantiza operación completa incluso sin conexión o ante JSON malformado del modelo (*"el modelo propone, el motor valida"*).

@@ -525,6 +525,11 @@ class GoalTask:
         self.finished_at: Optional[str] = finished_at
         self.replan_generation: int = int(replan_generation)
         self.metadata: dict[str, Any] = dict(metadata or {})
+        # Marcadores de procedencia y anotaciones efímeras exclusivas de RAM (jamás serializadas).
+        self.provenance_origin: str = str(self.metadata.get("provenance_origin") or "deterministic")
+        self.n8_influenced: bool = bool(self.metadata.get("n8_influenced", False))
+        self.n8_exposed_at_exec: bool = False
+        self._ephemeral_annotations: dict[str, Any] = {}
         initial_status = status if isinstance(status, TaskStatus) else TaskStatus(str(status))
         if initial_status == TaskStatus.COMPLETED and not self._has_verifiable_evidence(
             self.execution_evidence, self.output_summary
@@ -652,6 +657,15 @@ class GoalTask:
         else:
             self.transition_to(TaskStatus.READY)
 
+    def set_ephemeral_annotation(self, key: str, value: Any) -> None:
+        self._ephemeral_annotations[str(key)] = value
+
+    def get_ephemeral_annotations(self) -> dict[str, Any]:
+        return dict(self._ephemeral_annotations)
+
+    def clear_ephemeral_annotations(self) -> None:
+        self._ephemeral_annotations.clear()
+
     def canonical_definition_dict(self) -> dict[str, Any]:
         """Representación estructural inmutable para calcular integridad criptográfica del plan."""
         return {
@@ -776,6 +790,38 @@ class Goal:
         self.completed_at: Optional[str] = completed_at
         self.cancellation_reason: Optional[str] = cancellation_reason
         self.error_summary: Optional[str] = error_summary
+        # Línea base determinista y anotaciones efímeras RAM-only para frontera estructural N8.
+        self._deterministic_baseline: Optional[dict[str, Any]] = None
+        self._ephemeral_annotations: dict[str, Any] = {}
+        self._n8_exposed_during_planning: bool = False
+
+    def capture_deterministic_baseline(self) -> dict[str, Any]:
+        """Fija la instantánea determinista libre de LLM+N8 como esqueleto persistible."""
+        snapshot = {
+            "raw_input": self.raw_input,
+            "interpreted_summary": self.interpreted_summary,
+            "missing_info": list(self.missing_info),
+            "required_outcomes": list(self.success_criteria.required_outcomes),
+            "target_app": self.context.target_app,
+            "target_paths": list(self.context.target_paths),
+            "urls": list((self.context.extra or {}).get("urls") or []),
+            "error_summary": self.error_summary,
+        }
+        self._deterministic_baseline = snapshot
+        return dict(snapshot)
+
+    @property
+    def deterministic_baseline(self) -> Optional[dict[str, Any]]:
+        return dict(self._deterministic_baseline) if self._deterministic_baseline is not None else None
+
+    def set_ephemeral_annotation(self, key: str, value: Any) -> None:
+        self._ephemeral_annotations[str(key)] = value
+
+    def get_ephemeral_annotations(self) -> dict[str, Any]:
+        return dict(self._ephemeral_annotations)
+
+    def clear_ephemeral_annotations(self) -> None:
+        self._ephemeral_annotations.clear()
 
     @property
     def status(self) -> GoalStatus:
@@ -945,6 +991,10 @@ class GoalPlan:
     replan_history: list[ReplanDecision] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
+    # Metadatos exclusivos de RAM (no se serializan ni entran en `plan_hash`).
+    ephemeral_annotations: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    is_ephemeral_private: bool = field(default=False, repr=False, compare=False)
+    n8_context_exposed: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.plan_hash:

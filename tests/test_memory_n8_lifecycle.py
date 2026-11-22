@@ -499,24 +499,33 @@ class N8LifecycleAndPrivacyTests(unittest.TestCase):
         router_log = buf_router.getvalue()
         self.assertNotIn("DATO_CONFIDENCIAL_BETA_88", router_log)
 
-        # En run_console_session, `/optimizar`, `/rollback` y `/goal` se rechazan durante `/privado`.
+        # En run_console_session, `/optimizar` y `/rollback` se rechazan en `/privado`, mientras
+        # `/goal` opera exclusivamente sobre EphemeralGoalStore en RAM sin tocar disco y se descarta al salir.
         from main import run_console_session
 
         bm = BrainManager(initial_mode="OLLAMA", ollama_brain=_FakeDummyLLM(), skill_manager=skill_mgr, memory=conv_mem)
-        inputs = iter(["/optimizar CyberGame", "/rollback exec-1", "/goal crear archivo nuevo", "/privado off", "salir"])
+        inputs = iter(["/optimizar CyberGame", "/rollback exec-1", "/goal diagnosticar uso de cpu y ram", "/privado off", "/plan", "salir"])
         out_lines: list[str] = []
-        run_console_session(
-            bm,
-            enable_tts=False,
-            input_fn=lambda _: next(inputs),
-            output_fn=out_lines.append,
-            memory_engine=self.engine,
-        )
+        case_tmp = self.work_dir / "console_priv_isolated"
+        case_tmp.mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, {"JARVIS_TEST_TEMP_ROOT": str(case_tmp)}):
+            run_console_session(
+                bm,
+                enable_tts=False,
+                input_fn=lambda _: next(inputs),
+                output_fn=out_lines.append,
+                memory_engine=self.engine,
+            )
         joined_out = "\n".join(out_lines)
         self.assertIn("operación '/optimizar' rechazada durante el modo privado", joined_out.lower())
         self.assertIn("operación '/rollback' rechazada durante el modo privado", joined_out.lower())
-        self.assertIn("operación '/goal' o mutación '/plan' rechazada durante el modo privado", joined_out.lower())
+        self.assertIn("ephemeralgoalstore", joined_out.lower())
+        self.assertIn("no hay ningún objetivo activo actualmente", joined_out.lower())
         self.assertIn("salga de `/privado`", joined_out.lower())
+        goals_dir = case_tmp / "goals"
+        if goals_dir.exists():
+            self.assertEqual(list(goals_dir.rglob("*.goal.json")), [])
+            self.assertEqual(list(goals_dir.rglob("*.wal.jsonl")), [])
 
     # ------------------------------------------------------------------
     # 3. Importación manual de preferencias (segura y sin tocar original)

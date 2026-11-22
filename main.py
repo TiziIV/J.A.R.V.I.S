@@ -137,6 +137,19 @@ def run_console_session(
         )
         return conv_priv or eng_priv
 
+    def _allow_history_in_private() -> bool:
+        if not _is_private_mode_active():
+            return True
+        conv_allow = (
+            brain_manager.memory is None
+            or getattr(brain_manager.memory, "private_allow_history", True) is not False
+        )
+        eng_allow = (
+            memory_engine_instance is None
+            or getattr(memory_engine_instance, "allow_history_reads", True) is not False
+        )
+        return conv_allow and eng_allow
+
     def _ensure_memory_engine() -> Any:
         nonlocal memory_engine_instance
         if memory_engine_instance is None:
@@ -157,7 +170,25 @@ def run_console_session(
             )
             if getattr(brain_manager, "memory_engine", None) is None:
                 brain_manager.memory_engine = memory_engine_instance
+        if goal_console_handler is not None and hasattr(goal_console_handler, "set_memory_engine"):
+            goal_console_handler.set_memory_engine(memory_engine_instance)
         return memory_engine_instance
+
+    def _resolve_existing_memory_engine() -> Optional[Any]:
+        if memory_engine_instance is not None:
+            return memory_engine_instance
+        from config import settings
+
+        if settings.N8_ENABLED and settings.EXPERIENCES_DB_PATH.exists():
+            return _ensure_memory_engine()
+        return None
+
+    def _on_private_mode_changed(enabled: bool, _allow_history: bool) -> None:
+        if goal_console_handler is not None:
+            if not enabled and hasattr(goal_console_handler, "sync_private_mode_exit"):
+                goal_console_handler.sync_private_mode_exit()
+            elif getattr(goal_console_handler, "_goal_engine", None) is not None:
+                goal_console_handler._goal_engine._reconcile_private_state()
 
     def _ensure_memory_capture_service() -> Optional[Any]:
         nonlocal memory_capture_instance
@@ -190,6 +221,7 @@ def run_console_session(
                 memory_engine=_ensure_memory_engine(),
                 conversation_memory=brain_manager.memory,
                 skill_manager=getattr(brain_manager, "skill_manager", None),
+                on_private_mode_changed=_on_private_mode_changed,
                 input_fn=input_fn,
                 output_fn=output_fn,
             )
@@ -253,6 +285,9 @@ def run_console_session(
                 context_engine=_ensure_context_engine(),
                 ensure_orchestrator_fn=_ensure_orchestrator,
                 memory_capture_service=_ensure_memory_capture_service(),
+                memory_engine=_resolve_existing_memory_engine(),
+                is_private_mode_fn=_is_private_mode_active,
+                allow_history_in_private_fn=_allow_history_in_private,
                 input_fn=input_fn,
                 output_fn=output_fn,
             )
@@ -497,20 +532,11 @@ def run_console_session(
                     )
                 continue
 
-            # 4.5 Comandos N6 (/goal y /plan) -> motor autónomo de objetivos con confirmación explícita
+            # 4.5 Comandos N6 (/goal y /plan) -> en modo privado opera sobre EphemeralGoalStore en RAM
             if lowered == "/goal" or lowered.startswith("/goal ") or lowered == "/plan" or lowered.startswith("/plan "):
-                if _is_private_mode_active():
-                    goal_sub = text[len("/plan") :].strip().lower() if lowered.startswith("/plan") else ""
-                    # Solo las consultas de lectura sobre un plan previo quedan permitidas; toda escritura WAL se rechaza.
-                    if lowered == "/goal" or lowered.startswith("/goal ") or goal_sub not in {"estado", "ver", "mostrar", ""}:
-                        output_fn(
-                            "JARVIS: Operación '/goal' o mutación '/plan' rechazada durante el modo privado para "
-                            "evitar escribir registros persistentes (.goal.json / .wal.jsonl). Salga de `/privado` primero, señor."
-                        )
-                        continue
                 handler = _ensure_goal_handler()
                 goal_reply = handler.handle_command(text, input_fn=input_fn, output_fn=output_fn)
-                if tts_active and tts_engine is not None and goal_reply:
+                if tts_active and tts_engine is not None and goal_reply and not _is_private_mode_active():
                     try:
                         _speak_blocking(tts_engine, goal_reply)
                     except Exception:
@@ -576,6 +602,11 @@ def run_console_session(
                     logger.debug(f"Aviso en locución TTS de consola: {speak_err}")
 
     finally:
+        if goal_console_handler is not None and _is_private_mode_active():
+            try:
+                goal_console_handler.sync_private_mode_exit()
+            except Exception:
+                pass
         if tts_engine is not None:
             try:
                 tts_engine.close()

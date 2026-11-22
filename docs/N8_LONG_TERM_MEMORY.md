@@ -1,8 +1,8 @@
-# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Subfases 1 y 2)
+# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Subfases 1, 2 y 3)
 
 > [!IMPORTANT]
-> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración), **N8.3 Subfase 1** (migración SQLite v1 -> v2, idempotencia estricta para `EXECUTION_VERIFIED`, `store_version_token` monótono e `invalidate_by_execution()`) y **N8.3 Subfase 2** (`capture_contracts.py` v2.0, `N5ExecutionEvidenceAdapter`, `N6GoalEvidenceAdapter`, `ExperienceCaptureService` desacoplado e invalidación automática por rollback N5 confirmado + tombstone).
-> Permanecen reservadas y sin activar las subfases siguientes de **N8.3** (`EphemeralGoalStore` / referencias N8 en `GoalStore`, integración consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` y `MemorySnapshotGuard` validado por `store_version_token`), así como embeddings y consolidación por LLM.
+> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración), **N8.3 Subfase 1** (migración SQLite v1 -> v2, idempotencia estricta para `EXECUTION_VERIFIED`, `store_version_token` monótono e `invalidate_by_execution()`), **N8.3 Subfase 2** (`capture_contracts.py` v2.0, `N5ExecutionEvidenceAdapter`, `N6GoalEvidenceAdapter`, `ExperienceCaptureService` desacoplado e invalidación automática por rollback N5 confirmado + tombstone) y **N8.3 Subfase 3** (`GoalMemoryBridge` con sobres RAM-only `RuntimeN8Envelope`, `EphemeralGoalStore` 100 % en RAM para `/privado`, separación estructural `persistable_skeleton` vs `ephemeral_annotations`, revalidación estricta ante `REVOKED`/`EXPIRED`/purga/cambio de revisión y límites `untrusted_long_term_memory` sobre N6).
+> Permanecen reservadas y sin activar la **Subfase 4 de N8.3** (`MemorySnapshotGuard` validado por `store_version_token`, validación de vigencia de snapshot en `BrainManager` y pruebas E2E de Subfase 4), así como embeddings y consolidación por LLM. **N8.3 aún no se declara completa hasta cerrar la Subfase 4.**
 
 ---
 
@@ -42,7 +42,9 @@ flowchart LR
 | [engine.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/engine.py) | N8.2/N8.3-S1/S2 | API central `MemoryEngine`: coordinación de políticas, modo privado, ciclo de vida completo, `get_store_version_token()`, `invalidate_by_execution()`, tombstones de rollback (`is_execution_invalidated()`, `mark_execution_rollback_tombstone()`), backups/restauración e importación manual read-only desde JSON legacy. |
 | [capture_contracts.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/capture_contracts.py) | N8.3-S2 | Contrato versionado `CAPTURE_CONTRACT_VERSION="2.0"`, referencias inmutables (`VerifiedOperationReference`), validación de verificadores autorizados (`AUTHORIZED_VERIFIERS_BY_LAYER`), digests `evidence_sha256` / `contract_sha256` deterministas y rechazo de `verified=True`, LLM/síntesis, transcripts, web cruda o secretos (`MemoryEvidenceContractError`). |
 | [capture.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/capture.py) | N8.3-S2 | `N5ExecutionEvidenceAdapter`, `N6GoalEvidenceAdapter` (`COMPLETED` / `PARTIAL` tarea a tarea verificada) y coordinador desacoplado `ExperienceCaptureService` con puertas de privacidad/flags, aislamiento total de fallos e invalidación/tombstone por rollback N5 confirmado. |
-| [console.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/console.py) | N8.2 | Comandos de consola `/memoria`, `/privado` e `/incognito` con validación de argumentos, vistas previas y confirmación interactiva antes de acciones destructivas. |
+| [console.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/console.py) | N8.2/N8.3-S3 | Comandos de consola `/memoria`, `/privado` e `/incognito` con callback `on_private_mode_changed` hacia N6, validación de argumentos, vistas previas y confirmación interactiva antes de acciones destructivas. |
+| [goal_memory.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/brain/goal_memory.py) | N8.3-S3 | Puente consultivo `GoalMemoryBridge`: sobres `RuntimeN8Envelope` en RAM con redacción en `__repr__`/`__str__`, referencias persistibles mínimas `N8MemoryReference`, revalidación `STRICT_INVALIDATE` vía `MemoryEngine.get_memory`, separación estructural `persistable_skeleton` vs `ephemeral_annotations` y sanitización WAL/JSON. |
+| [goal_persistence.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/brain/goal_persistence.py) | N6/N8.3-S3 | `GoalStore` endurecido con saneado recursivo contra texto N8/N7 volátil (`extract_persistable_plan_dict` / `sanitize_wal_payload`) y `EphemeralGoalStore` 100 % RAM-only para modo privado. |
 
 ---
 
@@ -189,10 +191,36 @@ La protección no depende de instrucciones al modelo LLM sino de controles estru
    - `ChainOrchestrator` dispara `handle_n5_rollback_confirmed()` únicamente cuando `rollback_execution()` o `recover_pending_transactions()` confirman transición real a `ROLLED_BACK` (nunca en `ROLLBACK_FAILED` ni ante conflictos externos).
    - `ExperienceCaptureService` ejecuta invalidación idempotente vía `MemoryEngine.invalidate_by_execution(execution_id)` y registra tombstone persistente en `memory_audit` (`mark_execution_rollback_tombstone()` / `is_execution_invalidated()`) para impedir capturas tardías o en paralelo incluso tras reiniciar el proceso. También está bloqueada cuando el modo privado está activo (`blocked_private_mode`).
 
+---
+
+## 11. Integración Consultiva con N6, Aislamiento de Contexto y Modo Privado (N8.3 Subfase 3)
+
+1. **`EphemeralGoalStore` (`src/brain/goal_persistence.py`):**
+   - Almacén 100 % en RAM con interfaz equivalente a `GoalStore` (`save_plan`, `append_wal_event`, `load_plan`, `load_active_plan`, `list_plan_ids`, `read_wal_events`, `clear_active_pointer`, `clear`, `discard`).
+   - En modo privado (`/privado`, `/privado --sin-historial` o vía API programática `set_private_mode` / `is_private_mode_fn`), `GoalEngine.active_goal_store` cambia automáticamente a `EphemeralGoalStore`, evitando generar archivos `.goal.json`, `.wal.jsonl` ni temporales auxiliares en `data/goals/` o `temp/jarvis_test_isolated/`.
+   - Al salir del modo privado (`on_private_mode_exited()` / `/privado off`) o cerrar el proceso, los objetivos privados se descartan por completo sin transferencia a `GoalStore` persistente; los planes `is_ephemeral_private=True` quedan bloqueados para persistirse en `GoalStore`.
+
+2. **Integración consultiva acotada en el ciclo de vida de N6 (`src/brain/goal_memory.py` y `src/brain/goal_engine.py`):**
+   - Disparo en los puntos reales de planificación inicial (`create_goal_and_plan` / `clarify_pending_goal` / `interpret_goal`), replanificación (`ExecutionSupervisor._attempt_replan`) y reanudación (`resume_plan`, consola `/plan reanudar`), evitando consultas duplicadas innecesarias sobre un mismo objetivo.
+   - Ámbitos derivados de contexto (`PROJECT` > `APP_OR_GAME` > `GLOBAL`) y presupuestos diferenciados según el perfil del modelo activo: `NORMAL` (`N8_TEXT_MAX_ITEMS=5`, `N8_TEXT_MAX_CHARS=1500`) y modelos locales pequeños tipo 3B (`OLLAMA_MODEL` / `3b`, perfil `LOCAL_3B`: `N8_VOICE_MAX_ITEMS=3`, `N8_VOICE_MAX_CHARS=600`). Todo error de consulta o revalidación en N8 se aísla sin bloquear la planificación o ejecución de N6.
+
+3. **Sobres volátiles RAM-only y frontera estructural de persistencia:**
+   - `GoalMemoryBridge` almacena los contenidos recuperados en `_runtime_n8_envelopes` (`RuntimeN8Envelope` / `RuntimeN8MemoryItem`), con redacción en `__repr__`/`__str__` para no filtrar texto de memoria en logs o excepciones, aislados por `plan_id`/`goal_id` y liberados al completar, cancelar o limpiar el objetivo.
+   - En `GoalStore` (y en copias WAL/snapshot) solo se admiten referencias mínimas trazables en `goal.context.extra` (`ALLOWED_PERSISTED_N8_EXTRA_KEYS`: `n8_query_id`, `n8_memory_refs`, `n8_trust_boundary`, `n8_last_revalidated_at`). Todo campo prohibido (`FORBIDDEN_PERSISTED_N8_KEYS`), anotaciones LLM+N8 (`ephemeral_annotations`), paráfrasis y parámetros de skills no anclados independientemente en `collect_grounded_anchors()` (`separate_grounded_skill_params()`) se excluyen determinísticamente sin depender de heurísticas n-gram y sin romper `n7_untrusted_envelope` de N7.
+
+4. **Revalidación estricta y semántica TOCTOU / revocación entre planificación y ejecución:**
+   - Antes de consumir recuerdos en síntesis o planificación LLM (`_prepare_n8_context_for_execution`, `_execute_internal_synthesis`, `_attempt_replan`, `resume_plan`), `GoalMemoryBridge.revalidate_references()` consulta caso a caso la API pública `MemoryEngine.get_memory()` (sin acceso SQL directo desde N6).
+   - Se excluyen con registro trazable (`RevalidationReport`) los registros `REVOKED`, `EXPIRED` (por estado o timestamp vencido `expires_at`), `SUPERSEDED`, purgados/inexistentes, `pending_confirmation=True`, o con revisión/hash modificados bajo `RevisionMismatchPolicy.STRICT_INVALIDATE`, **sin auto-sustituir jamás** un recuerdo descartado por otro similar.
+   - **Semántica de frontera TOCTOU / revocación en Subfase 3:** la revalidación verifica frescura al iniciar cada etapa/consumo dentro de N6 y refleja de inmediato revocaciones o cambios ocurridos en `MemoryEngine` antes del consumo siguiente; las operaciones de herramientas deterministas ya en curso con parámetros anclados en el usuario/N7 no leen N8 en tiempo real. La verificación atómica global por `store_version_token` (`MemorySnapshotGuard` y vigencia de snapshot en `BrainManager`) queda reservada para **N8.3 Subfase 4**.
+
+5. **Modo privado y frontera de confianza:**
+   - `/privado` (Opción A: lectura histórica previa permitida, cero escrituras N8, `EphemeralGoalStore` en RAM) y `/privado --sin-historial` (lectura y escritura bloqueadas, limpieza inmediata de sobres RAM y cero inyección en prompts) aplican tanto por consola como en API Python directa (`MemoryEngine` + `GoalEngine`).
+   - Los recuerdos revalidados se inyectan exclusivamente por `BrainManager.query_raw(..., untrusted_context=...)` marcados con `trust_boundary="untrusted_long_term_memory"`, subordinados al `system_prompt`, a las restricciones de N5 (`read_only`, `requires_approval`) y al estado actual observado por N7 (si N7 observa otra GPU/entorno, prevalece N7).
+
 ### Ejecución de tests
 
 ```powershell
 $env:JARVIS_ENV = "test"
-.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback -v
+.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback tests.test_memory_n8_consultative_n6 tests.test_goal_engine -v
 .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q
 ```

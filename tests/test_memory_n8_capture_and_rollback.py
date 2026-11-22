@@ -1073,7 +1073,9 @@ class N8CaptureContractsAdaptersAndRollbackTests(unittest.TestCase):
             mod: (mod in sys.modules)
             for mod in ("faster_whisper", "sounddevice", "pyttsx3", "speech_recognition")
         }
-        with patch.object(settings, "N8_AUTO_CAPTURE_ENABLED", True):
+        with patch.object(settings, "N8_AUTO_CAPTURE_ENABLED", True), patch.dict(
+            os.environ, {"JARVIS_TEST_TEMP_ROOT": str(self.work_dir)}
+        ):
             cap_svc = ExperienceCaptureService(
                 memory_engine=self.engine,
                 enabled=True,
