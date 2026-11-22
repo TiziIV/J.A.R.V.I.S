@@ -65,12 +65,14 @@ class GoalEngine:
         context_engine: Optional["ContextAwarenessEngine"] = None,
         goal_store: Optional[GoalStore] = None,
         limits: Optional[GoalEngineLimits] = None,
+        memory_capture_service: Optional[Any] = None,
         use_ai: bool = False,
     ) -> None:
         self.skill_manager: SkillManager = skill_manager or SkillManager()
         self.brain_manager: Optional["BrainManager"] = brain_manager
         self.chain_orchestrator: Optional["ChainOrchestrator"] = chain_orchestrator
         self.context_engine: Optional["ContextAwarenessEngine"] = context_engine
+        self.memory_capture_service: Optional[Any] = memory_capture_service
         self.limits: GoalEngineLimits = limits or GoalEngineLimits()
 
         self.skill_selector: GoalSkillSelector = GoalSkillSelector(self.skill_manager)
@@ -96,10 +98,16 @@ class GoalEngine:
             chain_orchestrator=chain_orchestrator,
             goal_store=self.goal_store,
             evaluator=self.evaluator,
+            memory_capture_service=memory_capture_service,
         )
 
         self._active_plan: Optional[GoalPlan] = None
         self._pending_clarification_goal: Optional[Goal] = None
+
+    def set_memory_capture_service(self, memory_capture_service: Optional[Any]) -> None:
+        """Conecta desacopladamente el coordinador de captura N8 al supervisor N6."""
+        self.memory_capture_service = memory_capture_service
+        self.supervisor.set_memory_capture_service(memory_capture_service)
 
     def set_chain_orchestrator(self, chain_orchestrator: "ChainOrchestrator") -> None:
         """Conecta tardíamente `ChainOrchestrator` cuando el usuario lo inicializa."""

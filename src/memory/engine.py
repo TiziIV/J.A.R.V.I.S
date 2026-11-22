@@ -297,6 +297,26 @@ class MemoryEngine:
             private_mode=self.is_private_mode,
         )
 
+    def is_execution_invalidated(self, execution_id: str) -> bool:
+        """Consulta en SQLite si una ejecución fue revertida o invalidada previamente."""
+        return self.store.is_execution_invalidated(execution_id)
+
+    def mark_execution_rollback_tombstone(
+        self,
+        execution_id: str,
+        *,
+        reason: str = "rollback_execution",
+        actor: str = "system",
+    ) -> bool:
+        """Registra marca persistente de rollback confirmado respetando privacidad y bloqueo."""
+        self._assert_write_allowed()
+        return self.store.mark_execution_rollback_tombstone(
+            execution_id,
+            reason=reason,
+            actor=actor,
+            private_mode=self.is_private_mode,
+        )
+
     def purge_memory(
         self,
         memory_id: str,

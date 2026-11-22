@@ -1062,6 +1062,7 @@ class ChainOrchestrator:
         max_provider_response_chars: int = 16_000,
         transaction_manager: Optional[TransactionManager] = None,
         journal_dir: Optional[Path | str] = None,
+        memory_capture_service: Optional[Any] = None,
     ) -> None:
         self.file_editor: FileEditorSkill = file_editor or FileEditorSkill()
         self.policy_engine: PolicyEngine = PolicyEngine(self.file_editor)
@@ -1070,6 +1071,7 @@ class ChainOrchestrator:
         self.skill_manager = skill_manager
         self.provider_timeout_sec = float(provider_timeout_sec)
         self.max_provider_response_chars = int(max_provider_response_chars)
+        self.memory_capture_service: Optional[Any] = memory_capture_service
 
         default_journal_dir: Optional[Path | str] = journal_dir
         if default_journal_dir is None and self.file_editor.backup_dir is not None:
@@ -1084,6 +1086,10 @@ class ChainOrchestrator:
         # Token opaco, de un solo uso y ligado a la aprobación; la garantía es local al proceso.
         self._approval_tokens: dict[str, dict[str, Any]] = {}
         self._approval_lock = threading.Lock()
+
+    def set_memory_capture_service(self, capture_service: Optional[Any]) -> None:
+        """Asocia o reemplaza de forma desacoplada el coordinador de captura/invalidación N8."""
+        self.memory_capture_service = capture_service
 
     def _purge_approval_tokens_locked(self) -> None:
         """Retira tokens consumidos o vencidos; requiere mantener `_approval_lock`."""
@@ -1123,6 +1129,20 @@ class ChainOrchestrator:
                     self.rehydrate_execution(rep.execution_id)
                 except Exception:
                     pass
+                if (
+                    self.memory_capture_service is not None
+                    and getattr(rep, "final_state", None) == TransactionState.ROLLED_BACK.value
+                    and getattr(rep, "decision", None) == "ROLLED_BACK_TO_ORIGINAL"
+                ):
+                    try:
+                        self.memory_capture_service.handle_n5_rollback_confirmed(
+                            execution_id=rep.execution_id,
+                            recovery_report=rep,
+                            reason="n5_recovery_rollback_confirmed",
+                            actor="chain_orchestrator_recovery",
+                        )
+                    except Exception:
+                        pass
         return reports
 
     def rehydrate_execution(self, execution_id: str) -> Optional[ChainExecutionRecord]:
@@ -3214,7 +3234,7 @@ class ChainOrchestrator:
             fully_completed=fully_completed,
         )
         self.transition_state(plan.execution_id, ChainState.COMPLETED)
-        return {
+        exec_summary: dict[str, Any] = {
             "plan_id": plan.plan_id,
             "execution_id": plan.execution_id,
             "state": record.state.value,
@@ -3230,6 +3250,18 @@ class ChainOrchestrator:
                 "Nota: el impacto real en FPS o estabilidad debe comprobarse ejecutando la aplicación."
             ),
         }
+        if self.memory_capture_service is not None:
+            try:
+                exec_txs = self.transaction_manager.get_transactions_for_execution(plan.execution_id)
+                self.memory_capture_service.handle_n5_execution_completed(
+                    record=record,
+                    summary=exec_summary,
+                    transaction_records=exec_txs,
+                )
+            except Exception:
+                # Aislamiento obligatorio: fallos en N8 jamás alteran el éxito verificado de N5.
+                pass
+        return exec_summary
 
     def _apply_single_operation(
         self,
@@ -3611,11 +3643,24 @@ class ChainOrchestrator:
                 record.operation_states = record.plan.get_operation_states()
             record.rollback_summary = {"restored_count": len(restored_files), "all_restored": True,
                                        "restored_files": list(restored_files)}
-            return {
+            rb_result: dict[str, Any] = {
                 "execution_id": execution_id,
                 "state": record.state.value,
                 "restored_files": restored_files,
             }
+            if self.memory_capture_service is not None:
+                try:
+                    self.memory_capture_service.handle_n5_rollback_confirmed(
+                        execution_id=execution_id,
+                        record=record,
+                        rollback_result=rb_result,
+                        reason="n5_rollback_confirmed",
+                        actor="chain_orchestrator",
+                    )
+                except Exception:
+                    # Aislamiento obligatorio: errores N8 nunca alteran ni revierten el rollback N5.
+                    pass
+            return rb_result
 
     # ------------------------------------------------------------------
     # Utilidades de extremo a extremo para consola interactiva (/optimizar)

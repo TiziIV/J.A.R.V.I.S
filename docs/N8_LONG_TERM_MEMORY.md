@@ -1,8 +1,8 @@
-# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Subfase 1)
+# J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Subfases 1 y 2)
 
 > [!IMPORTANT]
-> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración) y **N8.3 Subfase 1** (migración SQLite v1 -> v2, idempotencia estricta para `EXECUTION_VERIFIED`, `store_version_token` monótono e `invalidate_by_execution()`).
-> Permanecen reservadas y sin activar las subfases siguientes de **N8.3** (`ExperienceCaptureService` en N5/N6, captura automática `N8_AUTO_CAPTURE_ENABLED`, `EphemeralGoalStore`, integración en `GoalEngine`/`BrainManager` y `MemorySnapshotGuard`), así como embeddings y consolidación por LLM.
+> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración), **N8.3 Subfase 1** (migración SQLite v1 -> v2, idempotencia estricta para `EXECUTION_VERIFIED`, `store_version_token` monótono e `invalidate_by_execution()`) y **N8.3 Subfase 2** (`capture_contracts.py` v2.0, `N5ExecutionEvidenceAdapter`, `N6GoalEvidenceAdapter`, `ExperienceCaptureService` desacoplado e invalidación automática por rollback N5 confirmado + tombstone).
+> Permanecen reservadas y sin activar las subfases siguientes de **N8.3** (`EphemeralGoalStore` / referencias N8 en `GoalStore`, integración consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` y `MemorySnapshotGuard` validado por `store_version_token`), así como embeddings y consolidación por LLM.
 
 ---
 
@@ -37,9 +37,11 @@ flowchart LR
 | [models.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/models.py) | N8.1/N8.2/N8.3-S1 | Enumeraciones (`MemoryAuditAction.REJECT_IDEMPOTENCY_CONFLICT`), máquina de estados, excepciones tipadas (`MemoryIdempotencyConflictError`, etc.) y contratos DTO (`ExecutionVerificationEvidence` con `canonical_unit_id`, `MemoryCreateInput`, `MemoryRecord`, `ExecutionInvalidationResult`, `MemoryRetrievalResult` y `StoreStats` con `store_version_token`). |
 | [policy.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/policy.py) | N8.1/N8.2/N8.3-S1 | `MemoryPolicy`, `sanitize_memory_text()`, detección sin exposición de secretos (`assert_no_secrets` + `redact_secrets`), bloqueo de `INFERENCE`, validación `EXECUTION_VERIFIED`, derivación determinista `compute_default_canonical_unit_id()` / `compute_execution_idempotency_key()` y sandbox `JARVIS_ENV=test`. |
 | [migrations.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/migrations.py) | N8.1/N8.3-S1 | Esquema SQLite versionado v1 -> v2 (`canonical_unit_id`, `idempotency_key`, reconstrucción de `memory_audit`, índices de idempotencia/ejecución, `store_version_epoch` / `store_version_seq` / `store_version_token`), tokenizer `unicode61 remove_diacritics 2` y pragmas `WAL` + `synchronous=FULL` + `secure_delete=ON` + `foreign_keys=ON`. |
-| [store.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/store.py) | N8.1/N8.2/N8.3-S1 | `ExperienceStoreLock` y `ExperienceStore`: CRUD transaccional (`BEGIN IMMEDIATE`), idempotencia estricta `EXECUTION_VERIFIED` sin fusión entre ejecuciones, dedupe convencional por `content_fingerprint`, actualización atómica de `store_version_token`, `invalidate_by_execution()`, backups y restauración compatible v1/v2 con verificación inmediata. |
+| [store.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/store.py) | N8.1/N8.2/N8.3-S1/S2 | `ExperienceStoreLock` y `ExperienceStore`: CRUD transaccional (`BEGIN IMMEDIATE`), idempotencia estricta `EXECUTION_VERIFIED` sin fusión entre ejecuciones, dedupe convencional por `content_fingerprint`, actualización atómica de `store_version_token`, `invalidate_by_execution()`, tombstones persistentes de rollback (`is_execution_invalidated()`, `mark_execution_rollback_tombstone()`), backups y restauración compatible v1/v2 con verificación inmediata. |
 | [retriever.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/retriever.py) | N8.2/N8.3-S1 | Recuperación determinista FTS5/BM25 + fallback SQL `LIKE` junto con lectura atómica del `store_version_token` del snapshot recuperado. |
-| [engine.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/engine.py) | N8.2/N8.3-S1 | API central `MemoryEngine`: coordinación de políticas, modo privado, ciclo de vida completo, `get_store_version_token()`, `invalidate_by_execution()`, backups/restauración e importación manual read-only desde JSON legacy. |
+| [engine.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/engine.py) | N8.2/N8.3-S1/S2 | API central `MemoryEngine`: coordinación de políticas, modo privado, ciclo de vida completo, `get_store_version_token()`, `invalidate_by_execution()`, tombstones de rollback (`is_execution_invalidated()`, `mark_execution_rollback_tombstone()`), backups/restauración e importación manual read-only desde JSON legacy. |
+| [capture_contracts.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/capture_contracts.py) | N8.3-S2 | Contrato versionado `CAPTURE_CONTRACT_VERSION="2.0"`, referencias inmutables (`VerifiedOperationReference`), validación de verificadores autorizados (`AUTHORIZED_VERIFIERS_BY_LAYER`), digests `evidence_sha256` / `contract_sha256` deterministas y rechazo de `verified=True`, LLM/síntesis, transcripts, web cruda o secretos (`MemoryEvidenceContractError`). |
+| [capture.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/capture.py) | N8.3-S2 | `N5ExecutionEvidenceAdapter`, `N6GoalEvidenceAdapter` (`COMPLETED` / `PARTIAL` tarea a tarea verificada) y coordinador desacoplado `ExperienceCaptureService` con puertas de privacidad/flags, aislamiento total de fallos e invalidación/tombstone por rollback N5 confirmado. |
 | [console.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/src/memory/console.py) | N8.2 | Comandos de consola `/memoria`, `/privado` e `/incognito` con validación de argumentos, vistas previas y confirmación interactiva antes de acciones destructivas. |
 
 ---
@@ -132,7 +134,7 @@ La protección no depende de instrucciones al modelo LLM sino de controles estru
 - **Concurrencia real:** Todas las operaciones (`create`, `revise`, `confirm`, `revoke`, `purge`, `backup`, `restore`, `verify_integrity`, `retrieve`) comparten `ExperienceStoreLock` (RLock modular por ruta canónica + `msvcrt.locking` en Windows / `fcntl.flock` en POSIX). Validado mediante subprocesos independientes reales en `writer-vs-purge` y `writer-vs-restore`.
 - **Protección Git:** `.gitignore` y `src/utils/git_guard.py` (`GitSafetyGuard`) bloquean `data/`, `experiences.db*`, `-wal`, `-shm`, `-journal`, `.db.lock`, `.backup.json`, `.db.sha256`, `data/backups/memory/`, `.restore_staging_*`, `.pre_restore_*` y `*.corrupt.*`.
 - **Aislamiento de tests (`JARVIS_ENV=test`):** redirige DB y backups bajo `temp/jarvis_test_isolated/` y prohíbe acceder a `data/memory_store.json`, `data/experiences.db` o `data/backups/` reales.
-- **Límites respecto a subfases siguientes de N8.3:** todavía no se integran `ExperienceCaptureService`, captura automática (`N8_AUTO_CAPTURE_ENABLED=False`), referencias N8 en `GoalStore` / `EphemeralGoalStore`, cambios en `GoalEngine` / `BrainManager` / `ExecutionSupervisor`, `MemorySnapshotGuard`, embeddings ni consolidación LLM.
+- **Límites respecto a subfases siguientes de N8.3:** la captura verificada automática y la invalidación por rollback ya están implementadas en Subfase 2 (`N8_AUTO_CAPTURE_ENABLED` continúa en `False` por defecto en producción); todavía permanecen sin implementar ni integrar `EphemeralGoalStore` / referencias N8 en `GoalStore` (Subfase 3), la recuperación consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` con `MemorySnapshotGuard` validado por `store_version_token` (Subfase 4), los embeddings y la consolidación por LLM.
 
 ---
 
@@ -166,10 +168,31 @@ La protección no depende de instrucciones al modelo LLM sino de controles estru
    - Repetir la llamada sobre la misma ejecución es idempotente (sin revocaciones adicionales y sin modificar `store_version_token`).
    - Está bloqueada en modo privado (`MemoryPrivateModeError`). Un retry idempotente posterior con la misma clave devuelve el registro `REVOKED` sin resucitarlo.
 
+---
+
+## 10. Contratos de Evidencia, Captura Verificada N5/N6 e Invalidación por Rollback (N8.3 Subfase 2)
+
+1. **Contrato estricto y versionado (`src/memory/capture_contracts.py`):**
+   - Define `CAPTURE_CONTRACT_VERSION = "2.0"`, `VerifiedOperationReference` y `VerifiedExecutionEvidenceContract` (`@dataclass(frozen=True)`), deserialización estricta con rechazo de campos desconocidos, listas blancas de verificadores objetivos (`AUTHORIZED_VERIFIERS_BY_LAYER`) y listas negras de marcadores especulativos/LLM/síntesis (`FORBIDDEN_VERIFIER_MARKERS`, `FORBIDDEN_EVIDENCE_KEYS`).
+   - Rechaza explícitamente booleanos simples (`{"verified": True}`), transcripciones, prompts, salidas crudas LLM/web (`web_extraction` nunca persiste HTML/texto externo) y secretos (`MemoryEvidenceContractError` / `MemoryPolicyError`).
+   - Calcula `evidence_sha256` y `contract_sha256` deterministas mediante JSON canónico y exige verificación post-escritura con `after_sha256` en toda referencia N5.
+
+2. **Adaptadores desacoplados N5 y N6 (`src/memory/capture.py`):**
+   - `N5ExecutionEvidenceAdapter`: adapta registros reales de `ChainOrchestrator` únicamente si `state == COMPLETED`, `approval_granted=True`, `approval_hash` SHA-256 presente, operaciones aplicadas (`APPLIED`) con verificación objetiva confirmada (`after_sha256`) y sin `rolled_back_at` ni ejecución ya invalidada.
+   - `N6GoalEvidenceAdapter`: evalúa planes de `GoalEngine` / `ExecutionSupervisor` (`COMPLETED` y `PARTIAL`) tarea a tarea mediante `AdaptationReport`, aceptando solo tareas `TaskStatus.COMPLETED` con verificador autorizado (`ExecutionSupervisorSkillVerifier`, `ExecutionSupervisorChainVerifier`, `ChainOrchestratorVerifier`), IDs consistentes (`task_id`/`plan_id`/`goal_id`), entrada `task_completed` real en `plan.history` y artefactos verificables. Nunca marca un plan `PARTIAL` como éxito global ni acepta `internal_synthesis` o texto libre del modelo. Cuando una tarea N6 delega en N5 (`chain_execution_id`), enlaza `source_execution_id` al `chain_execution_id` real.
+
+3. **Coordinador `ExperienceCaptureService` e invariantes de seguridad:**
+   - Captura exclusivamente con `MemorySource.EXECUTION_VERIFIED` y `MemoryCategory.FACT` bajo puertas estrictas: `N8_ENABLED`, `N8_AUTO_CAPTURE_ENABLED` (apagada por defecto), rechazo absoluto en modo privado (`is_private_mode`) sin leer ni contaminar buffers privados en RAM, deduplicación/idempotencia v2 y bloqueo de ejecuciones revertidas.
+   - Todo fallo de SQLite, bloqueo o conflicto se aísla por completo (`CaptureBatchResult` / `CaptureUnitOutcome`): jamás altera ni hace fallar la ejecución de N5 ni de N6 ni el arranque liviano de `main.py` sin voz.
+
+4. **Invalidación por rollback N5 confirmado y tombstone persistente:**
+   - `ChainOrchestrator` dispara `handle_n5_rollback_confirmed()` únicamente cuando `rollback_execution()` o `recover_pending_transactions()` confirman transición real a `ROLLED_BACK` (nunca en `ROLLBACK_FAILED` ni ante conflictos externos).
+   - `ExperienceCaptureService` ejecuta invalidación idempotente vía `MemoryEngine.invalidate_by_execution(execution_id)` y registra tombstone persistente en `memory_audit` (`mark_execution_rollback_tombstone()` / `is_execution_invalidated()`) para impedir capturas tardías o en paralelo incluso tras reiniciar el proceso. También está bloqueada cuando el modo privado está activo (`blocked_private_mode`).
+
 ### Ejecución de tests
 
 ```powershell
 $env:JARVIS_ENV = "test"
-.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence -v
+.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback -v
 .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q
 ```

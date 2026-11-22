@@ -1338,6 +1338,126 @@ class ExperienceStore:
                         conn.execute("ROLLBACK")
                     raise
 
+    @staticmethod
+    def _has_rollback_audit_tx(conn: sqlite3.Connection, execution_id: str) -> bool:
+        """Comprueba exactamente mediante JSON parseado si existe marca o revocación por rollback."""
+        like_pat = f"%{execution_id}%"
+        rows = conn.execute(
+            """
+            SELECT details_json FROM memory_audit
+            WHERE action = 'REVOKE' AND details_json LIKE ?
+            ORDER BY created_at DESC
+            LIMIT 100
+            """,
+            (like_pat,),
+        ).fetchall()
+        for row in rows:
+            try:
+                parsed = json.loads(str(row["details_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(parsed, dict)
+                and parsed.get("source_execution_id") == execution_id
+                and parsed.get("invalidation_kind")
+                in {"rollback_execution", "rollback_execution_tombstone"}
+            ):
+                return True
+        return False
+
+    def is_execution_invalidated(self, execution_id: str) -> bool:
+        """Indica si `execution_id` figura revertida por rollback en memoria persistente."""
+        self.policy.assert_enabled()
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise MemoryValidationError("execution_id no puede estar vacío.")
+        clean_exec_id = sanitize_memory_text(
+            execution_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="execution_id",
+            check_secrets=True,
+        )
+        with self.acquire_lock():
+            with self._open_connection() as conn:
+                self._ensure_ready(conn)
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM memories
+                    WHERE source = 'EXECUTION_VERIFIED'
+                      AND source_execution_id = ?
+                      AND status = 'REVOKED'
+                    LIMIT 1
+                    """,
+                    (clean_exec_id,),
+                ).fetchone()
+                if row is not None:
+                    return True
+                return self._has_rollback_audit_tx(conn, clean_exec_id)
+
+    def mark_execution_rollback_tombstone(
+        self,
+        execution_id: str,
+        *,
+        reason: str = "rollback_execution",
+        actor: str = "system",
+        private_mode: bool = False,
+    ) -> bool:
+        """
+        Registra de forma idempotente en `memory_audit` una marca persistente de rollback confirmado
+        cuando todavía no existían recuerdos activos en `memories`, bloqueando capturas tardías futuras.
+        """
+        self.policy.assert_write_allowed(private_mode=private_mode)
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise MemoryValidationError("execution_id no puede estar vacío.")
+        clean_exec_id = sanitize_memory_text(
+            execution_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="execution_id",
+            check_secrets=True,
+        )
+        clean_reason = sanitize_memory_text(
+            reason,
+            max_chars=240,
+            allow_newlines=False,
+            field_name="reason",
+            check_secrets=True,
+        )
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+        with self.acquire_lock():
+            with self._open_connection(enable_wal=True) as conn:
+                self._ensure_ready(conn)
+                now = utc_now_iso()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._has_rollback_audit_tx(conn, clean_exec_id):
+                        conn.execute("COMMIT")
+                        return False
+                    self._insert_audit_tx(
+                        conn,
+                        action=MemoryAuditAction.REVOKE,
+                        memory_id=None,
+                        actor=clean_actor,
+                        reason=clean_reason,
+                        details={
+                            "source_execution_id": clean_exec_id,
+                            "invalidation_kind": "rollback_execution_tombstone",
+                        },
+                        created_at=now,
+                    )
+                    conn.execute("COMMIT")
+                    return True
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
     def transition_status(
         self,
         memory_id: str,

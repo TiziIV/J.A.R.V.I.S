@@ -1202,6 +1202,45 @@ Se implementó exclusivamente la base de persistencia v2 necesaria para habilita
 
 ### 4. Límites y Pendientes (Siguientes Subfases N8.3)
 
-- **Pendiente Subfase 2:** `ExperienceCaptureService` y ganchos desacoplados en N5/N6 (`ChainOrchestrator` / `TransactionManager` / `FileEditorSkill` / `GoalSupervisor`) controlados por `N8_AUTO_CAPTURE_ENABLED`.
+- **Pendiente Subfase 2:** `ExperienceCaptureService` y ganchos desacoplados en N5/N6 (`ChainOrchestrator` / `TransactionManager` / `FileEditorSkill` / `GoalSupervisor`) controlados por `N8_AUTO_CAPTURE_ENABLED`. *(Completada)*
+- **Pendiente Subfase 3:** persistencia efímera / referencias N8 en `EphemeralGoalStore` (`GoalStore`).
+- **Pendiente Subfase 4:** integración consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` con `MemorySnapshotGuard` validado por `store_version_token` y pruebas E2E integrales.
+
+---
+
+## Fase N8.3 Subfase 2 — Contratos de Evidencia N5/N6, Captura Verificada e Invalidación por Rollback (2026-11-21)
+
+### 1. Resumen de Implementación
+
+Se implementó **N8.3 Subfase 2** conectando de forma desacoplada las ejecuciones verificadas de **N5** (`ChainOrchestrator` / `TransactionManager`) y **N6** (`GoalEngine` / `ExecutionSupervisor`) hacia el motor de memoria **N8** (`ExperienceCaptureService` -> `MemoryEngine` / `ExperienceStore`) mediante contratos inmutables versionados v2.0 y revocación automática ante rollbacks N5 confirmados. Se mantienen sin implementar ni activar las Subfases 3 y 4 (`EphemeralGoalStore` / referencias N8 en `GoalStore`, recuperación consultiva en `GoalEngine` / `BrainManager` e inyección de snapshot por `MemorySnapshotGuard`).
+
+### 2. Archivos Creados y Modificados
+
+- **Nuevos en `src/memory/`:**
+  - `src/memory/capture_contracts.py`: definidos `CAPTURE_CONTRACT_VERSION = "2.0"`, `AUTHORIZED_VERIFIERS_BY_LAYER`, `FORBIDDEN_VERIFIER_MARKERS`, `FORBIDDEN_EVIDENCE_KEYS`, `MemoryEvidenceContractError`, `VerifiedOperationReference`, `VerifiedExecutionEvidenceContract` (`@dataclass(frozen=True)` con canonicalización y hashes SHA-256 `evidence_sha256` y `contract_sha256`), `AdaptationReport`, `CaptureUnitOutcome`, `CaptureBatchResult` y `RollbackInvalidationOutcome`. Rechaza booleanos (`{"verified": True}`), afirmaciones LLM/`internal_synthesis`, transcripts, prompts, contenido web crudo y secretos.
+  - `src/memory/capture.py`: implementados `N5ExecutionEvidenceAdapter` (exige `ChainState.COMPLETED`, `approval_granted=True`, `approval_hash`, operaciones `APPLIED` con `after_sha256` post-escritura verificada y ausencia de rollback), `N6GoalEvidenceAdapter` (evalúa `COMPLETED` y `PARTIAL` tarea a tarea comprobando verificador objetivo autorizado, correspondencia de IDs, historial `task_completed` y artefactos reales sin promover `PARTIAL` a éxito global ni capturar `internal_synthesis`) y `ExperienceCaptureService` (puertas `N8_ENABLED` / `N8_AUTO_CAPTURE_ENABLED`, rechazo absoluto en modo privado sin tocar buffers privados, idempotencia v2, aislamiento de errores de SQLite/lock e invalidación/tombstone por rollback N5 confirmado).
+- **Actualizados en `src/memory/`:**
+  - `src/memory/store.py` y `src/memory/engine.py`: añadidos soporte de tombstones de ejecución revertida sobre `memory_audit` sin migración de esquema adicional (`_has_rollback_audit_tx`, `is_execution_invalidated()`, `mark_execution_rollback_tombstone()`) para impedir capturas tardías o en paralelo incluso tras reiniciar el proceso.
+  - `src/memory/__init__.py`: exportados los 12 símbolos públicos nuevos de Subfase 2 y actualizado el docstring del paquete.
+- **Cableado desacoplado en `src/brain/` y consola (`main.py`):**
+  - `src/brain/chain_orchestrator.py`: soporte opcional `memory_capture_service` / `set_memory_capture_service()`, captura tras `execute_approved_plan()` en estado `COMPLETED` e invalidación tras rollback confirmado a `ROLLED_BACK` en `rollback_execution()` y `recover_pending_transactions()`, completamente aislados ante fallos.
+  - `src/brain/goal_supervisor.py`: evidencia verificada explícita en `_execute_registered_skill` (`ExecutionSupervisorSkillVerifier`, IDs de tarea/plan/objetivo) y `_execute_via_chain_orchestrator` (`ExecutionSupervisorChainVerifier`, vínculo con `chain_execution_id`), más hook opcional post-`execute_plan()` para planes terminados en `COMPLETED` o `PARTIAL` (`not stopped_for_approval`).
+  - `src/brain/goal_engine.py`, `src/brain/goal_console.py` y `main.py`: propagación opcional de `memory_capture_service` y creación perezosa condicionada `_ensure_memory_capture_service()` en `run_console_session` preservando arranque liviano sin módulos de voz ni escrituras innecesarias cuando la DB aún no existe y la autocaptura está deshabilitada.
+- **Pruebas y Documentación:**
+  - `tests/test_memory_n8_capture_and_rollback.py`: nueva suite aislada de 8 pruebas integrales bajo `JARVIS_ENV=test` y `temp/jarvis_test_isolated/` (determinismo/inmutabilidad/rechazo de falsificación en contratos, adaptador N5 real + rechazos, adaptador N6 `COMPLETED`/`PARTIAL` + rechazo LLM/síntesis/evidencia ajena, políticas de privacidad/`N8_AUTO_CAPTURE_ENABLED`/web cruda/secretos/aislamiento de fallos SQLite, rollback confirmado vs fallido/tombstones, concurrencia captura vs rollback sin huérfanos, E2E por consola `main.py` `/optimizar`->`/rollback`->`/goal`->`/plan ejecutar`->`/memoria` en subproceso limpio sin `faster_whisper`/`sounddevice`/`pyttsx3`, y delegación N6->N5->rollback + recovery).
+  - `docs/N8_LONG_TERM_MEMORY.md`: agregada Sección 10 de contratos, adaptadores N5/N6, coordinador e invalidación/tombstones por rollback y actualizados alcance y comandos de test.
+  - `prompts_history.txt`: registrado el prompt íntegro de N8.3 Subfase 2 (no versionado).
+
+### 3. Verificaciones Realmente Ejecutadas (N8.3 Subfase 2)
+
+- `py_compile` sobre todos los módulos modificados/nuevos y suite Subfase 2: **OK (código 0)**.
+- Suite aislada Subfase 2 (`tests.test_memory_n8_capture_and_rollback`): **8 pruebas en 20.932s — OK** (después de los ajustes de suite, también validada dentro del bloque combinado y global).
+- Batería combinada N8 + N6 + N5 (`tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback tests.test_goal_engine tests.test_file_editor_and_chain tests.test_transaction_recovery`): **175 pruebas en 134.800s — OK**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **633 pruebas en 188.249s — OK (0 fallos, 0 errores, 0 omitidas)** respecto a línea base de 625 (+8 pruebas nuevas sin regresiones).
+- Verificación de arranque liviano (`import sys, main, src.memory` + subproceso limpio en `run_console_session(..., enable_tts=False)`): **`NO_VOICE_MODULES_LOADED: []`** (`faster_whisper`, `sounddevice`, `pyttsx3`, `speech_recognition` ausentes).
+- Integridad de datos reales verificada post-tests: `data/memory_store.json` permanece intacto en **1.218 bytes** (SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`); no existen `data/experiences.db`, `data/backups/`, `data/transactions/` ni `data/goals/` (solo existe `data/file_editor_audit.jsonl` generado fuera de N8 durante la suite general).
+
+### 4. Límites y Pendientes (Siguientes Subfases N8.3)
+
 - **Pendiente Subfase 3:** persistencia efímera / referencias N8 en `EphemeralGoalStore` (`GoalStore`).
 - **Pendiente Subfase 4:** integración consultiva en `GoalEngine` / `TaskDecomposer` / `BrainManager` con `MemorySnapshotGuard` validado por `store_version_token` y pruebas E2E integrales.

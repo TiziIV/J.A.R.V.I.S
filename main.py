@@ -106,6 +106,7 @@ def run_console_session(
     orchestrator: Optional[Any] = None,
     memory_engine: Optional[Any] = None,
     memory_handler: Optional[Any] = None,
+    memory_capture_service: Optional[Any] = None,
 ) -> None:
     """
     Ejecuta el bucle interactivo por consola (modo texto o texto + TTS).
@@ -123,6 +124,7 @@ def run_console_session(
     context_console_handler: Any = None
     memory_engine_instance: Any = memory_engine or getattr(brain_manager, "memory_engine", None)
     memory_console_handler: Any = memory_handler
+    memory_capture_instance: Any = memory_capture_service
 
     def _is_private_mode_active() -> bool:
         conv_priv = (
@@ -156,6 +158,28 @@ def run_console_session(
             if getattr(brain_manager, "memory_engine", None) is None:
                 brain_manager.memory_engine = memory_engine_instance
         return memory_engine_instance
+
+    def _ensure_memory_capture_service() -> Optional[Any]:
+        nonlocal memory_capture_instance
+        if memory_capture_instance is not None:
+            return memory_capture_instance
+        from config import settings
+
+        should_attach = bool(
+            memory_engine_instance is not None
+            or (
+                settings.N8_ENABLED
+                and (settings.N8_AUTO_CAPTURE_ENABLED or settings.EXPERIENCES_DB_PATH.exists())
+            )
+        )
+        if not should_attach:
+            return None
+        from src.memory.capture import ExperienceCaptureService
+
+        memory_capture_instance = ExperienceCaptureService(
+            memory_engine=_ensure_memory_engine(),
+        )
+        return memory_capture_instance
 
     def _ensure_memory_handler() -> Any:
         nonlocal memory_console_handler
@@ -201,12 +225,21 @@ def run_console_session(
                 file_editor=fe,
                 brain_manager=brain_manager,
                 skill_manager=sm,
+                memory_capture_service=_ensure_memory_capture_service(),
             )
             if hasattr(chain_orchestrator, "recover_pending_transactions"):
                 try:
                     chain_orchestrator.recover_pending_transactions()
                 except Exception as rec_err:
                     logger.warning(f"Advertencia al recuperar transacciones pendientes: {rec_err}")
+        elif (
+            getattr(chain_orchestrator, "memory_capture_service", None) is None
+            and hasattr(chain_orchestrator, "set_memory_capture_service")
+            and type(chain_orchestrator).__name__ == "ChainOrchestrator"
+        ):
+            cap_svc = _ensure_memory_capture_service()
+            if cap_svc is not None:
+                chain_orchestrator.set_memory_capture_service(cap_svc)
         return chain_orchestrator
 
     def _ensure_goal_handler() -> Any:
@@ -219,6 +252,7 @@ def run_console_session(
                 brain_manager=brain_manager,
                 context_engine=_ensure_context_engine(),
                 ensure_orchestrator_fn=_ensure_orchestrator,
+                memory_capture_service=_ensure_memory_capture_service(),
                 input_fn=input_fn,
                 output_fn=output_fn,
             )

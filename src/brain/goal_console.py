@@ -29,6 +29,7 @@ class GoalConsoleHandler:
         brain_manager: Any = None,
         context_engine: Any = None,
         ensure_orchestrator_fn: Optional[Callable[[], Any]] = None,
+        memory_capture_service: Any = None,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
     ) -> None:
@@ -37,6 +38,7 @@ class GoalConsoleHandler:
         self._brain_manager = brain_manager
         self._context_engine = context_engine
         self._ensure_orchestrator_fn = ensure_orchestrator_fn
+        self._memory_capture_service = memory_capture_service
         self._input_fn = input_fn
         self._output_fn = output_fn
 
@@ -47,6 +49,7 @@ class GoalConsoleHandler:
                 skill_manager=self._skill_manager,
                 brain_manager=self._brain_manager,
                 context_engine=self._context_engine,
+                memory_capture_service=self._memory_capture_service,
                 use_ai=False,
             )
         return self._goal_engine

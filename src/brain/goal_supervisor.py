@@ -201,6 +201,7 @@ class ExecutionSupervisor:
         chain_orchestrator: Optional["ChainOrchestrator"] = None,
         goal_store: Optional[GoalStore] = None,
         evaluator: Optional[PlanEvaluator] = None,
+        memory_capture_service: Optional[Any] = None,
         replan_factory: Optional[
             Callable[[GoalPlan, GoalTask], list[GoalTask]]
         ] = None,
@@ -212,7 +213,12 @@ class ExecutionSupervisor:
         self.chain_orchestrator: Optional["ChainOrchestrator"] = chain_orchestrator
         self.goal_store: Optional[GoalStore] = goal_store
         self.evaluator: PlanEvaluator = evaluator or PlanEvaluator()
+        self.memory_capture_service: Optional[Any] = memory_capture_service
         self.replan_factory = replan_factory
+
+    def set_memory_capture_service(self, memory_capture_service: Optional[Any]) -> None:
+        """Asocia o reemplaza el coordinador desacoplado de captura verificada N8."""
+        self.memory_capture_service = memory_capture_service
 
     def authorize_sensitive_tasks(
         self,
@@ -491,11 +497,25 @@ class ExecutionSupervisor:
                 )
                 self._persist(plan, "goal_finished", {"status": evaluated.value})
 
-        return self._build_result(
+        final_result = self._build_result(
             plan,
             stopped_for_approval=stopped_for_approval,
             errors=errors,
         )
+        if (
+            self.memory_capture_service is not None
+            and not stopped_for_approval
+            and plan.goal.status in {GoalStatus.COMPLETED, GoalStatus.PARTIAL}
+        ):
+            try:
+                self.memory_capture_service.handle_n6_execution_completed(
+                    plan=plan,
+                    execution_result=final_result,
+                )
+            except Exception:
+                # Aislamiento estricto: un fallo de memoria jamás altera el ExecutionResult N6.
+                pass
+        return final_result
 
     def execute_single_task(
         self,
@@ -754,7 +774,11 @@ class ExecutionSupervisor:
 
         evidence: dict[str, Any] = {
             "kind": "skill_execution",
+            "task_id": task.task_id,
+            "plan_id": plan.plan_id,
+            "goal_id": plan.goal.goal_id,
             "skill_name": task.skill_name,
+            "verifier_component": "ExecutionSupervisorSkillVerifier",
             "verified_at": utc_now_iso(),
             "output_length": len(text_output),
         }
@@ -827,8 +851,13 @@ class ExecutionSupervisor:
             ),
             "evidence": {
                 "kind": "chain_orchestrator",
+                "task_id": task.task_id,
+                "plan_id": plan.plan_id,
+                "goal_id": plan.goal.goal_id,
                 "execution_id": change_plan.execution_id,
                 "approval_hash": approval_hash,
+                "verifier_component": "ExecutionSupervisorChainVerifier",
+                "verified_at": utc_now_iso(),
                 "policy_validated": True,
                 "summary": exec_summary,
             },

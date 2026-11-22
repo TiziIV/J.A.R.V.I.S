@@ -1,13 +1,32 @@
 """
-Paquete `src.memory`: persistencia, políticas, recuperación, consola y ciclo de vida N8.1 + N8.2.
+Paquete `src.memory`: persistencia, políticas, recuperación, consola, captura verificada N8.1–N8.3 Subfase 2.
 
 En N8.1 se estableció `data/experiences.db`, políticas de ingesta, migraciones y `ExperienceStoreLock`.
-En N8.2 se completan la recuperación determinista (`MemoryRetriever`), la API central (`MemoryEngine`),
+En N8.2 se completaron la recuperación determinista (`MemoryRetriever`), la API central (`MemoryEngine`),
 la consola administrativa (`/memoria`, `/privado`, `/incognito`), la importación manual de preferencias,
 la purga física controlada y los backups/restauraciones verificados por SHA-256.
-La captura automática post-ejecución e integración profunda con N6 (N8.3) permanecen reservadas.
+En N8.3 Subfase 1 y 2 se agregan esquema SQLite v2, idempotencia estricta, `store_version_token`,
+contratos criptográficos de evidencia verificada N5/N6, adaptadores desacoplados (`ExperienceCaptureService`)
+e invalidación automática por rollback confirmado.
+La integración consultiva en N6 / `EphemeralGoalStore` / `MemorySnapshotGuard` (Subfases 3 y 4) permanece reservada.
 """
 
+from src.memory.capture import (
+    ExperienceCaptureService,
+    N5ExecutionEvidenceAdapter,
+    N6GoalEvidenceAdapter,
+)
+from src.memory.capture_contracts import (
+    AUTHORIZED_VERIFIERS_BY_LAYER,
+    CAPTURE_CONTRACT_VERSION,
+    AdaptationReport,
+    CaptureBatchResult,
+    CaptureUnitOutcome,
+    MemoryEvidenceContractError,
+    RollbackInvalidationOutcome,
+    VerifiedExecutionEvidenceContract,
+    VerifiedOperationReference,
+)
 from src.memory.console import MemoryConsoleHandler
 from src.memory.engine import MemoryEngine
 from src.memory.migrations import (
@@ -89,10 +108,16 @@ from src.memory.store import ExperienceStore, ExperienceStoreLock
 
 __all__ = [
     "ALLOWED_MEMORY_TRANSITIONS",
+    "AUTHORIZED_VERIFIERS_BY_LAYER",
+    "AdaptationReport",
     "BackupInfo",
+    "CAPTURE_CONTRACT_VERSION",
     "CURRENT_SCHEMA_VERSION",
+    "CaptureBatchResult",
+    "CaptureUnitOutcome",
     "ExecutionInvalidationResult",
     "ExecutionVerificationEvidence",
+    "ExperienceCaptureService",
     "ExperienceStore",
     "ExperienceStoreLock",
     "IntegrityReport",
@@ -105,6 +130,7 @@ __all__ = [
     "MemoryCreateInput",
     "MemoryDuplicateError",
     "MemoryEngine",
+    "MemoryEvidenceContractError",
     "MemoryIdempotencyConflictError",
     "MemoryLockTimeoutError",
     "MemoryNotFoundError",
@@ -131,15 +157,20 @@ __all__ = [
     "MemoryValidationError",
     "MemoryWriteResult",
     "MigrationResult",
+    "N5ExecutionEvidenceAdapter",
+    "N6GoalEvidenceAdapter",
     "PreferenceImportItem",
     "PreferenceImportPreview",
     "PreferenceImportResult",
     "PreparedMemoryCreate",
     "PurgeResult",
     "RestoreResult",
+    "RollbackInvalidationOutcome",
     "SOURCE_ALLOWED_CATEGORIES",
     "StoreStats",
     "VALID_VERIFICATION_SOURCE_LAYERS",
+    "VerifiedExecutionEvidenceContract",
+    "VerifiedOperationReference",
     "apply_migrations",
     "assert_no_secrets",
     "canonical_json",
