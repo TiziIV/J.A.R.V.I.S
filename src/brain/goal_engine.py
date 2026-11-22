@@ -396,7 +396,13 @@ class GoalEngine:
 
         n8_env = self._consult_n8_before_planning(goal, stage="planning")
         untrusted_n8 = n8_env.to_untrusted_prompt_context() if n8_env is not None else None
-        self.understanding.run_ai_enrichment(goal, untrusted_n8_context=untrusted_n8)
+        s_guard, m_snap = self.memory_bridge.build_dispatch_guard(n8_env, goal=goal)
+        self.understanding.run_ai_enrichment(
+            goal,
+            untrusted_n8_context=untrusted_n8,
+            snapshot_guard=s_guard,
+            memory_snapshot=m_snap,
+        )
         return goal
 
     def submit_goal(
@@ -427,10 +433,13 @@ class GoalEngine:
             allow_history_in_private=self.allow_history_in_private,
         )
         untrusted_n8 = valid_env.to_untrusted_prompt_context() if valid_env is not None else None
+        p_guard, p_snap = self.memory_bridge.build_dispatch_guard(valid_env, goal=goal)
         plan = self.planner.build_plan(
             goal,
             limits=limits or self.limits,
             untrusted_n8_context=untrusted_n8,
+            snapshot_guard=p_guard,
+            memory_snapshot=p_snap,
         )
         if self.is_private_mode:
             plan.is_ephemeral_private = True
@@ -464,11 +473,14 @@ class GoalEngine:
             allow_history_in_private=self.allow_history_in_private,
         )
         untrusted_n8 = valid_env.to_untrusted_prompt_context() if valid_env is not None else None
+        p_guard, p_snap = self.memory_bridge.build_dispatch_guard(valid_env, goal=goal)
         plan = self.planner.build_plan(
             goal,
             limits=limits or self.limits,
             custom_tasks=custom_tasks,
             untrusted_n8_context=untrusted_n8,
+            snapshot_guard=p_guard,
+            memory_snapshot=p_snap,
         )
         if self.is_private_mode:
             plan.is_ephemeral_private = True
@@ -515,12 +527,26 @@ class GoalEngine:
         refined_goal.capture_deterministic_baseline()
         n8_env = self._consult_n8_before_planning(refined_goal, stage="planning")
         untrusted_n8 = n8_env.to_untrusted_prompt_context() if n8_env is not None else None
-        self.understanding.run_ai_enrichment(refined_goal, untrusted_n8_context=untrusted_n8)
+        u_guard, u_snap = self.memory_bridge.build_dispatch_guard(n8_env, goal=refined_goal)
+        self.understanding.run_ai_enrichment(
+            refined_goal,
+            untrusted_n8_context=untrusted_n8,
+            snapshot_guard=u_guard,
+            memory_snapshot=u_snap,
+        )
+        valid_env, _reval = self.memory_bridge.revalidate_envelope(
+            goal=refined_goal,
+            allow_history_in_private=self.allow_history_in_private,
+        )
+        untrusted_plan_n8 = valid_env.to_untrusted_prompt_context() if valid_env is not None else None
+        p_guard, p_snap = self.memory_bridge.build_dispatch_guard(valid_env, goal=refined_goal)
         self._pending_clarification_goal = None
         plan = self.planner.build_plan(
             refined_goal,
             limits=limits or self.limits,
-            untrusted_n8_context=untrusted_n8,
+            untrusted_n8_context=untrusted_plan_n8,
+            snapshot_guard=p_guard,
+            memory_snapshot=p_snap,
         )
         if self.is_private_mode:
             plan.is_ephemeral_private = True

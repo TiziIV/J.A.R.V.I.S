@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import socket
 import urllib.error
-from typing import Optional
+from typing import Callable, Optional
 
 from google import genai
 from google.genai import types
@@ -219,6 +219,7 @@ class GeminiBrain:
         max_output_tokens: int | None = None,
         raise_on_error: bool = False,
         untrusted_context: str | None = None,
+        pre_dispatch_refresh: Callable[[], tuple[bool, Optional[str]]] | None = None,
     ) -> str:
         """
         Genera una respuesta con Gemini y reintenta con un modelo alternativo solo ante un 404.
@@ -241,11 +242,6 @@ class GeminiBrain:
             return unconfigured_err.user_message
 
         active_system_prompt: str = system_prompt or JARVIS_SYSTEM_PROMPT
-        effective_prompt: str = (
-            f"[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n{untrusted_context}\n[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n\n{prompt}"
-            if untrusted_context
-            else prompt
-        )
         primary_model: str = (model_override or self.model_name).strip() or self.model_name
         token_limit: int = max_output_tokens if isinstance(max_output_tokens, int) and max_output_tokens > 0 else 300
 
@@ -265,6 +261,28 @@ class GeminiBrain:
         )
 
         for model_index, candidate in enumerate(candidate_models):
+            current_untrusted = untrusted_context
+            if model_index > 0 and pre_dispatch_refresh is not None:
+                allowed, refreshed_untrusted = pre_dispatch_refresh()
+                if not allowed:
+                    abort_err = BrainError(
+                        provider="Gemini",
+                        kind=BrainErrorKind.INVALID_REQUEST,
+                        user_message="Despacho abortado por protección pre-dispatch de memoria/privacidad N8.",
+                        model=candidate,
+                    )
+                    self.last_error = abort_err
+                    if raise_on_error:
+                        raise abort_err
+                    return abort_err.user_message
+                current_untrusted = refreshed_untrusted
+
+            effective_prompt: str = (
+                f"[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n{current_untrusted}\n[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n\n{prompt}"
+                if current_untrusted
+                else prompt
+            )
+
             try:
                 if token_limit == 300:
                     answer: str = self._generate_with_model(

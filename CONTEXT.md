@@ -1292,4 +1292,54 @@ Se implementó **N8.3 Subfase 2** conectando de forma desacoplada las ejecucione
 
 ### 4. Límites y Pendientes (Siguiente Subfase N8.3)
 
-- **Pendiente Subfase 4 (cierre N8.3):** `MemorySnapshotGuard` validado por `store_version_token`, validación de vigencia de snapshot en `BrainManager` y pruebas E2E de cierre integral N8.3.
+- **Subfase 4 completada *(2026-11-22)*:** `MemorySnapshotGuard`, control pre-dispatch de `store_version_token` en `BrainManager` (todos los adaptadores, fallbacks y reintentos 404), integración final con N6 y pruebas de concurrencia/privacidad.
+- **Estado N8.3:** **Implementación completa de N8.3 (Subfases 1–4) cerrada técnicamente y pendiente de auditoría integral independiente.**
+
+---
+
+## Proyecto J.A.R.V.I.S. — N8.3 Subfase 4 (2026-11-22): `MemorySnapshotGuard`, Control de Frescura y Protección Pre-Dispatch en `BrainManager`
+
+**Estado:** Implementada, verificada y lista para commit sobre `main` (después de `f5b92a3`). **N8.3 queda cerrada como implementación completa pendiente de auditoría integral independiente.**
+
+### 1. Cambios Implementados
+
+- **Guarda inmutable de instantánea y frescura (`src/memory/snapshot_guard.py`, `src/memory/engine.py`, `src/memory/__init__.py`):**
+  - Implementados `MemorySnapshotGuard`, `MemorySnapshot`, `MemorySnapshotReference`, `SnapshotMemoryPayload`, `SnapshotValidationStatus`, `SnapshotValidationResult`, `compute_record_version_hash`, `is_valid_store_version_token` y `extract_n8_untrusted_payload_info`.
+  - Cada `MemorySnapshot` queda vinculado de forma inmutable y redactada en `__repr__`/`__str__` a un `request_id` concreto (más `goal_id`/`plan_id` en N6), sin persistirse nunca en disco y marcado `validated_before_dispatch=True` únicamente tras completar todas las comprobaciones.
+  - Ante cambio de `store_version_token` (antes o detectado en el post-check durante la revalidación), ejecuta a lo sumo `max_revalidations=1` y como máximo `max_refreshes=1` recuperación acotada cuando no hubo referencias invalidadas que pudieran inducir auto-sustitución por similares; si el token sigue mutando (`FAILED_TOKEN_UNSTABLE`) o SQLite/token no es legible (`FAILED_ENGINE_UNAVAILABLE` / `FAILED_TOKEN_INVALID`), falla cerrado respecto de N8 (`n8_allowed=False`, `untrusted_n8_context=None`). Jamás retiene locks SQLite durante llamadas a proveedores LLM.
+  - Añadido helper `MemoryEngine.create_snapshot_guard(...)` y exportados los símbolos públicos en `src/memory/__init__.py`.
+
+- **Validación pre-dispatch común en `BrainManager` y protección en adaptadores (`src/brain/brain_manager.py`, `ollama_client.py`, `gemini_client.py`, `openai_client.py`):**
+  - Integrada la validación pre-dispatch inmediatamente antes de cada envío físico en el punto común `_generate_with_fallback_policy()` -> `_invoke_single_mode()` -> `_validate_n8_for_physical_dispatch()`, cubriendo `process_turn()`, `query_raw()` (incluidos N6 y corrección `resolve_mode_alias` para `mode_override`), selección `AUTO`, one-shot y todas las cadenas de fallback entre proveedores (`Claude`, `GPT`, `Gemini`, `Codex`, `Ollama` / `OLLAMA_UNCENSORED`).
+  - Añadido callback opcional `pre_dispatch_refresh` en los reintentos internos de modelo por HTTP 404 de `OllamaBrain`, `GeminiBrain` y `OpenAIBrain` para que ninguna revocación o cambio a `--sin-historial` entre modelos primarios y secundarios filtre recuerdos obsoletos.
+  - `_assert_dispatch_isolation()` verifica antes de enviar que no existan marcadores ni fragmentos N8 en `system_prompt`, ni contenido de recuerdos excluidos en `prompt`. Si el resto de la solicitud está limpio, degrada normalmente sin contexto N8; si hay riesgo de fuga en roles privilegiados o prompt, aborta cerrado (`BrainErrorKind.INVALID_REQUEST`).
+  - Si `query_raw(..., untrusted_context=...)` recibe un JSON N8 crudo sin `MemorySnapshot` explícito, reconstruye y revalida `store_version_token`/referencias mediante `MemorySnapshotGuard` antes del dispatch.
+
+- **Propagación desde N6 y reconciliación de nombres reales (`src/brain/goal_memory.py`, `goal_understanding.py`, `goal_planner.py`, `goal_engine.py`):**
+  - Eliminada duplicación de hashing delegando `compute_memory_version_hash` a `compute_record_version_hash`.
+  - Añadidos `RuntimeN8Envelope.to_memory_snapshot()` y `GoalMemoryBridge.build_dispatch_guard()`, incluyendo `store_version_token` en el JSON consultivo no confiable y propagando `(snapshot_guard, memory_snapshot)` desde `GoalEngine` hacia `GoalUnderstandingEngine`, `TaskDecomposer`/`GoalPlanningEngine` y `BrainManager.query_raw()`.
+  - Documentada correspondencia real de módulos respecto al diseño nominal: `goal_persistence.py` cumple el rol de `goal_store.py` y `goal_planner.py` aloja `TaskDecomposer`.
+
+- **Suite adversarial y de concurrencia (`tests/test_memory_n8_snapshot_guard.py`):**
+  - Creadas **6 pruebas integrales** bajo `JARVIS_ENV=test` y `temp/jarvis_test_isolated/` validando ciclo completo de `MemorySnapshotGuard`, llamadas reales interceptadas en transporte para `OllamaBrain`, `GeminiBrain`, `ClaudeBrain`, `OpenAIBrain` y `CodexBrain`, propagación N6 -> `BrainManager.query_raw`, fallbacks `Claude -> Gemini -> Ollama` y `GPT -> Ollama`, `AUTO`, retries internos 404 (`gpt-5.4 -> gpt-4o`, `gemini-2.0 -> 1.5`, `OLLAMA_UNCENSORED -> OLLAMA`), concurrencia real multi-hilo sin retención de `ExperienceStoreLock` durante llamada al proveedor y enforcement real de `/privado` y `/privado --sin-historial` en dispatch.
+
+### 2. Documentación Actualizada
+
+- [docs/N8_LONG_TERM_MEMORY.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N8_LONG_TERM_MEMORY.md): agregada Sección 12 completa (diseño de `MemorySnapshotGuard`, `store_version_token`, pre-dispatch, fallbacks/reintentos, límites TOCTOU realistas, degradación segura, privacidad y frontera de proveedores incluida la limitación CLI de `CodexBrain`). Declarada **N8.3 completa pendiente de auditoría integral independiente**.
+- [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N6_AUTONOMOUS_GOAL_ENGINE.md): enlazada integración `MemorySnapshotGuard` hacia `BrainManager.query_raw` y aclarada correspondencia real de archivos (`goal_persistence.py`, `goal_planner.py`).
+- `prompts_history.txt`: registrado el prompt íntegro de N8.3 Subfase 4 (excluido de Git).
+
+### 3. Verificaciones Realmente Ejecutadas (N8.3 Subfase 4)
+
+- `py_compile` sobre todos los módulos nuevos/editados y `tests/test_memory_n8_snapshot_guard.py`: **OK (código 0)**.
+- Suite aislada N8.3 Subfase 4 (`tests.test_memory_n8_snapshot_guard`): **6 pruebas en 10.561s — OK**.
+- Batería combinada N8.1 + N8.2 + N8.3(S1–S4) + N6 + N5 + BrainManager/proveedores (`test_memory_n8_persistence`, `test_memory_n8_lifecycle`, `test_memory_n8_v2_persistence`, `test_memory_n8_capture_and_rollback`, `test_memory_n8_consultative_n6`, `test_memory_n8_snapshot_guard`, `test_goal_engine`, `test_file_editor_and_chain`, `test_transaction_recovery`, `test_brain_deliberation`, `test_llm_routing`, `test_codex_integration`, `test_web_extraction_skill`, `test_memory_persistence`, `test_memory_isolation`): **315 pruebas en 168.061s — OK**.
+- Suite global completa (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`): **646 pruebas en 207.865s — OK (0 fallos, 0 errores, 0 omitidas)** (`640` previas + `6` nuevas).
+- Verificación de arranque liviano sin voz (`import main, src.brain.brain_manager, src.brain.goal_engine, src.memory`): **`VOICE_LOADED: []`** (`faster_whisper`, `sounddevice`, `pyttsx3`, `speech_recognition` sin cargar).
+- Integridad de `data/` tras toda la batería global: `data/memory_store.json` intacto en **1.218 bytes** (SHA-256 `83640EAADFF5E33FEB9126F6EEBB9F7960F924F01BB3A1968468014223341222`); entradas presentes en `data/`: `['file_editor_audit.jsonl', 'memory_store.json']`; `data/experiences.db` y `data/goals/` inexistentes (`False`).
+- Pruebas físicas de hardware de audio/micrófono/altavoz: **no ejecutadas ni aplicables** en esta subfase.
+
+### 4. Límites y Próximo Hito
+
+- **Implementación técnica de N8.3 completa (Subfases 1–4).** Queda pendiente la **auditoría integral independiente de N8.3**.
+- Limitaciones honestas documentadas: la comprobación pre-dispatch protege hasta el instante previo al envío físico (una revocación posterior no retira datos ya recibidos por un modelo), y `CodexBrain` utiliza un argumento CLI único (`codex exec`) sin campo `system` independiente en transporte (mitigado por clasificación previa sobre `prompt` limpio, `--sandbox read-only` y validación pre-dispatch).

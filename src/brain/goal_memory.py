@@ -39,6 +39,14 @@ from src.memory.models import (
     MemoryStatus,
     parse_iso_utc,
 )
+from src.memory.snapshot_guard import (
+    MemorySnapshot,
+    MemorySnapshotGuard,
+    MemorySnapshotReference,
+    SnapshotMemoryPayload,
+    compute_record_version_hash,
+    is_valid_store_version_token,
+)
 
 
 N8_TRUST_BOUNDARY: str = "untrusted_long_term_memory"
@@ -116,12 +124,7 @@ def _new_query_id() -> str:
 
 def compute_memory_version_hash(record: MemoryRecord) -> str:
     """Calcula un hash de versión sin exponer contenido textual para detectar mutaciones."""
-    material = (
-        f"{record.memory_id}|{int(record.revision_number)}|"
-        f"{record.updated_at}|{record.status.value}|"
-        f"{record.scope_type.value}|{record.scope_key}|{record.content_fingerprint}"
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return compute_record_version_hash(record)
 
 
 class RevisionMismatchPolicy(str, Enum):
@@ -297,6 +300,61 @@ class RuntimeN8Envelope:
             }
         )
 
+    def to_memory_snapshot(self, *, request_id: Optional[str] = None) -> Optional[MemorySnapshot]:
+        """Construye un `MemorySnapshot` inmutable en RAM listo para protección pre-dispatch."""
+        if not self.items or not self.references or not is_valid_store_version_token(self.store_version_token):
+            return None
+        eff_req = str(
+            request_id or f"n6:{self.goal_id}:{self.plan_id or 'draft'}:{self.n8_query_id}"
+        ).strip()
+        snap_refs: list[MemorySnapshotReference] = []
+        snap_items: list[SnapshotMemoryPayload] = []
+        ref_by_id = {r.memory_id: r for r in self.references}
+        for item in self.items:
+            base_ref = ref_by_id.get(item.reference.memory_id) or item.reference
+            snap_ref = MemorySnapshotReference(
+                memory_id=base_ref.memory_id,
+                revision_number=base_ref.revision_number,
+                version_hash=base_ref.version_hash,
+                category=base_ref.category,
+                source=base_ref.source,
+                scope_type=base_ref.scope_type,
+                scope_key=base_ref.scope_key,
+                status_at_fetch=base_ref.status_at_fetch,
+                store_version_token_at_fetch=self.store_version_token,
+                trust_boundary=N8_TRUST_BOUNDARY,
+            )
+            snap_refs.append(snap_ref)
+            snap_items.append(
+                SnapshotMemoryPayload(
+                    reference=snap_ref,
+                    title=item.title,
+                    summary=item.summary,
+                    content=item.content,
+                    rendered_excerpt=item.rendered_excerpt,
+                    confidence=item.confidence,
+                    score=item.score,
+                )
+            )
+        return MemorySnapshot(
+            snapshot_id=f"n8s-{self.n8_query_id}",
+            n8_query_id=self.n8_query_id,
+            request_id=eff_req,
+            goal_id=self.goal_id or None,
+            plan_id=self.plan_id,
+            store_version_token=self.store_version_token,
+            references=tuple(snap_refs),
+            items=tuple(snap_items),
+            scope=self.scope,
+            query_text=self.query_text,
+            target=MemoryRetrievalTarget(self.target) if self.target else MemoryRetrievalTarget.NORMAL,
+            retrieved_at=self.retrieved_at,
+            last_validated_at=self.revalidated_at,
+            revalidation_count=0,
+            refresh_count=0,
+            validated_before_dispatch=False,
+        )
+
     def to_untrusted_prompt_context(self) -> str:
         """Genera bloque de datos no confiables listo para `BrainManager.query_raw(untrusted_context=...)`.
 
@@ -306,6 +364,7 @@ class RuntimeN8Envelope:
             return ""
         payload = {
             "n8_query_id": self.n8_query_id,
+            "store_version_token": self.store_version_token,
             "trust_boundary": N8_TRUST_BOUNDARY,
             "allow_system_prompt_promotion": False,
             "allow_tool_execution_from_content": False,
@@ -684,6 +743,33 @@ class GoalMemoryBridge:
             if plan_id and plan_id in self._ephemeral_annotations:
                 merged.update(self._ephemeral_annotations[plan_id])
             return dict(merged)
+
+    def build_dispatch_guard(
+        self,
+        envelope: Optional[RuntimeN8Envelope],
+        *,
+        goal: Any,
+        plan: Optional[Any] = None,
+        request_id: Optional[str] = None,
+    ) -> tuple[Optional[MemorySnapshotGuard], Optional[MemorySnapshot]]:
+        """Construye `(MemorySnapshotGuard, MemorySnapshot)` vinculado al objetivo/plan actual para `BrainManager`."""
+        if envelope is None or self.memory_engine is None:
+            return None, None
+        goal_id = str(getattr(goal, "goal_id", "") or envelope.goal_id or "").strip() or None
+        plan_id = str(getattr(plan, "plan_id", "") or envelope.plan_id or "").strip() or None
+        eff_req = str(
+            request_id or f"n6:{goal_id or 'goal'}:{plan_id or 'draft'}:{envelope.n8_query_id}"
+        ).strip()
+        snap = envelope.to_memory_snapshot(request_id=eff_req)
+        if snap is None:
+            return None, None
+        guard = MemorySnapshotGuard(
+            memory_engine=self.memory_engine,
+            request_id=eff_req,
+            goal_id=snap.goal_id,
+            plan_id=snap.plan_id,
+        )
+        return guard, snap
 
     @staticmethod
     def resolve_budget_target(brain_manager: Optional[Any] = None) -> MemoryRetrievalTarget:

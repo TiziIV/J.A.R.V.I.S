@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Generator
 import socket
 import urllib.error
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import ollama
 
 from config.prompts import JARVIS_SYSTEM_PROMPT
@@ -234,28 +234,12 @@ class OllamaBrain:
         if remaining:
             yield remaining
 
-    def generate_response_stream(
-        self,
+    @staticmethod
+    def _build_messages(
+        effective_system_prompt: str,
         prompt: str,
-        system_prompt: Optional[str] = None,
-        *,
-        model_override: Optional[str] = None,
-        context_prompt: Optional[str] = None,
-        num_predict: Optional[int] = None,
-        temperature: float = 0.3,
-        raise_on_error: bool = False,
-        untrusted_context: Optional[str] = None,
-    ) -> Generator[str, None, None]:
-        """
-        Genera texto en streaming desde Ollama (`stream=True`), acumulando tokens y
-        emitiendo (`yield`) oraciones completas delimitadas por '.', '?' o '!' en tiempo real.
-
-        Si se solicita un `model_override` (por ejemplo el modelo de `OLLAMA_UNCENSORED`)
-        y Ollama confirma que dicho modelo no está instalado (404 / model not found),
-        informa cómo instalarlo con `ollama pull <modelo>` e intenta el modelo estándar
-        `self.model_name` una sola vez, siempre que no se haya emitido ya una respuesta parcial.
-        """
-        effective_system_prompt = self._compose_system_prompt(system_prompt, context_prompt)
+        untrusted_context: Optional[str],
+    ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": effective_system_prompt},
         ]
@@ -271,6 +255,31 @@ class OllamaBrain:
                 }
             )
         messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def generate_response_stream(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        *,
+        model_override: Optional[str] = None,
+        context_prompt: Optional[str] = None,
+        num_predict: Optional[int] = None,
+        temperature: float = 0.3,
+        raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
+        pre_dispatch_refresh: Optional[Callable[[], tuple[bool, Optional[str]]]] = None,
+    ) -> Generator[str, None, None]:
+        """
+        Genera texto en streaming desde Ollama (`stream=True`), acumulando tokens y
+        emitiendo (`yield`) oraciones completas delimitadas por '.', '?' o '!' en tiempo real.
+
+        Si se solicita un `model_override` (por ejemplo el modelo de `OLLAMA_UNCENSORED`)
+        y Ollama confirma que dicho modelo no está instalado (404 / model not found),
+        informa cómo instalarlo con `ollama pull <modelo>` e intenta el modelo estándar
+        `self.model_name` una sola vez, siempre que no se haya emitido ya una respuesta parcial.
+        """
+        effective_system_prompt = self._compose_system_prompt(system_prompt, context_prompt)
         predict_limit = int(num_predict) if isinstance(num_predict, int) and num_predict > 0 else 300
         options: dict[str, Any] = {
             "temperature": temperature,
@@ -282,7 +291,22 @@ class OllamaBrain:
         self.last_fallback_note = None
         emitted_any = False
 
+        def _messages_for_dispatch(*, is_retry: bool) -> list[dict[str, str]]:
+            current_untrusted = untrusted_context
+            if is_retry and pre_dispatch_refresh is not None:
+                allowed, refreshed_untrusted = pre_dispatch_refresh()
+                if not allowed:
+                    raise BrainError(
+                        provider="Ollama",
+                        kind=BrainErrorKind.INVALID_REQUEST,
+                        user_message="Despacho abortado por protección pre-dispatch de memoria/privacidad N8.",
+                        model=requested_model,
+                    )
+                current_untrusted = refreshed_untrusted
+            return self._build_messages(effective_system_prompt, prompt, current_untrusted)
+
         try:
+            messages = _messages_for_dispatch(is_retry=False)
             for sentence in self._stream_once(requested_model, messages, options):
                 if not emitted_any:
                     self.last_used_model = requested_model
@@ -292,61 +316,80 @@ class OllamaBrain:
                 self.last_used_model = requested_model
             return
 
-        except Exception as primary_error:
+        except BrainError as abort_err:
+            if abort_err.kind == BrainErrorKind.INVALID_REQUEST and not emitted_any:
+                self.last_error = abort_err
+                if raise_on_error:
+                    raise
+                yield abort_err.user_message
+                return
+            primary_error = abort_err
+            classified = abort_err
+        except Exception as exc:
+            primary_error = exc
             classified = self._classify_ollama_error(
                 primary_error,
                 requested_model,
                 partial_output=emitted_any,
             )
 
-            # Si el modelo alternativo no existe, no hubo salida parcial y existe un modelo estándar distinto,
-            # informamos cómo instalarlo manualmente y probamos el modelo estándar UNA sola vez.
-            can_fallback_to_standard = (
-                classified.kind == BrainErrorKind.MODEL_NOT_FOUND
-                and not emitted_any
-                and requested_model != self.model_name
-                and bool(self.model_name)
+        # Si el modelo alternativo no existe, no hubo salida parcial y existe un modelo estándar distinto,
+        # informamos cómo instalarlo manualmente y probamos el modelo estándar UNA sola vez.
+        can_fallback_to_standard = (
+            classified.kind == BrainErrorKind.MODEL_NOT_FOUND
+            and not emitted_any
+            and requested_model != self.model_name
+            and bool(self.model_name)
+        )
+        if can_fallback_to_standard:
+            install_cmd = f"ollama pull {requested_model}"
+            note = (
+                f"Modelo local '{requested_model}' no encontrado en Ollama. "
+                f"Para instalarlo ejecute: `{install_cmd}`. "
+                f"Usando modelo estándar '{self.model_name}' por esta vez."
             )
-            if can_fallback_to_standard:
-                install_cmd = f"ollama pull {requested_model}"
-                note = (
-                    f"Modelo local '{requested_model}' no encontrado en Ollama. "
-                    f"Para instalarlo ejecute: `{install_cmd}`. "
-                    f"Usando modelo estándar '{self.model_name}' por esta vez."
-                )
-                self.last_fallback_note = note
-                print(f"[Ollama] {note}")
-                try:
-                    for sentence in self._stream_once(self.model_name, messages, options):
-                        if not emitted_any:
-                            self.last_used_model = self.model_name
-                        emitted_any = True
-                        yield sentence
+            self.last_fallback_note = note
+            print(f"[Ollama] {note}")
+            try:
+                fallback_messages = _messages_for_dispatch(is_retry=True)
+                for sentence in self._stream_once(self.model_name, fallback_messages, options):
                     if not emitted_any:
                         self.last_used_model = self.model_name
+                    emitted_any = True
+                    yield sentence
+                if not emitted_any:
+                    self.last_used_model = self.model_name
+                return
+            except BrainError as abort_fallback_err:
+                if abort_fallback_err.kind == BrainErrorKind.INVALID_REQUEST and not emitted_any:
+                    self.last_error = abort_fallback_err
+                    if raise_on_error:
+                        raise
+                    yield abort_fallback_err.user_message
                     return
-                except Exception as secondary_error:
-                    classified = self._classify_ollama_error(
-                        secondary_error,
-                        self.model_name,
-                        partial_output=emitted_any,
-                    )
-
-            self.last_error = classified
-            if classified.kind == BrainErrorKind.MODEL_NOT_FOUND:
-                print(
-                    f"[Ollama] Modelo '{classified.model}' no instalado. "
-                    f"Instálelo manualmente con: ollama pull {classified.model}"
+                classified = abort_fallback_err
+            except Exception as secondary_error:
+                classified = self._classify_ollama_error(
+                    secondary_error,
+                    self.model_name,
+                    partial_output=emitted_any,
                 )
-            elif classified.kind == BrainErrorKind.DAEMON_OFFLINE:
-                print(f"[Ollama Stream Error] No se pudo comunicar con el servidor local: {classified.detail}")
-            else:
-                print(f"[Ollama Stream Error] Fallo con '{classified.model}' ({classified.kind.value}): {classified.detail}")
 
-            if raise_on_error:
-                raise classified from None
-            if not emitted_any:
-                yield classified.user_message
+        self.last_error = classified
+        if classified.kind == BrainErrorKind.MODEL_NOT_FOUND:
+            print(
+                f"[Ollama] Modelo '{classified.model}' no instalado. "
+                f"Instálelo manualmente con: ollama pull {classified.model}"
+            )
+        elif classified.kind == BrainErrorKind.DAEMON_OFFLINE:
+            print(f"[Ollama Stream Error] No se pudo comunicar con el servidor local: {classified.detail}")
+        else:
+            print(f"[Ollama Stream Error] Fallo con '{classified.model}' ({classified.kind.value}): {classified.detail}")
+
+        if raise_on_error:
+            raise classified from None
+        if not emitted_any:
+            yield classified.user_message
 
     def generate_stream(
         self,
@@ -381,6 +424,7 @@ class OllamaBrain:
         temperature: float = 0.3,
         raise_on_error: bool = False,
         untrusted_context: Optional[str] = None,
+        pre_dispatch_refresh: Optional[Callable[[], tuple[bool, Optional[str]]]] = None,
     ) -> str:
         """
         Genera una respuesta completa consolidando el stream en un único texto continuo.
@@ -391,12 +435,15 @@ class OllamaBrain:
             and num_predict is None
             and not raise_on_error
             and untrusted_context is None
+            and pre_dispatch_refresh is None
         ):
             chunks = list(self.generate_response_stream(prompt, system_prompt=system_prompt))
         else:
-            extra_kw: dict[str, Any] = (
-                {"untrusted_context": untrusted_context} if untrusted_context is not None else {}
-            )
+            extra_kw: dict[str, Any] = {}
+            if untrusted_context is not None:
+                extra_kw["untrusted_context"] = untrusted_context
+            if pre_dispatch_refresh is not None:
+                extra_kw["pre_dispatch_refresh"] = pre_dispatch_refresh
             chunks = list(
                 self.generate_response_stream(
                     prompt,

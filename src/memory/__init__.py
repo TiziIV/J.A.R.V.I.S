@@ -1,14 +1,14 @@
 """
-Paquete `src.memory`: persistencia, políticas, recuperación, consola, captura verificada N8.1–N8.3 Subfase 2.
+Paquete `src.memory`: persistencia, políticas, recuperación, consola, captura verificada y `MemorySnapshotGuard` (N8.1–N8.3).
 
 En N8.1 se estableció `data/experiences.db`, políticas de ingesta, migraciones y `ExperienceStoreLock`.
 En N8.2 se completaron la recuperación determinista (`MemoryRetriever`), la API central (`MemoryEngine`),
 la consola administrativa (`/memoria`, `/privado`, `/incognito`), la importación manual de preferencias,
 la purga física controlada y los backups/restauraciones verificados por SHA-256.
-En N8.3 Subfase 1 y 2 se agregan esquema SQLite v2, idempotencia estricta, `store_version_token`,
-contratos criptográficos de evidencia verificada N5/N6, adaptadores desacoplados (`ExperienceCaptureService`)
-e invalidación automática por rollback confirmado.
-La integración consultiva en N6 / `EphemeralGoalStore` / `MemorySnapshotGuard` (Subfases 3 y 4) permanece reservada.
+En N8.3 (Subfases 1–4) se incorporan el esquema SQLite v2, idempotencia estricta, `store_version_token`,
+contratos criptográficos de evidencia verificada N5/N6, adaptadores desacoplados (`ExperienceCaptureService`),
+invalidación automática por rollback confirmado, integración consultiva con N6/`EphemeralGoalStore` y
+protección pre-dispatch `MemorySnapshotGuard`.
 """
 
 from src.memory.capture import (
@@ -104,6 +104,19 @@ from src.memory.policy import (
     validate_safe_read_json_path,
 )
 from src.memory.retriever import MemoryRetriever
+from src.memory.snapshot_guard import (
+    DEFAULT_MAX_REFRESH_RETRIEVALS,
+    DEFAULT_MAX_REVALIDATIONS,
+    MemorySnapshot,
+    MemorySnapshotGuard,
+    MemorySnapshotReference,
+    SnapshotMemoryPayload,
+    SnapshotValidationResult,
+    SnapshotValidationStatus,
+    compute_record_version_hash,
+    extract_n8_untrusted_payload_info,
+    is_valid_store_version_token,
+)
 from src.memory.store import ExperienceStore, ExperienceStoreLock
 
 __all__ = [
@@ -115,6 +128,8 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "CaptureBatchResult",
     "CaptureUnitOutcome",
+    "DEFAULT_MAX_REFRESH_RETRIEVALS",
+    "DEFAULT_MAX_REVALIDATIONS",
     "ExecutionInvalidationResult",
     "ExecutionVerificationEvidence",
     "ExperienceCaptureService",
@@ -150,6 +165,9 @@ __all__ = [
     "MemoryScopeContext",
     "MemoryScopeType",
     "MemorySearchCandidate",
+    "MemorySnapshot",
+    "MemorySnapshotGuard",
+    "MemorySnapshotReference",
     "MemorySource",
     "MemoryStatus",
     "MemorySubsystemError",
@@ -167,6 +185,9 @@ __all__ = [
     "RestoreResult",
     "RollbackInvalidationOutcome",
     "SOURCE_ALLOWED_CATEGORIES",
+    "SnapshotMemoryPayload",
+    "SnapshotValidationResult",
+    "SnapshotValidationStatus",
     "StoreStats",
     "VALID_VERIFICATION_SOURCE_LAYERS",
     "VerifiedExecutionEvidenceContract",
@@ -177,11 +198,14 @@ __all__ = [
     "compute_content_fingerprint",
     "compute_default_canonical_unit_id",
     "compute_execution_idempotency_key",
+    "compute_record_version_hash",
     "configure_connection",
+    "extract_n8_untrusted_payload_info",
     "fts5_available",
     "generate_memory_id",
     "is_test_environment",
     "is_valid_sha256_hex",
+    "is_valid_store_version_token",
     "normalize_scope",
     "normalize_text_for_search",
     "parse_iso_utc",

@@ -21,7 +21,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from config.prompts import JARVIS_SYSTEM_PROMPT
 from config.settings import (
@@ -369,6 +369,7 @@ class OpenAIBrain:
         max_output_tokens: Optional[int] = None,
         raise_on_error: bool = False,
         untrusted_context: Optional[str] = None,
+        pre_dispatch_refresh: Optional[Callable[[], tuple[bool, Optional[str]]]] = None,
     ) -> str:
         """
         Genera una respuesta con OpenAI GPT.
@@ -393,11 +394,27 @@ class OpenAIBrain:
         active_system_prompt = system_prompt or JARVIS_SYSTEM_PROMPT
         token_limit = int(max_output_tokens) if isinstance(max_output_tokens, int) and max_output_tokens > 0 else VOICE_MAX_TOKENS
         candidate_models = list(dict.fromkeys([primary_model, self.fallback_model_name]))
-        extra_kw: dict[str, Any] = (
-            {"untrusted_context": untrusted_context} if untrusted_context is not None else {}
-        )
 
         for index, candidate in enumerate(candidate_models):
+            current_untrusted = untrusted_context
+            if index > 0 and pre_dispatch_refresh is not None:
+                allowed, refreshed_untrusted = pre_dispatch_refresh()
+                if not allowed:
+                    abort_err = BrainError(
+                        provider="GPT",
+                        kind=BrainErrorKind.INVALID_REQUEST,
+                        user_message="Despacho abortado por protección pre-dispatch de memoria/privacidad N8.",
+                        model=candidate,
+                    )
+                    self.last_error = abort_err
+                    if raise_on_error:
+                        raise abort_err
+                    return abort_err.user_message
+                current_untrusted = refreshed_untrusted
+
+            extra_kw: dict[str, Any] = (
+                {"untrusted_context": current_untrusted} if current_untrusted is not None else {}
+            )
             payload = self._build_payload(
                 prompt=prompt,
                 system_prompt=active_system_prompt,

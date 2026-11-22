@@ -198,6 +198,27 @@ class MemoryEngine:
         """Devuelve el token monótono actual (`epoch:seq`) del almacén de experiencias."""
         return self.store.get_store_version_token()
 
+    def create_snapshot_guard(
+        self,
+        *,
+        request_id: str,
+        goal_id: str | None = None,
+        plan_id: str | None = None,
+        max_revalidations: int = 1,
+        max_refreshes: int = 1,
+    ) -> Any:
+        """Instancia un `MemorySnapshotGuard` vinculado a una solicitud concreta."""
+        from src.memory.snapshot_guard import MemorySnapshotGuard
+
+        return MemorySnapshotGuard(
+            memory_engine=self,
+            request_id=request_id,
+            goal_id=goal_id,
+            plan_id=plan_id,
+            max_revalidations=max_revalidations,
+            max_refreshes=max_refreshes,
+        )
+
     def verify_integrity(self, *, quarantine_on_corruption: bool = False) -> IntegrityReport:
         return self.store.verify_integrity(quarantine_on_corruption=quarantine_on_corruption)
 
