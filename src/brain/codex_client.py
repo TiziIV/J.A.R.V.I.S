@@ -724,10 +724,17 @@ class CodexBrain:
         system_prompt: Optional[str] = None,
         workspace_dir: Optional[str | Path] = None,
         timeout: Optional[float] = None,
+        untrusted_context: Optional[str] = None,
     ) -> str:
         """
         Valida precondiciones (habilitación, instalación, autenticación, workspace y sandbox)
         y ejecuta `codex exec --json --sandbox <sandbox>`.
+
+        Invariante de seguridad (remediación F-02):
+        - `codex exec` acepta un único argumento CLI posicional sin canal de rol `system`
+          separado; por ello, el contexto externo/N8 no confiable (`untrusted_context`) está
+          estrictamente PROHIBIDO en cualquier sandbox distinto de `read-only` (incluyendo
+          `workspace-write`).
         """
         if not self.enabled:
             raise BrainError(
@@ -742,6 +749,19 @@ class CodexBrain:
                 provider="Codex",
                 kind=BrainErrorKind.INVALID_REQUEST,
                 user_message=f"Modo de sandbox no permitido para Codex: '{sandbox}'.",
+                model=self.last_used_model,
+            )
+
+        clean_untrusted = (untrusted_context or "").strip() or None
+        untrusted_marker = "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+        if sandbox != "read-only" and (clean_untrusted is not None or untrusted_marker in (prompt or "")):
+            raise BrainError(
+                provider="Codex",
+                kind=BrainErrorKind.INVALID_REQUEST,
+                user_message=(
+                    "Por seguridad, Codex CLI no permite inyectar contexto externo/N8 no confiable "
+                    "cuando se ejecuta con permisos de escritura (--sandbox workspace-write)."
+                ),
                 model=self.last_used_model,
             )
 
@@ -771,6 +791,19 @@ class CodexBrain:
             )
 
         composed_prompt = prompt.strip()
+        if clean_untrusted is not None:
+            # Neutralizamos delimitadores de cierre falsos dentro de datos no confiables
+            # antes de anexarlos exclusivamente bajo `--sandbox read-only`.
+            safe_untrusted = (
+                clean_untrusted.replace("[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]", "[/EVIDENCIA_ESCAPADA]")
+                .replace("[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]", "[EVIDENCIA_ESCAPADA]")
+            )
+            composed_prompt = (
+                f"{composed_prompt}\n\n"
+                "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
+                f"{safe_untrusted}\n"
+                "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
+            )
         if system_prompt and system_prompt.strip():
             composed_prompt = (
                 f"[Contexto del asistente: {system_prompt.strip()}] "
@@ -823,17 +856,24 @@ class CodexBrain:
         workspace_dir: Optional[str | Path] = None,
         timeout: Optional[float] = None,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
+        _precomputed_classification: Optional[CodexTaskClassification] = None,
     ) -> str:
         """
         TIPO A: Ejecuta consultas, explicaciones, revisiones de código o análisis de arquitectura
         utilizando estrictamente `--sandbox read-only` (sin modificar archivos del repositorio).
+        El `untrusted_context` se transporta por separado y nunca participa en `classify_codex_task`.
         """
         self.last_error = None
         self.last_fallback_note = None
         self.last_task_type = "readonly"
         self.last_git_summary = None
 
-        classification = classify_codex_task(prompt)
+        classification = (
+            _precomputed_classification
+            if _precomputed_classification is not None
+            else classify_codex_task(prompt)
+        )
         if classification.is_destructive:
             err = BrainError(
                 provider="Codex",
@@ -853,6 +893,7 @@ class CodexBrain:
                 system_prompt=system_prompt,
                 workspace_dir=workspace_dir,
                 timeout=timeout,
+                untrusted_context=untrusted_context,
             )
         except BrainError as err:
             self.last_error = err
@@ -869,18 +910,40 @@ class CodexBrain:
         timeout: Optional[float] = None,
         allow_write: bool = True,
         raise_on_error: bool = False,
+        untrusted_context: Optional[str] = None,
+        _precomputed_classification: Optional[CodexTaskClassification] = None,
     ) -> str:
         """
         TIPO B: Ejecuta una tarea de programación autorizada utilizando `--sandbox workspace-write`.
         Valida previamente el workspace, protege cambios preexistentes en Git e inspecciona
         `git status` y `git diff` al finalizar sin realizar commit ni push automáticos.
+        Prohíbe estrictamente incorporar `untrusted_context` en modo `workspace-write` (F-02).
         """
         self.last_error = None
         self.last_fallback_note = None
         self.last_task_type = "coding"
         self.last_git_summary = None
 
-        classification = classify_codex_task(prompt)
+        if (untrusted_context or "").strip() or "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]" in (prompt or ""):
+            err = BrainError(
+                provider="Codex",
+                kind=BrainErrorKind.INVALID_REQUEST,
+                user_message=(
+                    "Por seguridad, `run_coding_task` con `--sandbox workspace-write` prohíbe "
+                    "inyectar contexto externo/N8 no confiable."
+                ),
+                model=self.last_used_model,
+            )
+            self.last_error = err
+            if raise_on_error:
+                raise err
+            return err.user_message
+
+        classification = (
+            _precomputed_classification
+            if _precomputed_classification is not None
+            else classify_codex_task(prompt)
+        )
         if classification.is_destructive:
             err = BrainError(
                 provider="Codex",
@@ -935,6 +998,7 @@ class CodexBrain:
                 system_prompt=system_prompt,
                 workspace_dir=valid_workspace,
                 timeout=timeout,
+                untrusted_context=None,
             )
 
             # Inspección post-ejecución de Git (Fase 4: verificar cambios sin hacer commit ni push)
@@ -982,18 +1046,17 @@ class CodexBrain:
         Punto de entrada unificado compatible con `BrainManager`.
         Distingue automáticamente entre consultas de solo lectura (Tipo A),
         edición autorizada (Tipo B) y solicitudes ambiguas o bloqueadas.
-        La clasificación de tarea se ejecuta exclusivamente sobre `prompt` (nunca sobre
-        `untrusted_context`) para impedir que contenido web externo escale permisos (F-05).
+
+        Invariantes de seguridad (remediación F-02):
+        1. `classify_codex_task()` se ejecuta UNA SOLA VEZ exclusivamente sobre el `prompt`
+           confiable del usuario, jamás sobre `untrusted_context`.
+        2. Cuando la tarea se ejecuta en modo `coding` (`--sandbox workspace-write`), todo
+           `untrusted_context` (N8, extracción web u otro) se omite por completo para impedir
+           que datos no confiables influyan sobre un agente con permisos de escritura en disco.
+        3. Solo en tareas `read-only` (`--sandbox read-only`) se permite transportar
+           `untrusted_context` separado hasta `_execute_codex_task`.
         """
         classification = classify_codex_task(prompt)
-        effective_prompt = (
-            f"{prompt}\n\n"
-            "[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]\n"
-            f"{untrusted_context}\n"
-            "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
-            if untrusted_context
-            else prompt
-        )
 
         if classification.is_destructive:
             err = BrainError(
@@ -1023,21 +1086,32 @@ class CodexBrain:
         )
 
         if effective_type == "coding" and should_write:
-            return self.run_coding_task(
-                effective_prompt,
+            omitted_untrusted = bool((untrusted_context or "").strip())
+            answer = self.run_coding_task(
+                prompt,
                 system_prompt=system_prompt,
                 workspace_dir=workspace_dir,
                 timeout=timeout,
                 allow_write=True,
                 raise_on_error=raise_on_error,
+                untrusted_context=None,
+                _precomputed_classification=classification,
             )
+            if omitted_untrusted and self.last_error is None:
+                note = "Contexto externo/N8 no confiable omitido por seguridad en modo workspace-write."
+                self.last_fallback_note = (
+                    f"{self.last_fallback_note} | {note}" if self.last_fallback_note else note
+                )
+            return answer
 
         return self.run_readonly_task(
-            effective_prompt,
+            prompt,
             system_prompt=system_prompt,
             workspace_dir=workspace_dir,
             timeout=timeout,
             raise_on_error=raise_on_error,
+            untrusted_context=untrusted_context,
+            _precomputed_classification=classification,
         )
 
 

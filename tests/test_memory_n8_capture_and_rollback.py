@@ -206,11 +206,12 @@ class N8CaptureContractsAdaptersAndRollbackTests(unittest.TestCase):
         self.assertEqual(REAL_BACKUPS_DIR.exists(), self._baseline_backups_exists)
 
     def _build_orchestrator(self, *, attach_capture: bool = True) -> tuple[FileEditorSkill, ChainOrchestrator]:
+        audit_logger = AuditLogger(log_file=self.n5_audit_log)
         fe = FileEditorSkill(
             authorized_roots=[self.cfg_root, self.n5_backup_dir],
             backup_dir=self.n5_backup_dir,
-            audit_logger=AuditLogger(log_file=self.n5_audit_log),
-            backup_manager=BackupManager(),
+            audit_logger=audit_logger,
+            backup_manager=BackupManager(audit_logger=audit_logger),
         )
         orch = ChainOrchestrator(
             file_editor=fe,

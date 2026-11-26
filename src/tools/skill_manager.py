@@ -96,6 +96,22 @@ class SkillManager:
             })
         return manifest
 
+    @staticmethod
+    def _is_file_mutating_skill(skill_name: str, skill_instance: BaseSkill) -> bool:
+        """Detecta skills que escriben o editan archivos en disco (incluso por alias o wrapper)."""
+        if skill_name in {"file_editor", "document_export"}:
+            return True
+        if getattr(skill_instance, "name", None) in {"file_editor", "document_export"}:
+            return True
+        if isinstance(skill_instance, (FileEditorSkill, DocumentExportSkill)):
+            return True
+        if bool(getattr(skill_instance, "mutates_files", False)) or bool(getattr(skill_instance, "modifies_files", False)):
+            return True
+        wrapped = getattr(skill_instance, "wrapped_skill", None) or getattr(skill_instance, "_skill", None)
+        if isinstance(wrapped, BaseSkill) and wrapped is not skill_instance:
+            return SkillManager._is_file_mutating_skill(wrapped.name, wrapped)
+        return False
+
     def execute_skill(self, skill_name: str, params: dict | None = None, **kwargs) -> str:
         """
         Busca una skill registrada por su nombre y ejecuta su método execute con los argumentos dados.
@@ -113,6 +129,11 @@ class SkillManager:
             return f"Lo siento señor, la habilidad '{skill_name}' no está registrada en mis sistemas."
 
         skill_instance = self.skills[skill_name]
+        if self._private_mode and self._is_file_mutating_skill(skill_name, skill_instance):
+            return (
+                f"Error: La habilidad de escritura en disco '{skill_name}' está bloqueada "
+                "durante el modo privado para impedir persistencia de datos de la sesión."
+            )
         
         # Consolidar parámetros recibidos como diccionario posicional o vía kwargs
         exec_args: dict = {}
@@ -157,6 +178,12 @@ class SkillManager:
             )
 
         skill_instance = self.skills[skill_name]
+        if self._private_mode and self._is_file_mutating_skill(skill_name, skill_instance):
+            return (
+                f"Error: La habilidad de escritura en disco '{skill_name}' está bloqueada "
+                "durante el modo privado para impedir persistencia de datos de la sesión.",
+                None,
+            )
         exec_args: dict = {}
         if isinstance(params, dict):
             exec_args.update(params)

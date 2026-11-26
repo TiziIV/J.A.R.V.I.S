@@ -1,8 +1,8 @@
 # J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Completa)
 
 > [!IMPORTANT]
-> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración) y **N8.3 Subfases 1 a 4** (`sqlite v2` + `store_version_token`, contratos v2.0 + `ExperienceCaptureService` + tombstones por rollback N5, integración consultiva N6 + `EphemeralGoalStore` + fronteras estructurales, y `MemorySnapshotGuard` + protección pre-dispatch en `BrainManager` y fallbacks).
-> **Estado de N8.3:** Implementación completa de Subfases 1–4 **pendiente de auditoría integral independiente**. Permanecen fuera de alcance actual los embeddings semánticos y la consolidación automática por LLM.
+> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración), **N8.3 Subfases 1 a 4** (`sqlite v2` + `store_version_token`, contratos v2.0 + `ExperienceCaptureService` + tombstones por rollback N5, integración consultiva N6 + `EphemeralGoalStore` + fronteras estructurales, y `MemorySnapshotGuard` + protección pre-dispatch en `BrainManager` y fallbacks) y la **ronda integral de remediación de auditoría independiente (F-01 a F-09)**.
+> **Estado de N8.3:** Hallazgos F-01 a F-09 remediados y verificados en suite global aislada, **pendientes de verificación independiente final por Antigravity Argon** antes del cierre oficial. Permanecen fuera de alcance actual los embeddings semánticos y la consolidación automática por LLM.
 
 ---
 
@@ -258,12 +258,46 @@ La protección no depende de instrucciones al modelo LLM sino de controles estru
      - `GeminiBrain`: separa `system_instruction` en `GenerateContentConfig` frente a `contents`.
      - `ClaudeBrain`: separa campo raíz `"system"` frente al bloque `user` dentro de `"messages"`.
      - `OpenAIBrain`: separa `"instructions"` / `"role": "system"` frente a `"input"` / `"role": "user"`.
-     - **`CodexBrain` (limitación CLI documentada):** `codex exec` acepta un único prompt CLI posicional sin campo JSON `system` independiente en transporte; la mitigación real en código consiste en clasificar permisos (`classify_codex_task`) exclusivamente sobre el `prompt` limpio antes de anexar el bloque `[EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]`, mantener `--sandbox read-only` salvo autorización explícita del `prompt` y aplicar `MemorySnapshotGuard` antes del subproceso.
+     - **`CodexBrain` (restricción CLI estricta y mitigación por sandbox, remediación F-02):** `codex exec` acepta un único argumento CLI posicional sin canal de rol `system` independiente en transporte; los delimitadores textuales **no** se asumen suficientes para aislar instrucciones cuando el agente tiene escritura. Por ello:
+       1. En tareas de programación con `--sandbox workspace-write` (`run_coding_task`), `CodexBrain` **prohíbe y omite por completo** todo `untrusted_context` (N8, `web_extraction` u otro contenido externo).
+       2. `classify_codex_task()` se ejecuta **una sola vez** exclusivamente sobre el `prompt` confiable del usuario antes de componer argumentos; los recuerdos no pueden alterar la clasificación ni disparar abortos falsos por palabras clave destructivas.
+       3. El contexto no confiable solo se transporta separado hacia `_execute_codex_task(..., sandbox="read-only")` donde `--sandbox read-only` impone contención a nivel de proceso CLI, siempre precedido por `MemorySnapshotGuard`.
+
+---
+
+## 13. Remediación de Auditoría Independiente N8.3 (F-01 a F-09)
+
+Los hallazgos identificados en la auditoría independiente de Antigravity Argon sobre `v5.4.0` (`3a868a8`) fueron remediados de forma integral y quedan **pendientes de verificación independiente**:
+
+1. **F-01 — Canonización de `task_id` bajo exposición N8 (`goal_models.py`, `goal_memory.py`, `goal_planner.py`, `goal_supervisor.py`, `goal_persistence.py`):**
+   - `GoalTask` aplica `SAFE_TASK_ID_RE` (`^[a-zA-Z0-9_-]{1,64}$`) sobre `task_id` y `depends_on` en toda creación y deserialización.
+   - Cuando `n8_exposed=True` o `replan_saw_n8=True`, el motor **jamás** acepta `task_id` elegidos libremente por el LLM: genera identificadores canónicos secuenciales (`t1`, `t2`, … / `t_r{gen}_{idx}`) mediante `canonicalize_n8_task_id_map()`, reescribe `depends_on` con mapa biyectivo estricto, rechaza duplicados/dependencias rotas y aplica canonización de respaldo en `extract_persistable_plan_dict()` (rechazando mutar planes ya aprobados). Ningún fragmento del identificador original aparece en `.goal.json`, `.wal.jsonl`, `title`, `history` ni `metadata`.
+2. **F-02 — Aislamiento de `CodexBrain` en `workspace-write` y clasificación única (`codex_client.py`, `brain_manager.py`):**
+   - Prohibición estructural de inyectar `untrusted_context` (N8 o web) con `--sandbox workspace-write`, verificación en `_execute_codex_task()` y eliminación de la segunda llamada a `classify_codex_task()` sobre prompts concatenados.
+3. **F-03 — Bloqueo de skills mutantes en modo privado y exclusión N8 en `document_export` (`goal_supervisor.py`, `skill_manager.py`):**
+   - `_execute_registered_skill()` (y `SkillManager` como defensa en profundidad) bloquean `FILE_MUTATING_SKILLS`, skills con `modifies_files`/`mutates_files`, subclases y wrappers de `FileEditorSkill` y `DocumentExportSkill` durante `/privado` y `/privado --sin-historial`.
+   - Se rastrea linaje transitivo `n8_tainted` y referencias `n8_refs_used_at_exec` en RAM a través del DAG: `document_export` excluye estructuralmente cualquier salida contaminada por N8 (incluso si el recuerdo sigue activo) y revalida referencias N8 del plan y del linaje upstream antes de escribir en disco, rechazando la exportación ante recuerdos revocados, expirados, modificados o no verificables.
+4. **F-04 — Estado privado en `MemoryConsoleHandler` perezoso (`console.py`):**
+   - `MemoryConsoleHandler` conserva `_private_mode` y `_allow_history` localmente sin crear `experiences.db` al activar `/privado` o `/privado --sin-historial`, y los propaga atómicamente al inicializar perezosamente `self.engine`.
+5. **F-05 — Invalidaciones de rollback N5 durante modo privado y eliminación del latch privado en `BrainManager` (`engine.py`, `capture.py`, `brain_manager.py`, `main.py`):**
+   - Un rollback N5 confirmado durante modo privado no escribe datos privados en disco ni pierde la invalidación: `ExperienceCaptureService` encola únicamente `(execution_id, reason, actor)` en RAM vía `MemoryEngine.queue_pending_rollback_invalidation()`, suprimiendo de inmediato sus recuerdos de `retrieve()`, `list_memories()` y `MemorySnapshotGuard` durante la sesión privada y drenándolos hacia SQLite al salir de `/privado` o al cerrar la sesión. Si el drenaje falla, `MemoryEngine` y `MemorySnapshotGuard` operan **fail-closed** hasta confirmar la invalidación.
+   - `BrainManager._sync_and_resolve_privacy_flags()` elimina el *latch* unidireccional de `private_active`, permitiendo transiciones limpias `/privado` ↔ `/privado --sin-historial` ↔ `/privado off` y recuperación tras excepciones.
+6. **F-06 — Inspección previa de firma sin `except TypeError:` sobre envíos (`brain_manager.py`, `goal_understanding.py`, `goal_planner.py`):**
+   - Reemplazados todos los bloques `except TypeError:` envolviendo invocaciones a proveedores o `query_raw` por `_filter_supported_kwargs()` (`inspect.signature`), asegurando una única llamada compatible y evitando segundos dispatches no validados ante un `TypeError` interno del proveedor.
+7. **F-07 — Consulta exacta de auditoría rollback sin `LIMIT 100` (`store.py`):**
+   - `ExperienceStore._has_rollback_audit_tx()` emplea `json_valid(details_json) = 1 AND json_extract(details_json, '$.source_execution_id') = ?` con parámetros vinculados y respaldo exhaustivo en Python, eliminando el límite de 100 filas y las coincidencias ambiguas por prefijo o comodines `LIKE`.
+8. **F-08 — Orden determinista de reconstrucción y frescura de sobres N8 (`goal_engine.py`, `goal_memory.py`):**
+   - `_prepare_n8_context_for_execution()` comprueba primero si existe un sobre vivo en RAM; al reconstruir desde referencias persistidas, `revalidate_envelope()` obtiene el `store_version_token` real vigente con doble comprobación anti-TOCTOU (antes y después de `get_memory()`), excluyendo recuerdos revocados/expirados sin auto-sustitución y aplicando comportamiento **fail-closed** si el token cambia o es ilegible durante la reconstrucción.
+9. **F-09 — Cableado perezoso único de `MemoryEngine` en consola y voz (`main.py`):**
+   - `attach_existing_memory_engine()` enlaza perezosamente `MemoryEngine` a `BrainManager` antes de `process_turn()` en consola y en `run_voice_session()` únicamente si `N8_ENABLED` está activo y `experiences.db` ya existe (sin crearla al arrancar, sin duplicar instancias y sin importar módulos de voz/GPU en consola).
+10. **Aislamiento de auditoría en pruebas (`skills/file_editor_skill.py`):**
+    - `AuditLogger` redirige automáticamente `AUDIT_LOG_FILE` hacia `temp/jarvis_test_isolated/` cuando `JARVIS_ENV=test`/`testing`, evitando escrituras colaterales en `data/file_editor_audit.jsonl` durante la ejecución de pruebas.
 
 ### Ejecución de tests
 
 ```powershell
 $env:JARVIS_ENV = "test"
-.\venv\Scripts\python.exe -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback tests.test_memory_n8_consultative_n6 tests.test_memory_n8_snapshot_guard tests.test_goal_engine tests.test_brain_deliberation tests.test_llm_routing -v
-.\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q
+.\venv\Scripts\python.exe -B -m unittest tests.test_memory_n8_audit_remediation -v
+.\venv\Scripts\python.exe -B -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback tests.test_memory_n8_consultative_n6 tests.test_memory_n8_snapshot_guard tests.test_memory_n8_audit_remediation tests.test_goal_engine tests.test_brain_deliberation tests.test_llm_routing tests.test_codex_integration -v
+.\venv\Scripts\python.exe -B -m unittest discover -s tests -p "test_*.py" -q
 ```

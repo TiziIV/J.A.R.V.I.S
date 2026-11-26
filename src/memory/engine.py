@@ -10,18 +10,21 @@ mantiene N8 estrictamente separado de N5 (autoridad/ejecución) y N6 (`GoalStore
 
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
 import json
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 from config import settings
-from src.brain.exceptions import is_sensitive_key
+from src.brain.exceptions import is_sensitive_key, redact_secrets
 from src.memory.models import (
     BackupInfo,
     ExecutionInvalidationResult,
     IntegrityReport,
     MemoryCategory,
     MemoryCreateInput,
+    MemoryPersistenceError,
     MemoryPolicyError,
     MemoryPrivateModeError,
     MemoryQueryFilter,
@@ -91,9 +94,14 @@ class MemoryEngine:
         self._allow_history_in_private: bool = True
         self._is_private_mode_fn: Callable[[], bool] | None = is_private_mode_fn
         self._allow_history_in_private_fn: Callable[[], bool] | None = allow_history_in_private_fn
+        # Remediación F-05: cola RAM mínima de invalidaciones de rollback N5 recibidas durante
+        # modo privado (exclusivamente execution_id + motivo/actor sanitizados, nunca texto privado).
+        self._state_lock: threading.RLock = threading.RLock()
+        self._pending_rollback_invalidations: dict[str, dict[str, str]] = {}
+        self._pending_invalidation_error: str | None = None
 
     # ------------------------------------------------------------------
-    # Control centralizado de Modo Privado
+    # Control centralizado de Modo Privado e Invalidaciones Diferidas (F-05)
     # ------------------------------------------------------------------
 
     @property
@@ -113,9 +121,146 @@ class MemoryEngine:
         return self._allow_history_in_private and ext_allow
 
     def set_private_mode(self, *, enabled: bool, allow_history: bool = True) -> None:
-        """Sincroniza el estado de privacidad del motor N8 sin escribir en disco ni logs sensibles."""
+        """
+        Sincroniza el estado de privacidad del motor N8 sin escribir contenido privado en disco.
+        Al salir de modo privado procesa automáticamente cualquier invalidación de rollback N5
+        pendiente en RAM antes de permitir nuevas lecturas históricas (remediación F-05).
+        """
         self._private_mode = bool(enabled)
         self._allow_history_in_private = True if not enabled else bool(allow_history)
+        if not self.is_private_mode and self.has_pending_rollback_invalidations():
+            try:
+                self.flush_pending_rollback_invalidations()
+            except Exception:
+                # Se conserva la cola pendiente y `_pending_invalidation_error` para operar
+                # en modo fail-closed ante cualquier lectura posterior hasta poder drenarla.
+                pass
+
+    def queue_pending_rollback_invalidation(
+        self,
+        execution_id: str,
+        *,
+        reason: str = "n5_rollback_confirmed",
+        actor: str = "n5_orchestrator",
+    ) -> bool:
+        """
+        Encola en RAM la invalidación de una ejecución N5 revertida durante el modo privado.
+        Solo almacena `execution_id`, `reason` y `actor` sanitizados (jamás texto de recuerdos
+        ni datos conversacionales) y suprime inmediatamente dichos recuerdos de lecturas en curso.
+        """
+        clean_exec_id = sanitize_memory_text(
+            execution_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="execution_id",
+            check_secrets=True,
+        )
+        clean_reason = sanitize_memory_text(
+            reason or "n5_rollback_confirmed",
+            max_chars=120,
+            allow_newlines=False,
+            field_name="reason",
+            check_secrets=True,
+        )
+        clean_actor = sanitize_memory_text(
+            actor or "n5_orchestrator",
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+        with self._state_lock:
+            is_new = clean_exec_id not in self._pending_rollback_invalidations
+            self._pending_rollback_invalidations[clean_exec_id] = {
+                "reason": clean_reason,
+                "actor": clean_actor,
+            }
+            return is_new
+
+    def has_pending_rollback_invalidations(self) -> bool:
+        with self._state_lock:
+            return bool(self._pending_rollback_invalidations)
+
+    def pending_rollback_execution_ids(self) -> tuple[str, ...]:
+        with self._state_lock:
+            return tuple(sorted(self._pending_rollback_invalidations.keys()))
+
+    def is_execution_pending_invalidation(self, execution_id: str | None) -> bool:
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            return False
+        clean_exec = execution_id.strip()
+        with self._state_lock:
+            return clean_exec in self._pending_rollback_invalidations
+
+    def flush_pending_rollback_invalidations(self) -> dict[str, Any]:
+        """
+        Procesa en SQLite todas las invalidaciones de rollback N5 encoladas durante el modo privado.
+        No crea nuevas experiencias ni escribe datos conversacionales; ante cualquier fallo de
+        persistencia conserva el ID en la cola y lanza `MemoryPersistenceError` (fail-closed).
+        """
+        if self.is_private_mode:
+            return {
+                "flushed": 0,
+                "pending": len(self.pending_rollback_execution_ids()),
+                "errors": {},
+            }
+
+        with self._state_lock:
+            pending_snapshot = list(self._pending_rollback_invalidations.items())
+
+        if not pending_snapshot:
+            with self._state_lock:
+                self._pending_invalidation_error = None
+            return {"flushed": 0, "pending": 0, "errors": {}}
+
+        flushed = 0
+        errors: dict[str, str] = {}
+        for exec_id, meta in pending_snapshot:
+            try:
+                inv = self.store.invalidate_by_execution(
+                    exec_id,
+                    reason=meta["reason"],
+                    actor=meta["actor"],
+                    private_mode=False,
+                )
+                if inv.invalidated_count == 0 and inv.already_inactive_count == 0:
+                    self.store.mark_execution_rollback_tombstone(
+                        exec_id,
+                        reason=meta["reason"],
+                        actor=meta["actor"],
+                        private_mode=False,
+                    )
+                with self._state_lock:
+                    self._pending_rollback_invalidations.pop(exec_id, None)
+                flushed += 1
+            except Exception as exc:
+                errors[exec_id] = redact_secrets(str(exc)) or type(exc).__name__
+
+        if errors:
+            summary_err = "; ".join(f"{k}: {v}" for k, v in sorted(errors.items()))
+            with self._state_lock:
+                self._pending_invalidation_error = summary_err
+            raise MemoryPersistenceError(
+                f"Fallo al procesar invalidaciones N5 pendientes al salir de modo privado (fail-closed): {summary_err}"
+            )
+
+        with self._state_lock:
+            self._pending_invalidation_error = None
+        return {"flushed": flushed, "pending": 0, "errors": {}}
+
+    def _ensure_pending_invalidations_applied_for_read(self) -> None:
+        """
+        Antes de cualquier consulta fuera de modo privado, exige que toda invalidación de
+        rollback N5 encolada en RAM se haya aplicado en SQLite; si falla, falla cerrado.
+        """
+        if not self.is_private_mode and self.has_pending_rollback_invalidations():
+            self.flush_pending_rollback_invalidations()
+
+    def _record_suppressed_by_pending_rollback(self, record: MemoryRecord | None) -> bool:
+        if record is None or record.source != MemorySource.EXECUTION_VERIFIED:
+            return False
+        exec_id = record.provenance.source_execution_id
+        return self.is_execution_pending_invalidation(exec_id)
 
     def _assert_write_allowed(self) -> None:
         self.policy.assert_write_allowed(private_mode=self.is_private_mode)
@@ -140,15 +285,16 @@ class MemoryEngine:
         max_chars_override: int | None = None,
     ) -> MemoryRetrievalResult:
         """
-        Recupera recuerdos relevantes de forma determinista respetando presupuesto y política
-        `--sin-historial` del modo privado.
+        Recupera recuerdos relevantes de forma determinista respetando presupuesto,
+        invalidaciones N5 pendientes (fail-closed) y política `--sin-historial`.
         """
+        self._ensure_pending_invalidations_applied_for_read()
         effective_allow_history = (
             self.allow_history_reads
             if allow_history_override is None
             else (bool(allow_history_override) and self.allow_history_reads)
         )
-        return self.retriever.retrieve(
+        result = self.retriever.retrieve(
             query,
             target=target,
             context_scope=context_scope,
@@ -161,9 +307,39 @@ class MemoryEngine:
             max_items_override=max_items_override,
             max_chars_override=max_chars_override,
         )
+        # Durante modo privado con historial (Opción A), cualquier recuerdo cuya ejecución N5
+        # fue revertida en esta sesión se excluye inmediatamente en RAM sin tocar disco.
+        if self.has_pending_rollback_invalidations() and result.items:
+            kept = tuple(
+                item
+                for item in result.items
+                if not self._record_suppressed_by_pending_rollback(item.record)
+            )
+            if len(kept) != len(result.items):
+                return MemoryRetrievalResult(
+                    query=result.query,
+                    target=result.target,
+                    items=kept,
+                    total_candidates=len(kept),
+                    returned_count=len(kept),
+                    total_chars=sum(len(it.rendered_excerpt) for it in kept),
+                    budget_max_items=result.budget_max_items,
+                    budget_max_chars=result.budget_max_chars,
+                    truncated_by_budget=result.truncated_by_budget,
+                    blocked_by_history_policy=result.blocked_by_history_policy,
+                    backend_used=result.backend_used,
+                    store_version_token=result.store_version_token,
+                )
+        return result
 
     def get_memory(self, memory_id: str) -> MemoryRecord | None:
-        return self.store.get_memory(memory_id)
+        self._ensure_pending_invalidations_applied_for_read()
+        rec = self.store.get_memory(memory_id)
+        if rec is not None and self._record_suppressed_by_pending_rollback(rec):
+            # Durante modo privado devolvemos vista lógica REVOKED en RAM sin escribir en SQLite
+            # para que MemorySnapshotGuard y GoalMemoryBridge lo excluyan de inmediato.
+            return dataclass_replace(rec, status=MemoryStatus.REVOKED)
+        return rec
 
     def list_memories(
         self,
@@ -177,7 +353,8 @@ class MemoryEngine:
         limit: int = 100,
         offset: int = 0,
     ) -> list[MemoryRecord]:
-        return self.store.list_memories(
+        self._ensure_pending_invalidations_applied_for_read()
+        records = self.store.list_memories(
             status=status,
             category=category,
             source=source,
@@ -187,6 +364,17 @@ class MemoryEngine:
             limit=limit,
             offset=offset,
         )
+        if not self.has_pending_rollback_invalidations():
+            return records
+        filtered: list[MemoryRecord] = []
+        for rec in records:
+            if self._record_suppressed_by_pending_rollback(rec):
+                if status == MemoryStatus.ACTIVE:
+                    continue
+                filtered.append(dataclass_replace(rec, status=MemoryStatus.REVOKED))
+            else:
+                filtered.append(rec)
+        return filtered
 
     def get_revisions(self, memory_id: str) -> list[MemoryRevision]:
         return self.store.get_revisions(memory_id)
@@ -196,6 +384,7 @@ class MemoryEngine:
 
     def get_store_version_token(self) -> str:
         """Devuelve el token monótono actual (`epoch:seq`) del almacén de experiencias."""
+        self._ensure_pending_invalidations_applied_for_read()
         return self.store.get_store_version_token()
 
     def create_snapshot_guard(
@@ -319,7 +508,9 @@ class MemoryEngine:
         )
 
     def is_execution_invalidated(self, execution_id: str) -> bool:
-        """Consulta en SQLite si una ejecución fue revertida o invalidada previamente."""
+        """Consulta si una ejecución fue revertida (en cola RAM pendiente o en SQLite)."""
+        if self.is_execution_pending_invalidation(execution_id):
+            return True
         return self.store.is_execution_invalidated(execution_id)
 
     def mark_execution_rollback_tombstone(

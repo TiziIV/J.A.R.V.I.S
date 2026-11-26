@@ -26,6 +26,7 @@ from src.brain.exceptions import redact_secrets
 from src.brain.goal_memory import (
     GoalMemoryBridge,
     build_skeleton_task_labels,
+    canonicalize_n8_task_id_map,
     collect_grounded_anchors,
     separate_grounded_skill_params,
 )
@@ -48,7 +49,7 @@ from src.brain.goal_models import (
 )
 from src.brain.goal_persistence import EphemeralGoalStore, GoalStore
 from src.brain.goal_planner import validate_plan_dag
-from src.brain.goal_skill_selector import GoalSkillSelector
+from src.brain.goal_skill_selector import FILE_MUTATING_SKILLS, GoalSkillSelector
 from src.context.policy import sanitize_untrusted_label
 from src.tools.skill_manager import SkillManager
 
@@ -713,10 +714,35 @@ class ExecutionSupervisor:
         upstream_outputs: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         """Ejecuta tareas puramente cognitivas (`SAFE_PLANNING`) aislando datos externos."""
+        # Remediación F-03: propagar trazabilidad transitiva N8 desde dependencias upstream
+        # para impedir que una síntesis posterior que consume datos N8 pase como limpia.
+        upstream_n8_tainted = any(
+            bool(dep_data.get("n8_tainted"))
+            or (
+                isinstance(dep_data.get("evidence"), dict)
+                and (
+                    dep_data["evidence"].get("n8_exposed_at_exec")
+                    or dep_data["evidence"].get("n8_tainted")
+                )
+            )
+            or (
+                isinstance(dep_data.get("untrusted_envelope"), dict)
+                and (
+                    dep_data["untrusted_envelope"].get("trust_level") == "untrusted_long_term_memory"
+                    or dep_data["untrusted_envelope"].get("provenance") == "n8_memory"
+                    or bool(dep_data["untrusted_envelope"].get("historical_references"))
+                )
+            )
+            for dep_data in upstream_outputs.values()
+        )
+        if upstream_n8_tainted:
+            task.n8_exposed_at_exec = True
+            plan.n8_context_exposed = True
+
         snippets: list[str] = []
         untrusted_count = 0
         for dep_id, dep_data in upstream_outputs.items():
-            if dep_data.get("untrusted_envelope"):
+            if dep_data.get("untrusted_envelope") or dep_data.get("n8_tainted"):
                 untrusted_count += 1
                 # El resumen se conserva únicamente dentro del JSON de observaciones escapado.
             else:
@@ -747,6 +773,9 @@ class ExecutionSupervisor:
                 n8_query_id_used = valid_env.n8_query_id
                 task.n8_exposed_at_exec = True
                 plan.n8_context_exposed = True
+                # Guardamos las referencias N8 exactas usadas en RAM para revalidarlas antes de
+                # cualquier exportación downstream incluso si el sobre del plan se revalidó después.
+                task.set_ephemeral_annotation("n8_refs_used_at_exec", tuple(valid_env.references))
                 untrusted_count += len(valid_env.items)
                 n8_history_items = [
                     {
@@ -810,9 +839,13 @@ class ExecutionSupervisor:
             "untrusted_hardware_context": bool(safe_hw_ctx),
             "verified_at": utc_now_iso(),
         }
-        if n8_query_id_used is not None:
+        if n8_query_id_used is not None or upstream_n8_tainted:
             ev_dict["n8_exposed_at_exec"] = True
-            ev_dict["n8_query_id"] = n8_query_id_used
+            ev_dict["n8_tainted"] = True
+            if n8_query_id_used is not None:
+                ev_dict["n8_query_id"] = n8_query_id_used
+            if n8_history_items:
+                ev_dict["n8_memory_ids"] = [it["memory_id"] for it in n8_history_items]
         return {
             "output_summary": redact_secrets(base_summary),
             "evidence": ev_dict,
@@ -823,27 +856,208 @@ class ExecutionSupervisor:
             ),
         }
 
+    @staticmethod
+    def _is_task_n8_tainted(task: GoalTask) -> bool:
+        """Indica estructuralmente si una tarea estuvo expuesta a recuerdos N8 o deriva de ellos."""
+        ev = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+        env = task.untrusted_envelope if isinstance(task.untrusted_envelope, dict) else {}
+        meta = task.metadata if isinstance(task.metadata, dict) else {}
+        return bool(
+            getattr(task, "n8_exposed_at_exec", False)
+            or getattr(task, "n8_influenced", False)
+            or getattr(task, "provenance_origin", "") == "llm_with_n8"
+            or ev.get("n8_exposed_at_exec")
+            or ev.get("n8_tainted")
+            or env.get("trust_level") == "untrusted_long_term_memory"
+            or env.get("provenance") == "n8_memory"
+            or bool(env.get("historical_references"))
+            or meta.get("n8_influenced")
+            or meta.get("provenance_origin") == "llm_with_n8"
+        )
+
+    @staticmethod
+    def _is_document_export_skill(skill_name: Optional[str], skill_instance: Any) -> bool:
+        """Detecta `document_export` por nombre o por herencia/instancia para evitar bypass por alias."""
+        if skill_name == "document_export":
+            return True
+        if skill_instance is None:
+            return False
+        if getattr(skill_instance, "name", None) == "document_export":
+            return True
+        try:
+            from skills.document_export_skill import DocumentExportSkill
+
+            if isinstance(skill_instance, DocumentExportSkill):
+                return True
+        except Exception:
+            pass
+        wrapped = getattr(skill_instance, "wrapped_skill", None) or getattr(skill_instance, "_skill", None)
+        if wrapped is not None and wrapped is not skill_instance:
+            return ExecutionSupervisor._is_document_export_skill(None, wrapped)
+        return False
+
+    @classmethod
+    def _is_file_mutating_skill(cls, task: GoalTask, skill_instance: Any) -> bool:
+        """
+        Determina estructuralmente si una skill puede crear, editar o exportar archivos en disco
+        (cubre `FILE_MUTATING_SKILLS`, metadatos, herencia de `FileEditorSkill`/`DocumentExportSkill`
+        y wrappers declarados para impedir bypass por nombres alternativos en modo privado).
+        """
+        if task.skill_name in FILE_MUTATING_SKILLS:
+            return True
+        if isinstance(task.metadata, dict) and bool(task.metadata.get("modifies_files")):
+            return True
+        if skill_instance is None:
+            return False
+        if bool(getattr(skill_instance, "mutates_files", False)) or bool(getattr(skill_instance, "modifies_files", False)):
+            return True
+        if getattr(skill_instance, "name", None) in FILE_MUTATING_SKILLS:
+            return True
+        if cls._is_document_export_skill(task.skill_name, skill_instance):
+            return True
+        try:
+            from skills.file_editor_skill import FileEditorSkill
+
+            if isinstance(skill_instance, FileEditorSkill):
+                return True
+        except Exception:
+            pass
+        wrapped = getattr(skill_instance, "wrapped_skill", None) or getattr(skill_instance, "_skill", None)
+        if wrapped is not None and wrapped is not skill_instance:
+            return cls._is_file_mutating_skill(task, wrapped)
+        return False
+
     def _execute_registered_skill(
         self,
         plan: GoalPlan,
         task: GoalTask,
         upstream_outputs: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
-        """Invoca una skill real del `SkillManager` preservando fronteras de confianza."""
+        """Invoca una skill real del `SkillManager` preservando fronteras de confianza y privacidad."""
         assert task.skill_name is not None
         params = dict(task.skill_params)
+        skill_instance = self.skill_manager.skills.get(task.skill_name)
 
-        # Si es `document_export`, enriquecer contenido usando evidencias upstream limpias.
-        if task.skill_name == "document_export" and upstream_outputs:
-            upstream_lines = [
-                f"- **{dep_id}**: {data.get('summary', '')}"
-                for dep_id, data in upstream_outputs.items()
-            ]
-            current_content = str(params.get("content") or "").strip()
-            enriched = (
-                f"{current_content}\n\n## Evidencia Recopilada\n" + "\n".join(upstream_lines)
-            ).strip()
-            params["content"] = redact_secrets(enriched)
+        # Remediación F-03.A: en modo privado (`/privado` y `/privado --sin-historial`)
+        # se bloquea estructuralmente toda skill capaz de mutar o exportar archivos en disco.
+        if self._is_private_active() and self._is_file_mutating_skill(task, skill_instance):
+            raise GoalPolicyViolationError(
+                f"Operación de escritura en disco mediante '{task.skill_name}' bloqueada durante el modo privado "
+                "para impedir persistencia de datos privados o históricos."
+            )
+
+        is_doc_export = self._is_document_export_skill(task.skill_name, skill_instance)
+        if is_doc_export:
+            upstream_has_n8 = any(
+                bool(data.get("n8_tainted"))
+                or (
+                    isinstance(data.get("evidence"), dict)
+                    and (
+                        data["evidence"].get("n8_exposed_at_exec")
+                        or data["evidence"].get("n8_tainted")
+                    )
+                )
+                or (
+                    isinstance(data.get("untrusted_envelope"), dict)
+                    and (
+                        data["untrusted_envelope"].get("trust_level") == "untrusted_long_term_memory"
+                        or data["untrusted_envelope"].get("provenance") == "n8_memory"
+                        or bool(data["untrusted_envelope"].get("historical_references"))
+                    )
+                )
+                for data in upstream_outputs.values()
+            )
+            plan_has_n8_refs = bool(
+                isinstance(plan.goal.context.extra, dict)
+                and plan.goal.context.extra.get("n8_memory_refs")
+            )
+            task_is_n8_tainted = self._is_task_n8_tainted(task)
+
+            # Remediación F-03.B: revalidación obligatoria de frescura N8 antes de cualquier
+            # persistencia documental en disco si el plan o sus entradas tuvieron exposición N8.
+            upstream_refs_used: list[Any] = []
+            for data in upstream_outputs.values():
+                for ref_u in (data.get("n8_refs_used") or ()):
+                    upstream_refs_used.append(ref_u)
+
+            if upstream_has_n8 or upstream_refs_used or plan_has_n8_refs or task_is_n8_tainted or getattr(plan, "n8_context_exposed", False):
+                if self.memory_bridge is not None:
+                    _env_now, reval_report = self.memory_bridge.revalidate_envelope(
+                        goal=plan.goal,
+                        plan=plan,
+                        allow_history_in_private=self._allow_history_active(),
+                    )
+                    if reval_report.blocked_by_privacy:
+                        raise GoalPolicyViolationError(
+                            "Exportación documental rechazada: la política de privacidad bloquea el uso de referencias N8."
+                        )
+                    if reval_report.excluded_ids:
+                        raise GoalPolicyViolationError(
+                            "Exportación documental rechazada: una o más referencias N8 asociadas fueron "
+                            "revocadas, expiradas, purgadas o modificadas antes de escribir en disco."
+                        )
+                    if upstream_refs_used:
+                        up_reval = self.memory_bridge.revalidate_references(
+                            upstream_refs_used,
+                            allow_history_in_private=self._allow_history_active(),
+                        )
+                        if up_reval.blocked_by_privacy or up_reval.excluded_ids:
+                            raise GoalPolicyViolationError(
+                                "Exportación documental rechazada: una o más referencias N8 consumidas por "
+                                "tareas previas fueron revocadas, expiradas, purgadas o modificadas antes de exportar."
+                            )
+                    if (plan_has_n8_refs or upstream_has_n8 or upstream_refs_used) and self.memory_bridge.memory_engine is None:
+                        raise GoalPolicyViolationError(
+                            "Exportación documental rechazada: no es posible validar la frescura de las referencias N8."
+                        )
+                elif upstream_has_n8 or upstream_refs_used or plan_has_n8_refs or task_is_n8_tainted:
+                    raise GoalPolicyViolationError(
+                        "Exportación documental rechazada: no existe puente N8 disponible para verificar frescura."
+                    )
+
+            # Si la propia tarea de exportación fue propuesta bajo exposición N8, verificar
+            # que el contenido no derive de texto no anclado del LLM/N8.
+            if task_is_n8_tainted:
+                anchors = collect_grounded_anchors(plan.goal)
+                grounded_p, ephemeral_p = separate_grounded_skill_params(params, anchors=anchors)
+                if "content" in ephemeral_p:
+                    raise GoalPolicyViolationError(
+                        "Exportación documental rechazada: el contenido propuesto deriva de contexto N8 no anclado."
+                    )
+                params = grounded_p
+
+            # Filtrado estructural de `upstream_outputs`: jamás concatenar salidas con procedencia
+            # N8 (aunque el recuerdo siga activo), ni resultados que mezclen texto confiable y N8.
+            if upstream_outputs:
+                clean_upstream_lines: list[str] = []
+                excluded_n8_upstream = 0
+                for dep_id, data in upstream_outputs.items():
+                    ev_d = data.get("evidence") if isinstance(data.get("evidence"), dict) else {}
+                    env_d = data.get("untrusted_envelope") if isinstance(data.get("untrusted_envelope"), dict) else {}
+                    dep_is_n8 = bool(
+                        data.get("n8_tainted")
+                        or ev_d.get("n8_exposed_at_exec")
+                        or ev_d.get("n8_tainted")
+                        or env_d.get("trust_level") == "untrusted_long_term_memory"
+                        or env_d.get("provenance") == "n8_memory"
+                        or bool(env_d.get("historical_references"))
+                    )
+                    if dep_is_n8:
+                        excluded_n8_upstream += 1
+                        continue
+                    clean_upstream_lines.append(f"- **{dep_id}**: {data.get('summary', '')}")
+
+                current_content = str(params.get("content") or "").strip()
+                if excluded_n8_upstream > 0 and not clean_upstream_lines and not current_content:
+                    raise GoalPolicyViolationError(
+                        "Exportación documental rechazada: todas las evidencias previas tienen procedencia N8 "
+                        "no exportable a disco."
+                    )
+                if clean_upstream_lines:
+                    enriched = (
+                        f"{current_content}\n\n## Evidencia Recopilada\n" + "\n".join(clean_upstream_lines)
+                    ).strip()
+                    params["content"] = redact_secrets(enriched)
 
         custom_envelope_override = (
             type(self.skill_manager).execute_skill_with_envelope
@@ -1041,10 +1255,29 @@ class ExecutionSupervisor:
             return False
 
         anchors = collect_grounded_anchors(plan.goal) if replan_saw_n8 else None
+        existing_task_ids = {t.task_id for t in plan.tasks}
+        replan_gen = plan.replan_count + 1
+        canonical_replan_pairs: Optional[list[tuple[str, list[str]]]] = None
+        if replan_saw_n8:
+            # Remediación F-01: en replanificación expuesta a N8 nunca aceptamos `task_id` libre
+            # del modelo/factory; generamos IDs canónicos `t_r{gen}_{idx}` y reescribimos `depends_on`.
+            try:
+                raw_replan_specs = [(t.task_id, list(t.depends_on)) for t in candidate_tasks]
+                _replan_map, canonical_replan_pairs = canonicalize_n8_task_id_map(
+                    raw_replan_specs,
+                    stage="replanning",
+                    generation=replan_gen,
+                    existing_task_ids=existing_task_ids,
+                )
+            except ValueError:
+                plan.goal.transition_to(GoalStatus.RUNNING)
+                return False
+
         isolated_candidates: list[GoalTask] = []
-        for new_task in candidate_tasks:
+        for idx, new_task in enumerate(candidate_tasks):
             self.skill_selector.validate_task(new_task, plan.goal.constraints)
-            if replan_saw_n8:
+            if replan_saw_n8 and canonical_replan_pairs is not None:
+                canonical_tid, mapped_deps = canonical_replan_pairs[idx]
                 skill_obj = self.skill_selector.skill_manager.skills.get(new_task.skill_name) if new_task.skill_name else None
                 skill_schema = getattr(skill_obj, "parameters", None) if skill_obj else None
                 grounded_params, eph_params = separate_grounded_skill_params(
@@ -1064,29 +1297,44 @@ class ExecutionSupervisor:
                                 plan.goal.transition_to(GoalStatus.RUNNING)
                                 return False
                 skel_title, skel_desc, skel_exp = build_skeleton_task_labels(
-                    task_id=new_task.task_id,
+                    task_id=canonical_tid,
                     skill_name=new_task.skill_name,
                     stage="replanning",
                 )
+                # Conservar exclusivamente metadatos estructurales permitidos (nunca texto libre ni ID original).
+                safe_replan_meta: dict[str, Any] = {
+                    "replan_for": failed_task.task_id,
+                    "provenance_origin": "llm_with_n8",
+                    "n8_influenced": True,
+                    "ephemeral_details_in_ram": True,
+                }
+                orig_meta = new_task.metadata if isinstance(new_task.metadata, dict) else {}
+                for flag_key in ("use_chain_orchestrator", "modifies_files", "proposed_by_ai"):
+                    if flag_key in orig_meta:
+                        safe_replan_meta[flag_key] = bool(orig_meta[flag_key])
+                if isinstance(orig_meta.get("target_app"), str) and orig_meta["target_app"].lower() in (
+                    (anchors or {}).get("grounded_scalars", set())
+                ):
+                    safe_replan_meta["target_app"] = orig_meta["target_app"]
+                if isinstance(orig_meta.get("file_path"), str) and orig_meta["file_path"] in (
+                    (anchors or {}).get("target_paths") or []
+                ):
+                    safe_replan_meta["file_path"] = orig_meta["file_path"]
+
                 clean_task = GoalTask(
-                    task_id=new_task.task_id,
+                    task_id=canonical_tid,
                     title=skel_title,
                     description=skel_desc,
                     skill_name=new_task.skill_name,
                     skill_params=grounded_params,
                     risk_category=new_task.risk_category,
                     requires_approval=new_task.requires_approval,
-                    depends_on=list(new_task.depends_on),
+                    depends_on=mapped_deps,
                     expected_output=skel_exp,
                     max_retries=new_task.max_retries,
                     timeout_sec=new_task.timeout_sec,
-                    replan_generation=new_task.replan_generation or (plan.replan_count + 1),
-                    metadata={
-                        **dict(new_task.metadata or {}),
-                        "provenance_origin": "llm_with_n8",
-                        "n8_influenced": True,
-                        "ephemeral_details_in_ram": True,
-                    },
+                    replan_generation=new_task.replan_generation or replan_gen,
+                    metadata=safe_replan_meta,
                 )
                 clean_task.set_ephemeral_annotation(
                     "ai_n8_replan_task",
@@ -1219,6 +1467,37 @@ class ExecutionSupervisor:
         plan.record_event("goal_timeout", timeout_msg, to_status=GoalStatus.FAILED.value)
         self._persist(plan, "goal_timeout", {"error": timeout_msg})
 
+    def _has_tainted_n8_lineage(self, plan: GoalPlan, task: GoalTask, visited: Optional[set[str]] = None) -> bool:
+        """Comprueba recursivamente si `task` o alguno de sus ancestros DAG estuvo expuesto a N8."""
+        seen = visited if visited is not None else set()
+        if task.task_id in seen:
+            return False
+        seen.add(task.task_id)
+        if self._is_task_n8_tainted(task):
+            return True
+        for dep_id in task.depends_on:
+            dep_task = plan.get_task(dep_id)
+            if dep_task is not None and self._has_tainted_n8_lineage(plan, dep_task, seen):
+                return True
+        return False
+
+    def _collect_n8_refs_in_lineage(self, plan: GoalPlan, task: GoalTask, visited: Optional[set[str]] = None) -> list[Any]:
+        """Reúne en RAM todas las referencias N8 consumidas por `task` o sus ancestros DAG."""
+        seen = visited if visited is not None else set()
+        if task.task_id in seen:
+            return []
+        seen.add(task.task_id)
+        collected: list[Any] = []
+        ann = task.get_ephemeral_annotations()
+        refs_here = ann.get("n8_refs_used_at_exec") or ()
+        for ref_item in refs_here:
+            collected.append(ref_item)
+        for dep_id in task.depends_on:
+            dep_task = plan.get_task(dep_id)
+            if dep_task is not None:
+                collected.extend(self._collect_n8_refs_in_lineage(plan, dep_task, seen))
+        return collected
+
     def _collect_upstream_outputs(
         self,
         plan: GoalPlan,
@@ -1232,6 +1511,8 @@ class ExecutionSupervisor:
                     "summary": dep_task.output_summary or "",
                     "evidence": dep_task.execution_evidence or {},
                     "untrusted_envelope": dep_task.untrusted_envelope,
+                    "n8_tainted": self._has_tainted_n8_lineage(plan, dep_task),
+                    "n8_refs_used": tuple(self._collect_n8_refs_in_lineage(plan, dep_task)),
                 }
         return outputs
 

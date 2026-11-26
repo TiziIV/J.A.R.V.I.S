@@ -96,6 +96,97 @@ def _speak_blocking(tts_instance: Any, text: str) -> None:
         time.sleep(0.04)
 
 
+def _resolve_existing_n8_db_path() -> Optional[Any]:
+    """
+    Resuelve la ruta efectiva de la base de datos N8 sin crearla en disco.
+    Respeta el aislamiento de pruebas (`JARVIS_ENV=test`) y `settings.EXPERIENCES_DB_PATH`.
+    """
+    from pathlib import Path
+    from config import settings
+
+    if not settings.N8_ENABLED:
+        return None
+
+    env_mode = os.environ.get("JARVIS_ENV", "").strip().lower()
+    configured_path = Path(settings.EXPERIENCES_DB_PATH)
+    if env_mode in {"test", "testing"}:
+        sandbox_root = (Path(settings.BASE_DIR) / "temp" / "jarvis_test_isolated").resolve()
+        try:
+            configured_resolved = configured_path.resolve()
+            configured_resolved.relative_to(sandbox_root)
+            candidate = configured_resolved
+        except (OSError, ValueError):
+            custom_root = os.environ.get("JARVIS_TEST_TEMP_ROOT", "").strip()
+            target_root = sandbox_root
+            if custom_root:
+                try:
+                    cand_root = Path(custom_root).resolve()
+                    cand_root.relative_to(sandbox_root)
+                    target_root = cand_root
+                except (OSError, ValueError):
+                    target_root = sandbox_root
+            candidate = target_root / "experiences.db"
+    else:
+        candidate = configured_path
+
+    return candidate if candidate.exists() and candidate.is_file() else None
+
+
+def attach_existing_memory_engine(
+    brain_manager: BrainManager,
+    *,
+    memory_engine: Optional[Any] = None,
+) -> Optional[Any]:
+    """
+    Conecta perezosamente una única instancia de `MemoryEngine` a `brain_manager` cuando
+    `settings.N8_ENABLED` está activo y `experiences.db` ya existe en disco (remediación F-09).
+
+    Garantías:
+    - Reutiliza cualquier instancia ya existente en `memory_engine` o `brain_manager.memory_engine`.
+    - Nunca crea `experiences.db` ni directorios de memoria solo por arrancar J.A.R.V.I.S.
+    - Aplica el estado de privacidad actual de `brain_manager.memory` antes de exponer el motor.
+    - No importa ningún módulo de audio, STT, TTS ni GPU.
+    """
+    existing = memory_engine or getattr(brain_manager, "memory_engine", None)
+    if existing is not None:
+        if getattr(brain_manager, "memory_engine", None) is None:
+            brain_manager.memory_engine = existing
+        return existing
+
+    db_path = _resolve_existing_n8_db_path()
+    if db_path is None:
+        return None
+
+    from src.memory.engine import MemoryEngine
+    from src.memory.store import ExperienceStore
+
+    conv_mem = getattr(brain_manager, "memory", None)
+    priv_now = bool(conv_mem is not None and getattr(conv_mem, "is_private_mode", False) is True)
+    allow_hist_now = (
+        True
+        if not priv_now
+        else (conv_mem is None or getattr(conv_mem, "private_allow_history", True) is not False)
+    )
+
+    store = ExperienceStore(db_path=db_path)
+    engine = MemoryEngine(
+        store=store,
+        is_private_mode_fn=(
+            (lambda: getattr(conv_mem, "is_private_mode", False) is True)
+            if conv_mem is not None
+            else None
+        ),
+        allow_history_in_private_fn=(
+            (lambda: getattr(conv_mem, "private_allow_history", True) is not False)
+            if conv_mem is not None
+            else None
+        ),
+    )
+    engine.set_private_mode(enabled=priv_now, allow_history=allow_hist_now)
+    brain_manager.memory_engine = engine
+    return engine
+
+
 def run_console_session(
     brain_manager: BrainManager,
     *,
@@ -153,35 +244,50 @@ def run_console_session(
     def _ensure_memory_engine() -> Any:
         nonlocal memory_engine_instance
         if memory_engine_instance is None:
-            from src.memory.engine import MemoryEngine
+            existing_attached = getattr(brain_manager, "memory_engine", None)
+            if existing_attached is not None:
+                memory_engine_instance = existing_attached
+            else:
+                from src.memory.engine import MemoryEngine
 
-            conv_mem = brain_manager.memory
-            memory_engine_instance = MemoryEngine(
-                is_private_mode_fn=(
-                    (lambda: getattr(conv_mem, "is_private_mode", False) is True)
-                    if conv_mem is not None
-                    else None
-                ),
-                allow_history_in_private_fn=(
-                    (lambda: getattr(conv_mem, "private_allow_history", True) is not False)
-                    if conv_mem is not None
-                    else None
-                ),
-            )
-            if getattr(brain_manager, "memory_engine", None) is None:
+                conv_mem = brain_manager.memory
+                priv_now = bool(conv_mem is not None and getattr(conv_mem, "is_private_mode", False) is True)
+                allow_hist_now = (
+                    True
+                    if not priv_now
+                    else (conv_mem is None or getattr(conv_mem, "private_allow_history", True) is not False)
+                )
+                memory_engine_instance = MemoryEngine(
+                    is_private_mode_fn=(
+                        (lambda: getattr(conv_mem, "is_private_mode", False) is True)
+                        if conv_mem is not None
+                        else None
+                    ),
+                    allow_history_in_private_fn=(
+                        (lambda: getattr(conv_mem, "private_allow_history", True) is not False)
+                        if conv_mem is not None
+                        else None
+                    ),
+                )
+                memory_engine_instance.set_private_mode(enabled=priv_now, allow_history=allow_hist_now)
                 brain_manager.memory_engine = memory_engine_instance
+        elif getattr(brain_manager, "memory_engine", None) is None:
+            brain_manager.memory_engine = memory_engine_instance
         if goal_console_handler is not None and hasattr(goal_console_handler, "set_memory_engine"):
             goal_console_handler.set_memory_engine(memory_engine_instance)
         return memory_engine_instance
 
     def _resolve_existing_memory_engine() -> Optional[Any]:
-        if memory_engine_instance is not None:
-            return memory_engine_instance
-        from config import settings
-
-        if settings.N8_ENABLED and settings.EXPERIENCES_DB_PATH.exists():
-            return _ensure_memory_engine()
-        return None
+        nonlocal memory_engine_instance
+        resolved = attach_existing_memory_engine(
+            brain_manager,
+            memory_engine=memory_engine_instance,
+        )
+        if resolved is not None:
+            memory_engine_instance = resolved
+            if goal_console_handler is not None and hasattr(goal_console_handler, "set_memory_engine"):
+                goal_console_handler.set_memory_engine(memory_engine_instance)
+        return memory_engine_instance
 
     def _on_private_mode_changed(enabled: bool, _allow_history: bool) -> None:
         if goal_console_handler is not None:
@@ -189,6 +295,15 @@ def run_console_session(
                 goal_console_handler.sync_private_mode_exit()
             elif getattr(goal_console_handler, "_goal_engine", None) is not None:
                 goal_console_handler._goal_engine._reconcile_private_state()
+        if (
+            not enabled
+            and memory_engine_instance is not None
+            and hasattr(memory_engine_instance, "flush_pending_rollback_invalidations")
+        ):
+            try:
+                memory_engine_instance.flush_pending_rollback_invalidations()
+            except Exception as flush_err:
+                logger.warning(f"Aviso drenando invalidaciones N5 pendientes al salir de privado: {flush_err}")
 
     def _ensure_memory_capture_service() -> Optional[Any]:
         nonlocal memory_capture_instance
@@ -582,6 +697,9 @@ def run_console_session(
                 continue
 
             # 5. Procesamiento del turno mediante BrainManager (selector -> skills locales -> LLM)
+            # Remediación F-09: conectar perezosamente MemoryEngine si `experiences.db` ya existe
+            # en disco (sin crearla nunca si no existe y respetando el estado privado vigente).
+            _resolve_existing_memory_engine()
             turn_result = brain_manager.process_turn(text, voice_mode=tts_active)
 
             if turn_result.selection_source == "ONE_SHOT":
@@ -605,6 +723,22 @@ def run_console_session(
         if goal_console_handler is not None and _is_private_mode_active():
             try:
                 goal_console_handler.sync_private_mode_exit()
+            except Exception:
+                pass
+        # Remediación F-05: al cerrar sesión, si existían invalidaciones de rollback N5
+        # encoladas durante modo privado, liberar modo privado y drenar solo los IDs N5
+        # (sin escribir nunca datos de la conversación privada).
+        if memory_engine_instance is not None and hasattr(
+            memory_engine_instance, "has_pending_rollback_invalidations"
+        ):
+            try:
+                if memory_engine_instance.has_pending_rollback_invalidations():
+                    if brain_manager.memory is not None and getattr(
+                        brain_manager.memory, "is_private_mode", False
+                    ):
+                        brain_manager.memory.exit_private_mode()
+                    memory_engine_instance.set_private_mode(enabled=False, allow_history=True)
+                    memory_engine_instance.flush_pending_rollback_invalidations()
             except Exception:
                 pass
         if tts_engine is not None:
@@ -639,6 +773,8 @@ def run_voice_session(brain_manager: BrainManager) -> None:
     skill_manager = brain_manager.skill_manager or SkillManager()
     brain_manager.memory = memory
     brain_manager.skill_manager = skill_manager
+    # Remediación F-09: conectar perezosamente MemoryEngine en modo voz si `experiences.db` ya existe.
+    attach_existing_memory_engine(brain_manager)
 
     # System Tray reactivo con callback de limpieza de memoria
     def on_tray_clear_memory() -> None:
@@ -687,6 +823,7 @@ def run_voice_session(brain_manager: BrainManager) -> None:
         Procesa una orden hablada dentro de la sesión activa usando BrainManager
         (selector de motor -> habilidades locales -> deliberación/motores con fallback).
         """
+        attach_existing_memory_engine(brain_manager)
         result = brain_manager.process_turn(user_transcript, voice_mode=True, sfx=sfx)
         if result.fallback_info:
             print(f"[Fallback] {result.fallback_info}")
@@ -749,6 +886,16 @@ def run_voice_session(brain_manager: BrainManager) -> None:
             pass
 
     finally:
+        eng_voice = getattr(brain_manager, "memory_engine", None)
+        if eng_voice is not None and hasattr(eng_voice, "has_pending_rollback_invalidations"):
+            try:
+                if eng_voice.has_pending_rollback_invalidations():
+                    if getattr(memory, "is_private_mode", False):
+                        memory.exit_private_mode()
+                    eng_voice.set_private_mode(enabled=False, allow_history=True)
+                    eng_voice.flush_pending_rollback_invalidations()
+            except Exception:
+                pass
         wake_detector.stop()
         tts.close()
         try:

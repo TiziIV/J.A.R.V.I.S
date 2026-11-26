@@ -574,7 +574,9 @@ class N8ConsultativeIntegrationAndPrivacyTests(unittest.TestCase):
         )
         res_rep = eng_replan.execute_plan(p_replan)
         self.assertEqual(res_rep.final_status, GoalStatus.PARTIAL)
-        self.assertEqual(p_replan.get_task("t_alt").status, TaskStatus.COMPLETED)
+        # Remediación F-01: bajo `replan_saw_n8=True`, el `task_id` libre (`t_alt`) se canoniza a `t_r1_1`.
+        self.assertIsNone(p_replan.get_task("t_alt"))
+        self.assertEqual(p_replan.get_task("t_r1_1").status, TaskStatus.COMPLETED)
         self.assertEqual(len(replan_calls), 1)
         self.assertIsNotNone(replan_calls[0])
         self.assertIn("SEC_VAL", replan_calls[0] or "")
@@ -1083,11 +1085,12 @@ class N8ConsultativeIntegrationAndPrivacyTests(unittest.TestCase):
         self.assertEqual(list(prog_goal_store.plans_dir.glob("*.goal.json")), [])
 
         # En modo privado, ChainOrchestrator dentro de N6 queda bloqueado para proteger disco.
+        fe_audit = AuditLogger(log_file=self.work_dir / "fe_audit.jsonl")
         fe = FileEditorSkill(
             authorized_roots=[self.work_dir],
             backup_dir=self.work_dir / "fe_bkp",
-            audit_logger=AuditLogger(log_file=self.work_dir / "fe_audit.jsonl"),
-            backup_manager=BackupManager(),
+            audit_logger=fe_audit,
+            backup_manager=BackupManager(audit_logger=fe_audit),
         )
         orch = ChainOrchestrator(
             file_editor=fe,

@@ -21,7 +21,7 @@ import inspect
 import re
 import string
 import unicodedata
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 import uuid
 
 from config.prompts import JARVIS_SYSTEM_PROMPT, JARVIS_TEXT_SYSTEM_PROMPT
@@ -248,6 +248,9 @@ class BrainManager:
         self.last_n8_guard_status: Optional[str] = None
         self.last_n8_validation_reason: Optional[str] = None
         self.last_n8_validation_result: Optional[SnapshotValidationResult] = None
+        # Rastrea si el modo privado de `memory_engine` fue propagado desde `ConversationMemory`
+        # para poder liberarlo al salir de `/privado` sin latch unidireccional (remediación F-05).
+        self._synced_engine_private_from_memory: bool = False
 
     # ------------------------------------------------------------------
     # Propiedades de acceso diferido a los motores
@@ -605,20 +608,56 @@ class BrainManager:
             "[/EVIDENCIA_EXTERNA_NO_CONFIABLE_SOLO_LECTURA]"
         )
 
+    def _sync_and_resolve_privacy_flags(
+        self,
+        *,
+        allow_history_override: Optional[bool] = None,
+    ) -> tuple[bool, bool]:
+        """
+        Sincroniza el estado de privacidad entre `ConversationMemory`, `MemoryEngine` y
+        `SkillManager` sin enganche unidireccional (*latch*, remediación F-05), y retorna
+        `(private_active, allow_history)` vigentes en el instante exacto del turno o dispatch.
+        """
+        mem_present = self.memory is not None
+        mem_priv = bool(mem_present and getattr(self.memory, "is_private_mode", False) is True)
+        mem_allow = (not mem_present) or (getattr(self.memory, "private_allow_history", True) is not False)
+
+        if self.memory_engine is not None and hasattr(self.memory_engine, "set_private_mode"):
+            if mem_priv:
+                self.memory_engine.set_private_mode(enabled=True, allow_history=mem_allow)
+                self._synced_engine_private_from_memory = True
+            elif self._synced_engine_private_from_memory:
+                # La privacidad fue activada vía ConversationMemory y ya se desactivó:
+                # liberamos MemoryEngine para drenar invalidaciones pendientes y restaurar modo normal.
+                self.memory_engine.set_private_mode(enabled=False, allow_history=True)
+                self._synced_engine_private_from_memory = False
+
+        eng_priv = bool(
+            self.memory_engine is not None
+            and getattr(self.memory_engine, "is_private_mode", False) is True
+        )
+        private_active = bool(mem_priv or eng_priv)
+
+        if self.skill_manager is not None and hasattr(self.skill_manager, "set_private_mode"):
+            self.skill_manager.set_private_mode(private_active)
+
+        if not private_active:
+            allow_history = allow_history_override is not False
+        else:
+            eng_allow = (
+                self.memory_engine is None
+                or getattr(self.memory_engine, "allow_history_reads", True) is not False
+            )
+            allow_history = bool(mem_allow and eng_allow and (allow_history_override is not False))
+        return private_active, allow_history
+
     def _effective_privacy_flags(
         self,
         *,
         allow_history_override: Optional[bool] = None,
     ) -> tuple[bool, bool]:
         """Calcula `(private_active, allow_history)` en vivo en el instante exacto del dispatch."""
-        priv_mem = self.memory is not None and getattr(self.memory, "is_private_mode", False) is True
-        priv_eng = self.memory_engine is not None and getattr(self.memory_engine, "is_private_mode", False) is True
-        private_active = bool(priv_mem or priv_eng)
-
-        hist_mem = self.memory is None or getattr(self.memory, "private_allow_history", True) is not False
-        hist_eng = self.memory_engine is None or getattr(self.memory_engine, "allow_history_reads", True) is not False
-        allow_history = bool(hist_mem and hist_eng and (allow_history_override is not False))
-        return private_active, allow_history
+        return self._sync_and_resolve_privacy_flags(allow_history_override=allow_history_override)
 
     @staticmethod
     def _compose_untrusted_context(
@@ -662,6 +701,29 @@ class BrainManager:
         if kwarg_name in sig.parameters:
             return True
         return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+    @staticmethod
+    def _filter_supported_kwargs(fn: Any, candidate_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        """
+        Inspecciona la firma de `fn` ANTES de invocarla para construir exactamente una llamada
+        compatible con mocks heredados o adaptadores reales, evitando cualquier `except TypeError:`
+        que pudiera desencadenar un segundo envío físico ante un TypeError interno (F-06).
+        """
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return {k: v for k, v in candidate_kwargs.items() if k == "system_prompt"}
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return dict(candidate_kwargs)
+        supported: dict[str, Any] = {}
+        for key, val in candidate_kwargs.items():
+            param = sig.parameters.get(key)
+            if param is not None and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                supported[key] = val
+        return supported
 
     @staticmethod
     def _assert_dispatch_isolation(
@@ -992,35 +1054,59 @@ class BrainManager:
             )
 
         max_tokens = VOICE_MAX_TOKENS if voice_mode else TEXT_MAX_TOKENS
-        extra_untrusted_kw: dict[str, Any] = (
-            {"untrusted_context": effective_untrusted} if effective_untrusted else {}
-        )
         fallback_prompt = self._attach_untrusted_data_to_prompt(prompt, effective_untrusted)
 
-        def _hook_kw(brain_fn: Any) -> dict[str, Any]:
+        def _invoke_provider_fn(
+            brain_fn: Any,
+            candidate_kwargs: dict[str, Any],
+            *,
+            forbid_fallback_untrusted_for_coding: bool = False,
+        ) -> str:
+            """
+            Construye una ÚNICA invocación segura mediante inspección previa de firma (F-06).
+            Nunca atrapa `TypeError` tras iniciar la ejecución del proveedor para impedir
+            segundos dispatches sin validación pre-dispatch.
+            """
+            accepts_untrusted = self._accepts_kwarg(brain_fn, "untrusted_context")
+            call_kw = dict(candidate_kwargs)
+            if effective_untrusted and accepts_untrusted:
+                call_kw["untrusted_context"] = effective_untrusted
+                prompt_to_send = prompt
+            elif effective_untrusted and not accepts_untrusted:
+                if forbid_fallback_untrusted_for_coding:
+                    from src.brain.codex_client import classify_codex_task
+
+                    cls_res = classify_codex_task(prompt)
+                    prompt_to_send = (
+                        prompt
+                        if (cls_res.task_type == "coding" and cls_res.authorized_write)
+                        else fallback_prompt
+                    )
+                else:
+                    prompt_to_send = fallback_prompt
+            else:
+                prompt_to_send = prompt
+
             if dispatch_state is not None and self._accepts_kwarg(brain_fn, "pre_dispatch_refresh"):
-                return {"pre_dispatch_refresh": _pre_dispatch_hook}
-            return {}
+                call_kw["pre_dispatch_refresh"] = _pre_dispatch_hook
+
+            filtered_kw = self._filter_supported_kwargs(brain_fn, call_kw)
+            return brain_fn(prompt_to_send, **filtered_kw)
 
         if mode in ("OLLAMA", "OLLAMA_UNCENSORED"):
             brain = self.ollama_brain
             override_model: Optional[str] = None
             if mode == "OLLAMA_UNCENSORED":
                 override_model = getattr(brain, "uncensored_model_name", OLLAMA_MODEL_UNCENSORED)
-            hook_kw = _hook_kw(brain.generate_response)
-            try:
-                text = brain.generate_response(
-                    prompt,
-                    system_prompt=system_prompt,
-                    model_override=override_model,
-                    num_predict=max_tokens,
-                    raise_on_error=True,
-                    **extra_untrusted_kw,
-                    **hook_kw,
-                )
-            except TypeError:
-                # Compatibilidad con mocks simples en pruebas que solo aceptan (prompt, system_prompt=...)
-                text = brain.generate_response(fallback_prompt, system_prompt=system_prompt)
+            text = _invoke_provider_fn(
+                brain.generate_response,
+                {
+                    "system_prompt": system_prompt,
+                    "model_override": override_model,
+                    "num_predict": max_tokens,
+                    "raise_on_error": True,
+                },
+            )
             if is_provider_error(text):
                 err = getattr(brain, "last_error", None) or BrainError(
                     provider="Ollama",
@@ -1037,18 +1123,14 @@ class BrainManager:
 
         if mode == "GEMINI":
             brain_g = self.gemini_brain
-            hook_kw = _hook_kw(brain_g.generate_response)
-            try:
-                text = brain_g.generate_response(
-                    prompt,
-                    system_prompt=system_prompt,
-                    max_output_tokens=max_tokens,
-                    raise_on_error=True,
-                    **extra_untrusted_kw,
-                    **hook_kw,
-                )
-            except TypeError:
-                text = brain_g.generate_response(fallback_prompt, system_prompt=system_prompt)
+            text = _invoke_provider_fn(
+                brain_g.generate_response,
+                {
+                    "system_prompt": system_prompt,
+                    "max_output_tokens": max_tokens,
+                    "raise_on_error": True,
+                },
+            )
             if is_provider_error(text):
                 err = getattr(brain_g, "last_error", None) or BrainError(
                     provider="Gemini",
@@ -1063,16 +1145,14 @@ class BrainManager:
 
         if mode == "CLAUDE":
             brain_c = self.claude_brain
-            try:
-                text = brain_c.generate_response(
-                    prompt,
-                    system_prompt=system_prompt,
-                    max_output_tokens=max_tokens,
-                    raise_on_error=True,
-                    **extra_untrusted_kw,
-                )
-            except TypeError:
-                text = brain_c.generate_response(fallback_prompt, system_prompt=system_prompt)
+            text = _invoke_provider_fn(
+                brain_c.generate_response,
+                {
+                    "system_prompt": system_prompt,
+                    "max_output_tokens": max_tokens,
+                    "raise_on_error": True,
+                },
+            )
             if is_provider_error(text):
                 err = getattr(brain_c, "last_error", None) or BrainError(
                     provider="Claude",
@@ -1087,18 +1167,14 @@ class BrainManager:
 
         if mode == "GPT":
             brain_o = self.openai_brain
-            hook_kw = _hook_kw(brain_o.generate_response)
-            try:
-                text = brain_o.generate_response(
-                    prompt,
-                    system_prompt=system_prompt,
-                    max_output_tokens=max_tokens,
-                    raise_on_error=True,
-                    **extra_untrusted_kw,
-                    **hook_kw,
-                )
-            except TypeError:
-                text = brain_o.generate_response(fallback_prompt, system_prompt=system_prompt)
+            text = _invoke_provider_fn(
+                brain_o.generate_response,
+                {
+                    "system_prompt": system_prompt,
+                    "max_output_tokens": max_tokens,
+                    "raise_on_error": True,
+                },
+            )
             if is_provider_error(text):
                 err = getattr(brain_o, "last_error", None) or BrainError(
                     provider="GPT",
@@ -1113,15 +1189,14 @@ class BrainManager:
 
         if mode == "CODEX":
             brain_x = self.codex_brain
-            try:
-                text = brain_x.generate_response(
-                    prompt,
-                    system_prompt=system_prompt,
-                    raise_on_error=True,
-                    **extra_untrusted_kw,
-                )
-            except TypeError:
-                text = brain_x.generate_response(fallback_prompt, system_prompt=system_prompt)
+            text = _invoke_provider_fn(
+                brain_x.generate_response,
+                {
+                    "system_prompt": system_prompt,
+                    "raise_on_error": True,
+                },
+                forbid_fallback_untrusted_for_coding=True,
+            )
             if is_provider_error(text):
                 err = getattr(brain_x, "last_error", None) or BrainError(
                     provider="Codex",
@@ -1188,19 +1263,8 @@ class BrainManager:
                 selection_reason="Entrada vacía.",
             )
 
-        # Sincronización estricta del estado privado hacia skills y motor N8.
-        private_active = (
-            (self.memory is not None and getattr(self.memory, "is_private_mode", False) is True)
-            or (self.memory_engine is not None and getattr(self.memory_engine, "is_private_mode", False) is True)
-        )
-        allow_history = (
-            (self.memory is None or getattr(self.memory, "private_allow_history", True) is not False)
-            and (self.memory_engine is None or getattr(self.memory_engine, "allow_history_reads", True) is not False)
-        )
-        if self.skill_manager is not None and hasattr(self.skill_manager, "set_private_mode"):
-            self.skill_manager.set_private_mode(private_active)
-        if self.memory_engine is not None and hasattr(self.memory_engine, "set_private_mode"):
-            self.memory_engine.set_private_mode(enabled=private_active, allow_history=allow_history)
+        # Sincronización estricta y reversible del estado privado hacia skills y motor N8 (F-05).
+        private_active, allow_history = self._sync_and_resolve_privacy_flags()
 
         # 0. Si el selector estaba esperando una respuesta puntual del usuario, intentamos resolverla.
         if self.awaiting_mode_choice:

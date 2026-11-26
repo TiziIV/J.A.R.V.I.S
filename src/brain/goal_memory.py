@@ -607,6 +607,91 @@ def strip_volatile_n8_keys_recursive(value: Any) -> Any:
     return value
 
 
+# Formato canónico exclusivo generado por el motor cuando existe exposición N8 (F-01).
+# El sistema jamás persiste `task_id` libremente elegido por un LLM expuesto a recuerdos N8.
+CANONICAL_N8_TASK_ID_RE: re.Pattern[str] = re.compile(r"^(?:t[1-9]\d*|t_r[1-9]\d*_[1-9]\d*)$")
+
+
+def is_canonical_n8_task_id(task_id: str) -> bool:
+    """Indica si `task_id` sigue el esquema secuencial determinista exigido bajo exposición N8."""
+    return isinstance(task_id, str) and bool(CANONICAL_N8_TASK_ID_RE.match(task_id.strip()))
+
+
+def canonicalize_n8_task_id_map(
+    raw_items: Sequence[tuple[str, Sequence[str]]],
+    *,
+    stage: str = "planning",
+    generation: int = 1,
+    existing_task_ids: Optional[set[str]] = None,
+) -> tuple[dict[str, str], list[tuple[str, list[str]]]]:
+    """
+    Construye un mapa biyectivo determinista `raw_id -> canonical_id` para tareas generadas
+    bajo exposición N8 y reescribe todas las dependencias `depends_on` sin conservar ningún
+    fragmento del identificador original propuesto por el LLM (remediación F-01).
+
+    Rechaza con `ValueError`:
+    - Identificadores duplicados o colisiones con tareas existentes.
+    - Dependencias inexistentes, ambiguas, duplicadas o autorreferenciales.
+    """
+    existing = set(existing_task_ids or set())
+    used_canonical: set[str] = set(existing)
+    id_map: dict[str, str] = {}
+    normalized_entries: list[tuple[str, list[str]]] = []
+
+    gen_num = max(1, int(generation))
+    seq_counter = 1
+
+    for idx, (raw_id_input, raw_deps) in enumerate(raw_items, start=1):
+        raw_key = str(raw_id_input).strip() if isinstance(raw_id_input, str) and raw_id_input.strip() else f"__anon_{idx}"
+        if raw_key in id_map:
+            raise ValueError(f"Identificador de tarea duplicado en propuesta N8: posición {idx}.")
+        if raw_key in existing:
+            raise ValueError(f"Identificador de tarea propuesto colisiona con tarea existente en posición {idx}.")
+
+        while True:
+            cand = f"t_r{gen_num}_{seq_counter}" if stage == "replanning" else f"t{seq_counter}"
+            seq_counter += 1
+            if cand not in used_canonical:
+                used_canonical.add(cand)
+                id_map[raw_key] = cand
+                break
+
+        deps_list: list[str] = []
+        seen_raw_deps: set[str] = set()
+        for raw_dep in (raw_deps or ()):
+            dep_str = str(raw_dep).strip() if raw_dep is not None else ""
+            if not dep_str:
+                continue
+            if dep_str in seen_raw_deps:
+                raise ValueError(f"Dependencia duplicada en tarea propuesta #{idx}.")
+            seen_raw_deps.add(dep_str)
+            deps_list.append(dep_str)
+        normalized_entries.append((raw_key, deps_list))
+
+    rewritten: list[tuple[str, list[str]]] = []
+    for raw_key, raw_deps in normalized_entries:
+        canonical_id = id_map[raw_key]
+        mapped_deps: list[str] = []
+        for dep_raw in raw_deps:
+            if dep_raw == raw_key:
+                raise ValueError(f"Dependencia autorreferencial detectada para '{canonical_id}'.")
+            if dep_raw in id_map:
+                target_dep = id_map[dep_raw]
+            elif dep_raw in existing:
+                target_dep = dep_raw
+            else:
+                raise ValueError(
+                    f"Dependencia inexistente o no anclada en propuesta N8 para '{canonical_id}'."
+                )
+            if target_dep == canonical_id:
+                raise ValueError(f"Ciclo trivial detectado tras canonizar '{canonical_id}'.")
+            if target_dep not in mapped_deps:
+                mapped_deps.append(target_dep)
+        rewritten.append((canonical_id, mapped_deps))
+
+    return id_map, rewritten
+
+
 def build_skeleton_task_labels(
     *,
     task_id: str,
@@ -1123,7 +1208,17 @@ class GoalMemoryBridge:
         plan: Optional[Any] = None,
         allow_history_in_private: Optional[bool] = None,
     ) -> tuple[Optional[RuntimeN8Envelope], RevalidationReport]:
-        """Revalida el sobre RAM vigente y actualiza las referencias persistibles sin exponer texto."""
+        """
+        Revalida el sobre RAM vigente (o reconstruye uno desde referencias persistidas)
+        obteniendo el `store_version_token` real vigente de `MemoryEngine` con verificación
+        doble anti-carrera (remediación F-08).
+
+        Garantías:
+        - Nunca inventa tokens ni reutiliza tokens persistidos sin volver a validar.
+        - Nunca sustituye automáticamente referencias revocadas, expiradas o modificadas.
+        - Si el token es ilegible o cambia durante la reconstrucción/revalidación, falla
+          cerrado (`None`) limpiando los sobres en RAM.
+        """
         goal_id = str(getattr(goal, "goal_id", "") or "").strip()
         plan_id = str(getattr(plan, "plan_id", "") or "").strip() or None
         current = self.get_envelope(plan_id=plan_id, goal_id=goal_id)
@@ -1139,11 +1234,62 @@ class GoalMemoryBridge:
             if isinstance(extra, Mapping) and isinstance(extra.get("n8_memory_refs"), (list, tuple)):
                 raw_refs = list(extra.get("n8_memory_refs") or [])
 
+        engine = self.memory_engine
+
+        def _read_valid_live_token() -> Optional[str]:
+            if engine is None:
+                return None
+            try:
+                tok = str(engine.get_store_version_token() or "").strip()
+            except Exception:
+                return None
+            return tok if is_valid_store_version_token(tok) else None
+
+        # Pre-check de token vivo antes de resolver referencias (cuando hay referencias y motor).
+        token_before: Optional[str] = None
+        if raw_refs and engine is not None and settings.N8_ENABLED:
+            token_before = _read_valid_live_token()
+            if token_before is None:
+                now_iso = _utc_now_iso()
+                excluded_fail = {
+                    (ref.memory_id if isinstance(ref, N8MemoryReference) else str(ref.get("memory_id") or "")): "token_unavailable"
+                    for ref in raw_refs
+                }
+                self.clear_goal_envelopes(goal_id=goal_id, plan_id=plan_id)
+                return None, RevalidationReport(
+                    checked_at=now_iso,
+                    revision_policy=self.revision_policy.value,
+                    valid_references=(),
+                    valid_items=(),
+                    excluded_ids=MappingProxyType(excluded_fail),
+                    blocked_by_privacy=False,
+                )
+
         report = self.revalidate_references(
             raw_refs,
             cached_items=cached_map,
             allow_history_in_private=allow_history_in_private,
         )
+
+        # Post-check de estabilidad del token tras resolver referencias (anti-TOCTOU F-08).
+        live_token = ""
+        if report.valid_items and not report.blocked_by_privacy:
+            token_after = _read_valid_live_token()
+            if token_after is None or token_before is None or token_after != token_before:
+                # Si el token cambió durante la reconstrucción/revalidación -> fail-closed.
+                self.clear_goal_envelopes(goal_id=goal_id, plan_id=plan_id)
+                fail_excluded = dict(report.excluded_ids)
+                for vref in report.valid_references:
+                    fail_excluded[vref.memory_id] = "token_changed_during_revalidation"
+                return None, RevalidationReport(
+                    checked_at=report.checked_at,
+                    revision_policy=report.revision_policy,
+                    valid_references=(),
+                    valid_items=(),
+                    excluded_ids=MappingProxyType(fail_excluded),
+                    blocked_by_privacy=False,
+                )
+            live_token = token_after
 
         # Actualiza las referencias persistibles en `goal.context.extra` manteniendo solo las vigentes.
         ctx = getattr(goal, "context", None)
@@ -1161,6 +1307,37 @@ class GoalMemoryBridge:
                 self.clear_goal_envelopes(goal_id=goal_id, plan_id=plan_id)
             return None, report
 
+        # Actualizamos `store_version_token_at_fetch` en las referencias válidas con el token
+        # realmente verificado contra el almacén (nunca un token antiguo persistido ni vacío).
+        validated_refs = tuple(
+            N8MemoryReference(
+                memory_id=r.memory_id,
+                revision_number=r.revision_number,
+                version_hash=r.version_hash,
+                category=r.category,
+                source=r.source,
+                scope_type=r.scope_type,
+                scope_key=r.scope_key,
+                status_at_fetch=r.status_at_fetch,
+                store_version_token_at_fetch=live_token,
+                trust_boundary=N8_TRUST_BOUNDARY,
+            )
+            for r in report.valid_references
+        )
+        vref_map = {r.memory_id: r for r in validated_refs}
+        validated_items = tuple(
+            RuntimeN8MemoryItem(
+                reference=vref_map.get(it.reference.memory_id, it.reference),
+                title=it.title,
+                summary=it.summary,
+                content=it.content,
+                rendered_excerpt=it.rendered_excerpt,
+                confidence=it.confidence,
+                score=it.score,
+            )
+            for it in report.valid_items
+        )
+
         if current is None:
             ctx_extra = getattr(ctx, "extra", {}) if ctx is not None and isinstance(getattr(ctx, "extra", None), Mapping) else {}
             persisted_qid = str(ctx_extra.get("n8_query_id") or "").strip() or _new_query_id()
@@ -1174,8 +1351,8 @@ class GoalMemoryBridge:
                 n8_query_id=persisted_qid,
                 goal_id=goal_id,
                 plan_id=plan_id,
-                references=report.valid_references,
-                items=report.valid_items,
+                references=validated_refs,
+                items=validated_items,
                 trust_boundary=N8_TRUST_BOUNDARY,
                 retrieved_at=report.checked_at,
                 scope=MappingProxyType(scope_dict),
@@ -1185,16 +1362,17 @@ class GoalMemoryBridge:
                 budget_max_items=settings.N8_TEXT_MAX_ITEMS,
                 budget_max_chars=settings.N8_TEXT_MAX_CHARS,
                 untrusted_advisory_json="",
-                store_version_token="",
+                store_version_token=live_token,
                 revalidated_at=report.checked_at,
             )
         else:
+            token_changed = bool(live_token and live_token != current.store_version_token)
             refreshed = RuntimeN8Envelope(
                 n8_query_id=current.n8_query_id,
                 goal_id=goal_id,
                 plan_id=plan_id or current.plan_id,
-                references=report.valid_references,
-                items=report.valid_items,
+                references=validated_refs,
+                items=validated_items,
                 trust_boundary=N8_TRUST_BOUNDARY,
                 retrieved_at=current.retrieved_at,
                 scope=current.scope,
@@ -1203,8 +1381,12 @@ class GoalMemoryBridge:
                 query_text=current.query_text,
                 budget_max_items=current.budget_max_items,
                 budget_max_chars=current.budget_max_chars,
-                untrusted_advisory_json=current.untrusted_advisory_json if not report.excluded_ids else "",
-                store_version_token=current.store_version_token,
+                untrusted_advisory_json=(
+                    current.untrusted_advisory_json
+                    if (not report.excluded_ids and not token_changed)
+                    else ""
+                ),
+                store_version_token=live_token,
                 revalidated_at=report.checked_at,
             )
         with self._lock:

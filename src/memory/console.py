@@ -54,23 +54,60 @@ class MemoryConsoleHandler:
         self._on_private_mode_changed: Optional[Callable[[bool, bool], None]] = on_private_mode_changed
         self._input_fn: Callable[[str], str] = input_fn
         self._output_fn: Callable[[str], None] = output_fn
+        # Remediación F-04: mantener el estado de privacidad en la propia consola incluso
+        # antes de instanciar perezosamente `MemoryEngine` (sin crear la DB innecesariamente).
+        if memory_engine is not None:
+            self._private_mode: bool = bool(getattr(memory_engine, "is_private_mode", False))
+            self._allow_history: bool = (
+                True
+                if not self._private_mode
+                else bool(getattr(memory_engine, "allow_history_reads", True))
+            )
+        elif conversation_memory is not None:
+            self._private_mode = bool(getattr(conversation_memory, "is_private_mode", False))
+            self._allow_history = (
+                True
+                if not self._private_mode
+                else (getattr(conversation_memory, "private_allow_history", True) is not False)
+            )
+        else:
+            self._private_mode = False
+            self._allow_history = True
 
     @property
     def engine(self) -> MemoryEngine:
         if self._engine is None:
             conv_mem = self._conversation_memory
-            self._engine = MemoryEngine(
+            # Propagar de forma inmediata las restricciones de privacidad previas al crear
+            # el motor perezoso, cerrando cualquier ventana donde el motor opere en modo normal.
+            eff_priv = bool(
+                self._private_mode
+                or (conv_mem is not None and getattr(conv_mem, "is_private_mode", False) is True)
+            )
+            eff_allow = True
+            if eff_priv:
+                conv_allow = conv_mem is None or getattr(conv_mem, "private_allow_history", True) is not False
+                eff_allow = bool(self._allow_history and conv_allow)
+
+            created_engine = MemoryEngine(
                 is_private_mode_fn=(
-                    (lambda: getattr(conv_mem, "is_private_mode", False) is True)
+                    (lambda: bool(self._private_mode or getattr(conv_mem, "is_private_mode", False) is True))
                     if conv_mem is not None
-                    else None
+                    else (lambda: self._private_mode)
                 ),
                 allow_history_in_private_fn=(
-                    (lambda: getattr(conv_mem, "private_allow_history", True) is not False)
+                    (
+                        lambda: bool(
+                            self._allow_history
+                            and (getattr(conv_mem, "private_allow_history", True) is not False)
+                        )
+                    )
                     if conv_mem is not None
-                    else None
+                    else (lambda: self._allow_history)
                 ),
             )
+            created_engine.set_private_mode(enabled=eff_priv, allow_history=eff_allow)
+            self._engine = created_engine
         return self._engine
 
     @staticmethod
@@ -83,6 +120,9 @@ class MemoryConsoleHandler:
         return False
 
     def _sync_private_state(self, *, enabled: bool, allow_history: bool) -> None:
+        self._private_mode = bool(enabled)
+        self._allow_history = True if not enabled else bool(allow_history)
+
         if self._conversation_memory is not None:
             if enabled:
                 if hasattr(self._conversation_memory, "enter_private_mode"):
@@ -92,14 +132,14 @@ class MemoryConsoleHandler:
                     self._conversation_memory.exit_private_mode()
 
         if self._engine is not None:
-            self._engine.set_private_mode(enabled=enabled, allow_history=allow_history)
+            self._engine.set_private_mode(enabled=self._private_mode, allow_history=self._allow_history)
 
         if self._skill_manager is not None and hasattr(self._skill_manager, "set_private_mode"):
-            self._skill_manager.set_private_mode(enabled)
+            self._skill_manager.set_private_mode(self._private_mode)
 
         if self._on_private_mode_changed is not None:
             try:
-                self._on_private_mode_changed(bool(enabled), bool(allow_history))
+                self._on_private_mode_changed(self._private_mode, self._allow_history)
             except Exception:
                 pass
 
@@ -194,11 +234,13 @@ class MemoryConsoleHandler:
         args = [p.lower() for p in parts[1:]]
 
         current_priv = (
-            (self._conversation_memory is not None and getattr(self._conversation_memory, "is_private_mode", False) is True)
+            self._private_mode
+            or (self._conversation_memory is not None and getattr(self._conversation_memory, "is_private_mode", False) is True)
             or (self._engine is not None and self._engine.is_private_mode is True)
         )
         current_allow_hist = (
-            (self._conversation_memory is None or getattr(self._conversation_memory, "private_allow_history", True) is not False)
+            self._allow_history
+            and (self._conversation_memory is None or getattr(self._conversation_memory, "private_allow_history", True) is not False)
             and (self._engine is None or self._engine.allow_history_reads is not False)
         )
 

@@ -834,7 +834,7 @@ class RollbackInvalidationOutcome:
 
     execution_id: str
     ok: bool
-    status: str  # invalidated | idempotent_noop | tombstone_marked | blocked_private_mode | disabled | not_confirmed | failed
+    status: str  # invalidated | idempotent_noop | tombstone_marked | deferred_private_mode | blocked_private_mode | disabled | not_confirmed | failed
     invalidated_count: int = 0
     invalidated_memory_ids: tuple[str, ...] = ()
     already_inactive_count: int = 0

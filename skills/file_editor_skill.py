@@ -169,14 +169,45 @@ class BackupRecord:
     post_edit_sha256: Optional[str] = None
 
 
+def _resolve_audit_log_path(log_file: Path | str | None) -> Path:
+    """
+    Resuelve la ruta efectiva del log de auditoría de `FileEditorSkill`.
+
+    En entorno de pruebas (`JARVIS_ENV=test`/`testing`), si el llamador no pasó una ruta
+    temporal explícita (o apunta al `AUDIT_LOG_FILE` productivo dentro de `data/`), redirige
+    automáticamente hacia `temp/jarvis_test_isolated/` para mantener intacto `data/`.
+    """
+    prod_path = Path(AUDIT_LOG_FILE).resolve()
+    candidate = prod_path if log_file is None else Path(log_file)
+    env_mode = os.environ.get("JARVIS_ENV", "").strip().lower()
+    if env_mode in {"test", "testing"}:
+        try:
+            resolved_candidate = candidate.resolve()
+        except OSError:
+            resolved_candidate = candidate
+        if log_file is None or resolved_candidate == prod_path:
+            base_isolated = (BASE_DIR / "temp" / "jarvis_test_isolated").resolve()
+            configured_root = os.environ.get("JARVIS_TEST_TEMP_ROOT", "").strip()
+            target_root = base_isolated
+            if configured_root:
+                try:
+                    cand_root = Path(configured_root).resolve()
+                    cand_root.relative_to(base_isolated)
+                    target_root = cand_root
+                except (OSError, ValueError):
+                    target_root = base_isolated
+            return target_root / "file_editor_audit.jsonl"
+    return candidate
+
+
 class AuditLogger:
     """
     Registrador de auditoría en formato JSON Lines para operaciones sobre archivos.
     Sanitiza todos los mensajes para no escribir jamás secretos ni credenciales.
     """
 
-    def __init__(self, log_file: Path | str = AUDIT_LOG_FILE) -> None:
-        self.log_file: Path = Path(log_file)
+    def __init__(self, log_file: Path | str | None = None) -> None:
+        self.log_file: Path = _resolve_audit_log_path(log_file)
         self.entries: list[dict[str, Any]] = []
 
     def record(self, event_type: str, execution_id: str, payload: dict[str, Any]) -> dict[str, Any]:

@@ -457,6 +457,26 @@ class GoalContext:
         )
 
 
+# Validador estricto para identificadores de tareas y dependencias (F-01):
+# impide inyectar texto libre, espacios, saltos de línea o paráfrasis largas en `task_id`.
+SAFE_TASK_ID_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def validate_safe_task_id(task_id: str, *, label: str = "task_id") -> str:
+    """Valida que un identificador de tarea cumpla el formato seguro `[a-zA-Z0-9_-]{1,64}`."""
+    if not isinstance(task_id, str):
+        raise GoalPlanningError(f"El identificador `{label}` debe ser una cadena válida.")
+    clean_id = task_id.strip()
+    if not clean_id:
+        raise GoalPlanningError(f"Toda `GoalTask` debe tener un `{label}` no vacío.")
+    if not SAFE_TASK_ID_RE.match(clean_id):
+        raise GoalPlanningError(
+            f"Identificador `{label}` inválido ('{clean_id[:32]}'): "
+            "solo se permiten caracteres alfanuméricos, '_' y '-' (máximo 64 caracteres)."
+        )
+    return clean_id
+
+
 class GoalTask:
     """Unidad mínima ejecutable dentro de un `GoalPlan` con transición de estado blindada."""
 
@@ -490,9 +510,7 @@ class GoalTask:
         replan_generation: int = 0,
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
-        clean_id = (task_id or "").strip()
-        if not clean_id:
-            raise GoalPlanningError("Toda `GoalTask` debe tener un `task_id` no vacío.")
+        clean_id = validate_safe_task_id(task_id, label="task_id")
         self.task_id: str = clean_id
         self.title: str = (title or "").strip() or clean_id
         self.description: str = (description or "").strip() or self.title
@@ -507,7 +525,13 @@ class GoalTask:
         self.requires_approval: bool = bool(requires_approval) or (
             self.risk_category == TaskRiskCategory.SENSITIVE_OPERATION
         )
-        self.depends_on: list[str] = list(dict.fromkeys(str(dep).strip() for dep in (depends_on or []) if str(dep).strip()))
+        validated_deps: list[str] = []
+        for raw_dep in (depends_on or []):
+            dep_str = str(raw_dep).strip()
+            if not dep_str:
+                continue
+            validated_deps.append(validate_safe_task_id(dep_str, label="depends_on"))
+        self.depends_on: list[str] = list(dict.fromkeys(validated_deps))
         self.expected_output: str = (expected_output or "").strip() or f"Resultado verificado de {self.title}."
         self.retry_count: int = int(retry_count)
         self.max_retries: int = max(0, int(max_retries))

@@ -1343,3 +1343,57 @@ Se implementó **N8.3 Subfase 2** conectando de forma desacoplada las ejecucione
 
 - **Implementación técnica de N8.3 completa (Subfases 1–4).** Queda pendiente la **auditoría integral independiente de N8.3**.
 - Limitaciones honestas documentadas: la comprobación pre-dispatch protege hasta el instante previo al envío físico (una revocación posterior no retira datos ya recibidos por un modelo), y `CodexBrain` utiliza un argumento CLI único (`codex exec`) sin campo `system` independiente en transporte (mitigado por clasificación previa sobre `prompt` limpio, `--sandbox read-only` y validación pre-dispatch).
+
+---
+
+## Proyecto J.A.R.V.I.S. — Remediación Integral N8.3 (2026-11-25): Corrección de Hallazgos F-01 a F-09 de Auditoría Independiente
+
+**Estado:** Todos los hallazgos **F-01 a F-09** identificados por la auditoría independiente de Antigravity Argon sobre `v5.4.0` (`3a868a8`) fueron remediados, probados con suite adversarial dedicada y validados en la suite global aislada (**656/656 OK**). **Quedan pendientes de verificación independiente final por Antigravity Argon** antes del cierre oficial y etiquetado definitivo de N8.3.
+
+### 1. Cambios Implementados
+
+- **F-01 (`src/brain/goal_models.py`, `src/brain/goal_memory.py`, `src/brain/goal_planner.py`, `src/brain/goal_supervisor.py`, `src/brain/goal_persistence.py`):**
+  - Añadido `SAFE_TASK_ID_RE` (`^[a-zA-Z0-9_-]{1,64}$`) y `validate_safe_task_id()` directamente en `GoalTask.__init__()` sobre `task_id` y `depends_on`.
+  - Añadidos `CANONICAL_N8_TASK_ID_RE`, `is_canonical_n8_task_id()` y `canonicalize_n8_task_id_map()` en `goal_memory.py`, integrados en `TaskDecomposer._try_ai_decomposition()` (`t1`, `t2`, …) y `ExecutionSupervisor._attempt_replan()` (`t_r{gen}_{idx}`) para no aceptar jamás identificadores libres del LLM bajo exposición N8 y reescribir `depends_on` mediante mapa biyectivo validado.
+  - Reforzada `extract_persistable_plan_dict()` en `goal_persistence.py` para canonizar tareas contaminadas construidas por rutas alternativas (rechazando alterar planes ya aprobados con `GoalPersistenceError`).
+- **F-02 (`src/brain/codex_client.py`, `src/brain/brain_manager.py`):**
+  - Prohibida estructuralmente la inyección de cualquier `untrusted_context` (N8, `web_extraction` u otro) en `CodexBrain` cuando se ejecuta con `--sandbox workspace-write` (`generate_response`, `run_coding_task` y `_execute_codex_task`).
+  - Eliminada la doble llamada a `classify_codex_task()` sobre `effective_prompt` contaminado: la clasificación corre una sola vez sobre el `prompt` confiable y `untrusted_context` viaja separado exclusivamente hacia `--sandbox read-only`.
+- **F-03 (`src/brain/goal_supervisor.py`, `src/tools/skill_manager.py`):**
+  - Bloqueo estructural en `_execute_registered_skill()` (y respaldo en `SkillManager`) de toda skill mutante de archivos (`FILE_MUTATING_SKILLS`, `modifies_files`, `mutates_files`, subclases y wrappers de `FileEditorSkill`/`DocumentExportSkill`) durante `/privado` y `/privado --sin-historial`.
+  - Trazabilidad transitiva de contaminación N8 (`_has_tainted_n8_lineage`, `_collect_n8_refs_in_lineage`) y revalidación obligatoria de frescura antes de `document_export`, excluyendo estructuralmente salidas con procedencia N8 y rechazando la exportación ante recuerdos revocados, expirados o no verificables.
+- **F-04 (`src/memory/console.py`):**
+  - `MemoryConsoleHandler` mantiene `_private_mode` y `_allow_history` propios sin crear `experiences.db` al ejecutar `/privado` o `/privado --sin-historial`, propagándolos inmediatamente al instanciar `self.engine` de forma perezosa y reflejándolos en `/privado estado`.
+- **F-05 (`src/memory/engine.py`, `src/memory/capture.py`, `src/memory/capture_contracts.py`, `src/brain/brain_manager.py`, `main.py`):**
+  - Añadida cola mínima en RAM `_pending_rollback_invalidations` en `MemoryEngine` (`queue_pending_rollback_invalidation`, `flush_pending_rollback_invalidations`, supresión inmediata en `retrieve`/`get_memory`/`list_memories` durante privado y comportamiento **fail-closed** si falla el drenaje al salir de privado). `ExperienceCaptureService.handle_n5_rollback_confirmed()` encola en modo privado (`deferred_private_mode`) sin escribir datos privados en disco, y `main.py` asegura el drenaje al salir de privado o cerrar la sesión.
+  - Corregido el *latch* unidireccional de `private_active` en `BrainManager._sync_and_resolve_privacy_flags()`.
+- **F-06 (`src/brain/brain_manager.py`, `src/brain/goal_understanding.py`, `src/brain/goal_planner.py`):**
+  - Eliminados todos los bloques `except TypeError:` que envolvían llamadas a proveedores o `query_raw()`, reemplazándolos por inspección previa de firma (`_filter_supported_kwargs`) para evitar segundos dispatches sin validación ante `TypeError` interno.
+- **F-07 (`src/memory/store.py`):**
+  - Reemplazado `LIKE ... LIMIT 100` en `_has_rollback_audit_tx()` por comparación exacta parametrizada con `json_valid(details_json) = 1 AND json_extract(details_json, '$.source_execution_id') = ?` (sin límite artificial y con respaldo exhaustivo en Python).
+- **F-08 (`src/brain/goal_engine.py`, `src/brain/goal_memory.py`):**
+  - Corregido el orden de comprobación `had_live_envelope` en `_prepare_n8_context_for_execution()`, y endurecido `revalidate_envelope()` con doble verificación de `store_version_token` (antes y después de `get_memory()`), emitiendo tokens vigentes en sobres reconstruidos desde disco y fallando cerrado si el token cambia o no es legible durante la reconstrucción.
+- **F-09 (`main.py`):**
+  - Añadido `attach_existing_memory_engine()` e invocado en `run_console_session()` (antes de `process_turn()`) y en `run_voice_session()` únicamente si `N8_ENABLED` y `experiences.db` existen en disco, sin crear la DB al arrancar, sin duplicar instancias y sin cargar módulos de voz/GPU en consola.
+- **Aislamiento de auditoría en entorno de pruebas (`skills/file_editor_skill.py`, `tests/test_memory_n8_capture_and_rollback.py`, `tests/test_memory_n8_consultative_n6.py`):**
+  - `AuditLogger` redirige automáticamente `AUDIT_LOG_FILE` hacia `temp/jarvis_test_isolated/` bajo `JARVIS_ENV=test`/`testing`, preservando bit a bit `data/file_editor_audit.jsonl`.
+- **Nueva suite adversarial (`tests/test_memory_n8_audit_remediation.py`):**
+  - Añadidas **10 pruebas integrales y adversariales** cubriendo F-01 a F-09 y los escenarios combinados de integración, con verificación estricta de hashes de `data/` antes y después de cada caso.
+
+### 2. Verificaciones Realmente Ejecutadas (Remediación N8.3)
+
+- `py_compile` sobre los 20 módulos de código y pruebas modificados/creados: **OK (código 0)**.
+- Suite adversarial dedicada (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -B -m unittest tests.test_memory_n8_audit_remediation -v`): **10 pruebas en 33.099s — OK**.
+- Suite global completa aislada (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -B -m unittest discover -s tests -p "test_*.py" -q`): **656 pruebas en 294.843s — OK (0 fallos, 0 errores, 0 omitidas)** (`646` previas + `10` nuevas).
+- Carga liviana sin voz (`import main, src.memory, src.brain.brain_manager, src.brain.goal_engine`): **`VOICE_LOADED: []`** (`faster_whisper`, `sounddevice`, `pyttsx3`, `speech_recognition` sin cargar).
+- Integridad de `data/` verificada bit a bit antes y después de las 656 pruebas:
+  - `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640eaadff5e33feb9126f6eebb9f7960f924f01bb3a1968468014223341222` (idéntico).
+  - `data/file_editor_audit.jsonl`: **283.090 bytes**, SHA-256 `a556adf1e3446dc23ebdd544e873b9623803d772fc273595b59dac27badda139` (idéntico; 0 bytes escritos durante toda la suite global).
+  - `data/experiences.db`, `data/goals/`, `data/backups/`: inexistentes (`False`).
+- Pruebas físicas de hardware de audio/micrófono/altavoz: **no ejecutadas** (se verificó la ruta `run_voice_session` mediante mocks aislados sin hardware físico).
+- `prompts_history.txt`: registrado el prompt íntegro de esta remediación (excluido de Git).
+
+### 3. Documentación Actualizada y Próximo Paso
+
+- Actualizados [docs/N8_LONG_TERM_MEMORY.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N8_LONG_TERM_MEMORY.md), [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N6_AUTONOMOUS_GOAL_ENGINE.md) y `CONTEXT.md`.
+- **Pendiente:** verificación independiente puntual de las remediaciones F-01 a F-09 por Antigravity Argon antes de emitir aprobación oficial y tag definitivo de cierre de N8.3.

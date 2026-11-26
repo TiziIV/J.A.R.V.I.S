@@ -623,25 +623,44 @@ class GoalEngine:
         *,
         force_resume_refresh: bool = False,
     ) -> None:
-        """Revalida referencias N8 antes del uso y consulta N8 solo si se trata de una reanudación."""
-        # Siempre revalida cualquier referencia existente sin auto-sustituir revocadas/expiradas.
-        self.memory_bridge.revalidate_envelope(
-            goal=plan.goal,
-            plan=plan,
-            allow_history_in_private=self.allow_history_in_private,
-        )
-        has_live_envelope = (
+        """
+        Prepara y revalida el contexto N8 antes de ejecutar un plan (remediación F-08).
+
+        Orden estricto:
+        1. Determina primero si existe un `RuntimeN8Envelope` vivo en RAM.
+        2. Si existe, lo revalida contra `MemoryEngine` sin auto-sustituir recuerdos invalidados.
+        3. Si NO existe sobre vivo (p. ej. plan `READY` recargado desde disco tras reinicio),
+           reconstruye y revalida desde las referencias persistidas `n8_memory_refs` obteniendo
+           el `store_version_token` vigente y aplicando fail-closed si el token es inestable.
+        4. Solo en reanudaciones explícitas (`force_resume_refresh=True` o `GoalStatus.PAUSED`)
+           ejecuta una consulta fresca `retrieve_for_goal(stage="resuming")` respetando privacidad.
+        """
+        had_live_envelope = (
             self.memory_bridge.get_envelope(plan_id=plan.plan_id, goal_id=plan.goal.goal_id)
             is not None
         )
-        is_resumed = force_resume_refresh or (
-            plan.goal.status == GoalStatus.PAUSED
-            or (
-                not has_live_envelope
-                and bool(plan.goal.context.extra.get("n8_memory_refs") or plan.history)
-            )
+        has_persisted_refs = bool(
+            isinstance(plan.goal.context.extra, dict)
+            and plan.goal.context.extra.get("n8_memory_refs")
         )
-        if is_resumed and self.memory_engine is not None and self.allow_history_in_private:
+
+        if had_live_envelope:
+            self.memory_bridge.revalidate_envelope(
+                goal=plan.goal,
+                plan=plan,
+                allow_history_in_private=self.allow_history_in_private,
+            )
+        elif has_persisted_refs:
+            rebuilt_env, _reval = self.memory_bridge.revalidate_envelope(
+                goal=plan.goal,
+                plan=plan,
+                allow_history_in_private=self.allow_history_in_private,
+            )
+            if rebuilt_env is not None:
+                plan.n8_context_exposed = True
+
+        is_explicit_resume = force_resume_refresh or (plan.goal.status == GoalStatus.PAUSED)
+        if is_explicit_resume and self.memory_engine is not None and self.allow_history_in_private:
             env = self.memory_bridge.retrieve_for_goal(
                 plan.goal,
                 stage="resuming",

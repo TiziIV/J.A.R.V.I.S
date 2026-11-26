@@ -1425,6 +1425,21 @@ class ExperienceCaptureService:
                 )
 
             if self.memory_engine.is_private_mode:
+                # Remediación F-05: durante modo privado no escribimos en SQLite ni guardamos
+                # contenido privado, pero encolamos en RAM el ID de ejecución N5 revertida para
+                # suprimir sus recuerdos de inmediato y persistir la revocación al salir de privado.
+                if hasattr(self.memory_engine, "queue_pending_rollback_invalidation"):
+                    self.memory_engine.queue_pending_rollback_invalidation(
+                        clean_exec_id,
+                        reason=reason,
+                        actor=actor,
+                    )
+                    return RollbackInvalidationOutcome(
+                        execution_id=clean_exec_id,
+                        ok=True,
+                        status="deferred_private_mode",
+                        error=None,
+                    )
                 return RollbackInvalidationOutcome(
                     execution_id=clean_exec_id,
                     ok=False,

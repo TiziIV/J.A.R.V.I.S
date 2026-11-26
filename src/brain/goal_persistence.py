@@ -28,6 +28,7 @@ from src.brain.goal_memory import (
     FORBIDDEN_PERSISTED_N8_KEYS,
     build_skeleton_task_labels,
     collect_grounded_anchors,
+    is_canonical_n8_task_id,
     sanitize_n8_context_extra_for_persistence,
     separate_grounded_skill_params,
     strip_volatile_n8_keys_recursive,
@@ -228,11 +229,84 @@ def extract_persistable_plan_dict(
     canonical_dirty = False
     clean_task_models: list[GoalTask] = []
 
-    for task_dict in cloned.get("tasks") or []:
-        if not isinstance(task_dict, dict):
-            continue
-        tid = str(task_dict.get("task_id") or "")
-        t_obj = task_objs.get(tid)
+    # Defensa en profundidad F-01: si alguna tarea influenciada por N8 llegara a persistencia
+    # con un `task_id` no canónico (p. ej. construido fuera de TaskDecomposer/ExecutionSupervisor),
+    # generamos un mapa de canonización determinista antes de serializar el grafo completo.
+    raw_task_dicts = [td for td in (cloned.get("tasks") or []) if isinstance(td, dict)]
+    tainted_id_remap: dict[str, str] = {}
+    used_persist_ids: set[str] = set()
+    for td in raw_task_dicts:
+        tid_raw = str(td.get("task_id") or "").strip()
+        t_ref = task_objs.get(tid_raw)
+        meta_ref = td.get("metadata") if isinstance(td.get("metadata"), dict) else {}
+        is_t_tainted = bool(
+            meta_ref.get("n8_influenced")
+            or meta_ref.get("provenance_origin") == "llm_with_n8"
+            or (t_ref is not None and (t_ref.n8_influenced or t_ref.provenance_origin == "llm_with_n8"))
+        )
+        if not is_t_tainted or is_canonical_n8_task_id(tid_raw):
+            used_persist_ids.add(tid_raw)
+
+    seq_plan_idx = 1
+    seq_replan_counters: dict[int, int] = {}
+    for td in raw_task_dicts:
+        tid_raw = str(td.get("task_id") or "").strip()
+        t_ref = task_objs.get(tid_raw)
+        meta_ref = td.get("metadata") if isinstance(td.get("metadata"), dict) else {}
+        is_t_tainted = bool(
+            meta_ref.get("n8_influenced")
+            or meta_ref.get("provenance_origin") == "llm_with_n8"
+            or (t_ref is not None and (t_ref.n8_influenced or t_ref.provenance_origin == "llm_with_n8"))
+        )
+        if is_t_tainted and not is_canonical_n8_task_id(tid_raw):
+            gen_val = int(td.get("replan_generation") or 0)
+            while True:
+                if gen_val > 0:
+                    cnt = seq_replan_counters.get(gen_val, 0) + 1
+                    seq_replan_counters[gen_val] = cnt
+                    cand_tid = f"t_r{gen_val}_{cnt}"
+                else:
+                    cand_tid = f"t{seq_plan_idx}"
+                    seq_plan_idx += 1
+                if cand_tid not in used_persist_ids:
+                    used_persist_ids.add(cand_tid)
+                    tainted_id_remap[tid_raw] = cand_tid
+                    break
+
+    if tainted_id_remap:
+        canonical_dirty = True
+
+    def _remap_tid(val: str) -> str:
+        return tainted_id_remap.get(val, val)
+
+    def _remap_nested_ids(obj: Any) -> Any:
+        if not tainted_id_remap:
+            return obj
+        if isinstance(obj, str):
+            out_str = obj
+            for old_id, new_id in tainted_id_remap.items():
+                if old_id and old_id in out_str:
+                    out_str = out_str.replace(old_id, new_id)
+            return out_str
+        if isinstance(obj, list):
+            return [_remap_nested_ids(item) for item in obj]
+        if isinstance(obj, dict):
+            return {k: _remap_nested_ids(v) for k, v in obj.items()}
+        return obj
+
+    for task_dict in raw_task_dicts:
+        orig_tid = str(task_dict.get("task_id") or "")
+        t_obj = task_objs.get(orig_tid)
+        tid = _remap_tid(orig_tid)
+        if tid != orig_tid:
+            task_dict["task_id"] = tid
+        raw_deps_list = task_dict.get("depends_on") or []
+        if isinstance(raw_deps_list, list) and tainted_id_remap:
+            remapped_deps = [_remap_tid(str(d)) for d in raw_deps_list]
+            if remapped_deps != raw_deps_list:
+                task_dict["depends_on"] = remapped_deps
+                canonical_dirty = True
+
         meta = dict(task_dict.get("metadata") or {})
         meta_cleaned = _redact_nested_data(meta)
         if not isinstance(meta_cleaned, dict):
@@ -248,7 +322,10 @@ def extract_persistable_plan_dict(
             or (t_obj is not None and getattr(t_obj, "n8_exposed_at_exec", False))
             or (
                 isinstance(task_dict.get("execution_evidence"), dict)
-                and task_dict["execution_evidence"].get("n8_exposed_at_exec")
+                and (
+                    task_dict["execution_evidence"].get("n8_exposed_at_exec")
+                    or task_dict["execution_evidence"].get("n8_tainted")
+                )
             )
             or (
                 task_dict.get("skill_name") is None
@@ -290,7 +367,7 @@ def extract_persistable_plan_dict(
             safe_meta: dict[str, Any] = {}
             for mk, mv in meta_cleaned.items():
                 if mk in _SAFE_PERSISTED_TASK_META_KEYS:
-                    safe_meta[mk] = mv
+                    safe_meta[mk] = _remap_nested_ids(mv)
                 elif mk == "target_app" and isinstance(mv, str) and mv.lower() in anchors.get("grounded_scalars", set()):
                     safe_meta[mk] = mv
                 elif mk == "file_path" and isinstance(mv, str) and mv in (anchors.get("target_paths") or []):
@@ -299,7 +376,7 @@ def extract_persistable_plan_dict(
             task_dict["metadata"] = safe_meta
         else:
             task_dict["skill_params"] = _redact_nested_data(task_dict.get("skill_params") or {})
-            task_dict["metadata"] = meta_cleaned
+            task_dict["metadata"] = _remap_nested_ids(meta_cleaned)
 
         if exec_tainted:
             if isinstance(task_dict.get("output_summary"), str) and task_dict["output_summary"].strip():
@@ -315,7 +392,7 @@ def extract_persistable_plan_dict(
                 for noisy_k in ("summary", "notes", "upstream_snippets"):
                     if noisy_k in ev_clean:
                         ev_clean[noisy_k] = "[RAM-ONLY]"
-                task_dict["execution_evidence"] = _redact_nested_data(ev_clean)
+                task_dict["execution_evidence"] = _remap_nested_ids(_redact_nested_data(ev_clean))
 
         clean_task_models.append(GoalTask.from_dict(task_dict))
 
@@ -346,15 +423,26 @@ def extract_persistable_plan_dict(
     for decision in cloned.get("replan_history") or []:
         if not isinstance(decision, dict):
             continue
+        if tainted_id_remap:
+            for key_list in ("preserved_task_ids", "added_task_ids", "cancelled_task_ids"):
+                if isinstance(decision.get(key_list), list):
+                    decision[key_list] = [_remap_tid(str(x)) for x in decision[key_list]]
+            if isinstance(decision.get("trigger_task_id"), str):
+                decision["trigger_task_id"] = _remap_tid(decision["trigger_task_id"])
         if n8_goal_exposed or "n8" in str(decision.get("strategy") or "").lower():
             decision["reason"] = "Replanificación ejecutada bajo contexto consultivo N8 (detalle mantenido en RAM)."
 
     for entry in cloned.get("history") or []:
         if not isinstance(entry, dict):
             continue
+        if tainted_id_remap:
+            if isinstance(entry.get("task_id"), str):
+                entry["task_id"] = _remap_tid(entry["task_id"])
+            if isinstance(entry.get("message"), str):
+                entry["message"] = _remap_nested_ids(entry["message"])
         details = entry.get("details")
         if isinstance(details, dict):
-            cleaned_details = sanitize_wal_payload(details)
+            cleaned_details = sanitize_wal_payload(_remap_nested_ids(details))
             entry["details"] = cleaned_details
         if entry.get("event_type") == "plan_replanned" and n8_goal_exposed:
             entry["message"] = "Replanificación controlada ejecutada (anotaciones N8 mantenidas solo en RAM)."

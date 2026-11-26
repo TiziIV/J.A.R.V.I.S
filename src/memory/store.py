@@ -1340,30 +1340,48 @@ class ExperienceStore:
 
     @staticmethod
     def _has_rollback_audit_tx(conn: sqlite3.Connection, execution_id: str) -> bool:
-        """Comprueba exactamente mediante JSON parseado si existe marca o revocación por rollback."""
-        like_pat = f"%{execution_id}%"
-        rows = conn.execute(
-            """
-            SELECT details_json FROM memory_audit
-            WHERE action = 'REVOKE' AND details_json LIKE ?
-            ORDER BY created_at DESC
-            LIMIT 100
-            """,
-            (like_pat,),
-        ).fetchall()
-        for row in rows:
-            try:
-                parsed = json.loads(str(row["details_json"]))
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if (
-                isinstance(parsed, dict)
-                and parsed.get("source_execution_id") == execution_id
-                and parsed.get("invalidation_kind")
-                in {"rollback_execution", "rollback_execution_tombstone"}
-            ):
-                return True
-        return False
+        """
+        Comprueba mediante coincidencia exacta en JSON estructurado si existe marca o revocación
+        por rollback para `execution_id`, sin límite artificial de filas y tolerando filas
+        históricas con JSON inválido (remediación F-07).
+        """
+        try:
+            hit = conn.execute(
+                """
+                SELECT 1 FROM memory_audit
+                WHERE action = 'REVOKE'
+                  AND json_valid(details_json) = 1
+                  AND json_extract(details_json, '$.source_execution_id') = ?
+                  AND json_extract(details_json, '$.invalidation_kind')
+                      IN ('rollback_execution', 'rollback_execution_tombstone')
+                LIMIT 1
+                """,
+                (execution_id,),
+            ).fetchone()
+            return hit is not None
+        except sqlite3.OperationalError:
+            # Respaldo defensivo en Python si una compilación SQLite careciera de JSON1,
+            # recorriendo todos los eventos REVOKE sin truncar a 100 filas.
+            cursor = conn.execute(
+                """
+                SELECT details_json FROM memory_audit
+                WHERE action = 'REVOKE'
+                ORDER BY created_at DESC
+                """
+            )
+            for row in cursor:
+                try:
+                    parsed = json.loads(str(row["details_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("source_execution_id") == execution_id
+                    and parsed.get("invalidation_kind")
+                    in {"rollback_execution", "rollback_execution_tombstone"}
+                ):
+                    return True
+            return False
 
     def is_execution_invalidated(self, execution_id: str) -> bool:
         """Indica si `execution_id` figura revertida por rollback en memoria persistente."""
