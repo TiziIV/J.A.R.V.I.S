@@ -301,3 +301,26 @@ $env:JARVIS_ENV = "test"
 .\venv\Scripts\python.exe -B -m unittest tests.test_memory_n8_persistence tests.test_memory_n8_lifecycle tests.test_memory_n8_v2_persistence tests.test_memory_n8_capture_and_rollback tests.test_memory_n8_consultative_n6 tests.test_memory_n8_snapshot_guard tests.test_memory_n8_audit_remediation tests.test_goal_engine tests.test_brain_deliberation tests.test_llm_routing tests.test_codex_integration -v
 .\venv\Scripts\python.exe -B -m unittest discover -s tests -p "test_*.py" -q
 ```
+
+---
+
+## Proyecto J.A.R.V.I.S. — Reauditoría focalizada N8.3 F-01/F-04/F-05/F-09 (2026-11-26)
+
+**Estado:** Remediación focalizada implementada y verificada con pruebas locales. N8.3 sigue pendiente de aprobación independiente final por Antigravity Argon.
+
+### Causa raíz y correcciones
+
+- **F-05 — rollback durable N5/N8:** la cola RAM no sobrevive a `os._exit` y no puede ser la fuente de verdad. `TransactionJournal.list_confirmed_rollback_execution_ids()` vuelve a leer los journals terminales `ROLLED_BACK`; `MemoryEngine.reconcile_confirmed_n5_rollbacks()` invalida solo `EXECUTION_VERIFIED` del `execution_id` confirmado y verifica `is_execution_invalidated()` antes de completar. La reconciliación corre en `ChainOrchestrator.recover_pending_transactions()` y, en la integración de aplicación, antes de entregar lecturas N8 mediante el proveedor read-only del journal. SQLite puede fallar por ejecución: quedan los estados `ROLLED_BACK` en N5 y cada lectura/recuperación vuelve a intentar; las demás ejecuciones siguen avanzando. Journals corruptos bloquean la lectura en lugar de asumir que no hay rollback.
+- La reconciliación de seguridad se permite durante modo privado porque solo escribe revocaciones/tombstones ligados a IDs N5 confirmados; el modo privado continúa bloqueando captura nueva y no envía contenido de conversación al reconciliador. La cola RAM sigue dando supresión inmediata durante la sesión y es auxiliar, no durable.
+- **F-01 — persistencia N6:** si el plan estuvo expuesto a N8, snapshots sustituyen mensajes del historial, errores/outputs de tareas y detalles narrativos por marcadores seguros. El WAL mantiene estados, códigos e IDs técnicos permitidos y sustituye el resto del payload. La prueba usa `N8_CANARY_F01_7F29A1` en un error arbitrario de skill tras retry y revisa todos los archivos generados en el GoalStore temporal.
+- **F-04/F-09 — inicialización perezosa:** construir el handler de memoria no construye `MemoryEngine`; `/privado` mantiene sus flags en RAM. `main.py` adjunta un motor preexistente si ya hay DB, y usa una fábrica para crear una única instancia solo cuando un comando consulta N8. La captura automática N8 se crea al comenzar una ejecución de plan o al inicializar el orquestador para una operación que lo requiera. `/goal` sin ejecución y `/privado --sin-historial` no crean `experiences.db`; voz conserva su enlace a la instancia existente.
+
+### Pruebas y límites comprobados
+
+- Prueba adversarial F-05: el subproceso confirma rollback N5 y sale con `os._exit(99)` antes de invalidar SQLite; el proceso reiniciado repara antes de servir lecturas. Incluye dos ejecuciones revertidas, falla transitoria en una, recuperación de la otra, idempotencia y una ejecución `COMPLETED` que conserva recuerdos activos.
+- Suite adversarial `tests.test_memory_n8_audit_remediation`: **12 pruebas en 33.600 s, OK**.
+- Regresiones N8/N5/N6 seleccionadas: **188 pruebas en 158.869 s, OK**.
+- Suite global aislada: **658 pruebas en 252.895 s, OK**.
+- `py_compile` de los módulos modificados: **OK**; `git diff --check`: **OK**.
+- La reconciliación vuelve a consultar el journal completo para priorizar recuperación ante estados terminales; en instalaciones con journals extensos, esa lectura tiene costo proporcional a la cantidad de transacciones. No se cambia el esquema de N8 ni se crea un journal paralelo.
+- Pruebas físicas de micrófono/altavoz no ejecutadas; el flujo de voz fue verificado en la suite con dobles de prueba.

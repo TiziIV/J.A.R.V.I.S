@@ -33,6 +33,7 @@ from skills.file_editor_skill import AuditLogger, BackupManager, FileEditorSkill
 from skills.system_skills import SystemInfoSkill, TimeSkill
 from src.brain.brain_manager import BrainManager
 from src.brain.chain_orchestrator import ChainOrchestrator, ChainState
+from src.brain.transaction_manager import TransactionJournal
 from src.brain.codex_client import CodexBrain, CodexAuthStatus, classify_codex_task
 from src.brain.exceptions import BrainError, BrainErrorKind
 from src.brain.goal_engine import GoalEngine
@@ -494,6 +495,50 @@ class TestN83AuditRemediation(unittest.TestCase):
         reloaded_direct = self.goal_store.load_plan(p_direct.plan_id)
         self.assertTrue(reloaded_direct.verify_integrity())
         self.assertEqual([t.task_id for t in reloaded_direct.tasks], ["t1"])
+
+    def test_f01_skill_exception_after_n8_context_never_reaches_goal_or_wal_files(self) -> None:
+        """Un error arbitrario de skill se elimina de todas las persistencias N6 tras exposición N8."""
+        canary = "N8_CANARY_F01_7F29A1"
+        self._seed_memory(
+            title="Preferencia de diagnóstico Valorant",
+            content=f"Referencia de diagnóstico {canary} para Valorant.",
+            summary=f"Diagnóstico Valorant {canary}",
+            scope_type=MemoryScopeType.APP_OR_GAME,
+            scope_key="valorant",
+            tags=("valorant", "diagnóstico"),
+        )
+        failing_skill = _SimpleSkill(
+            "web_search",
+            lambda **_: (_ for _ in ()).throw(RuntimeError(f"Fallo runtime con {canary}")),
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+        skills = _build_isolated_skill_manager(self.export_dir, extra={"web_search": failing_skill})
+        engine = GoalEngine(
+            skill_manager=skills,
+            goal_store=self.goal_store,
+            memory_engine=self.engine,
+        )
+        plan = engine.create_goal_and_plan(
+            "Diagnosticar Valorant",
+            context=GoalContext(target_app="Valorant"),
+            custom_tasks=[GoalTask(
+                task_id="t1",
+                title="Consultar diagnóstico",
+                description="Buscar diagnóstico disponible",
+                skill_name="web_search",
+                skill_params={"query": "Valorant"},
+                max_retries=1,
+            )],
+        )
+        engine.execute_plan(plan, enable_replan=False)
+        self.assertTrue(plan.n8_context_exposed)
+        persisted = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.goal_dir.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn(canary, persisted)
+        self.assertIn("DETALLE N8 OMITIDO", persisted)
 
     # ------------------------------------------------------------------
     # F-02: Codex CLI y aislamiento estricto de contexto no confiable
@@ -1183,6 +1228,126 @@ class TestN83AuditRemediation(unittest.TestCase):
         for om in orion_mems:
             self.assertEqual(self.store.get_memory(om.memory_id).status, MemoryStatus.REVOKED)
 
+    def test_f05_restart_reconciles_n5_journal_and_retries_without_touching_other_execution(self) -> None:
+        """El journal N5 repara tras os._exit, incluso en privado, y las fallas SQLite se reintentan."""
+        capture = ExperienceCaptureService(
+            memory_engine=self.engine,
+            enabled=True,
+            auto_capture_enabled=True,
+        )
+        _fe, orch = self._build_real_n5(capture)
+        _cfg, committed = self._run_real_n5_edit(
+            orch, exec_id="exec-f05-crash-rollback", game_name="CrashRollback"
+        )
+        self.assertEqual(committed["state"], ChainState.COMPLETED.value)
+        rollback_records = [
+            item for item in self.store.list_memories(status=MemoryStatus.ACTIVE)
+            if item.provenance.source_execution_id == "exec-f05-crash-rollback"
+        ]
+        self.assertGreaterEqual(len(rollback_records), 2)
+
+        # Una segunda ejecución completada confirma que el reconciliador filtra por ID N5.
+        _cfg2, completed = self._run_real_n5_edit(
+            orch, exec_id="exec-f05-stays-completed", game_name="StillCompleted"
+        )
+        self.assertEqual(completed["state"], ChainState.COMPLETED.value)
+        _cfg3, second_rollback = self._run_real_n5_edit(
+            orch, exec_id="exec-f05-partial-rollback", game_name="PartialRollback"
+        )
+        self.assertEqual(second_rollback["state"], ChainState.COMPLETED.value)
+        partial_records = [
+            item for item in self.store.list_memories(status=MemoryStatus.ACTIVE)
+            if item.provenance.source_execution_id == "exec-f05-partial-rollback"
+        ]
+        self.assertTrue(partial_records)
+
+        # El subproceso confirma ROLLED_BACK en el journal y cae abruptamente antes de N8.
+        child = f'''\
+import os, sys
+from pathlib import Path
+from skills.file_editor_skill import AuditLogger, BackupManager, FileEditorSkill
+from src.brain.chain_orchestrator import ChainOrchestrator
+base, backup, journal, audit = map(Path, sys.argv[1:5])
+logger = AuditLogger(log_file=audit)
+editor = FileEditorSkill(authorized_roots=[base, backup], backup_dir=backup,
+    audit_logger=logger, backup_manager=BackupManager(audit_logger=logger))
+orchestrator = ChainOrchestrator(file_editor=editor, journal_dir=journal)
+for execution in sys.argv[5:]:
+    result = orchestrator.rollback_execution(execution)
+    if result.get("state") != "ROLLED_BACK":
+        print(result, flush=True)
+        os._exit(98)
+os._exit(99)
+'''
+        crashed = subprocess.run(
+            [sys.executable, "-B", "-c", child, str(self.cfg_root), str(self.n5_backup_dir),
+             str(self.n5_journal_dir), str(self.n5_audit_log),
+             "exec-f05-crash-rollback", "exec-f05-partial-rollback"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "JARVIS_ENV": "test"},
+        )
+        self.assertEqual(crashed.returncode, 99, crashed.stdout + crashed.stderr)
+        for item in rollback_records:
+            self.assertEqual(self.store.get_memory(item.memory_id).status, MemoryStatus.ACTIVE)
+        for item in partial_records:
+            self.assertEqual(self.store.get_memory(item.memory_id).status, MemoryStatus.ACTIVE)
+
+        journal = TransactionJournal(self.n5_journal_dir)
+        self.assertIn(
+            "exec-f05-crash-rollback", journal.list_confirmed_rollback_execution_ids()
+        )
+        self.engine.set_n5_rollback_execution_provider(
+            journal.list_confirmed_rollback_execution_ids
+        )
+
+        # Privacidad no bloquea la invalidación obligatoria y no se crea historial privado.
+        self.engine.set_private_mode(enabled=True, allow_history=False)
+        original_invalidate = self.store.invalidate_by_execution
+        def fail_only_first(execution_id: str, **kwargs):
+            if execution_id == "exec-f05-crash-rollback":
+                raise MemoryPersistenceError("sqlite temporalmente bloqueado")
+            return original_invalidate(execution_id, **kwargs)
+
+        with patch.object(self.store, "invalidate_by_execution", side_effect=fail_only_first):
+            with self.assertRaises(MemoryPersistenceError):
+                self.engine.retrieve("CrashRollback")
+        for item in rollback_records:
+            self.assertEqual(self.store.get_memory(item.memory_id).status, MemoryStatus.ACTIVE)
+        for item in partial_records:
+            self.assertEqual(self.store.get_memory(item.memory_id).status, MemoryStatus.REVOKED)
+
+        self.engine.set_private_mode(enabled=False, allow_history=True)
+        first_read = self.engine.retrieve("StillCompleted")
+        self.assertTrue(self.store.is_execution_invalidated("exec-f05-crash-rollback"))
+        for item in rollback_records:
+            self.assertEqual(self.store.get_memory(item.memory_id).status, MemoryStatus.REVOKED)
+        for item in partial_records:
+            self.assertEqual(self.store.get_memory(item.memory_id).status, MemoryStatus.REVOKED)
+        completed_records = [
+            item for item in self.store.list_memories(status=MemoryStatus.ACTIVE)
+            if item.provenance.source_execution_id == "exec-f05-stays-completed"
+        ]
+        self.assertTrue(completed_records)
+        self.assertTrue(first_read.items)
+
+        with self.store.acquire_lock():
+            with self.store._open_connection() as conn:
+                audit_count_before = conn.execute(
+                    "SELECT COUNT(*) FROM memory_audit WHERE json_extract(details_json, '$.source_execution_id') = ?",
+                    ("exec-f05-crash-rollback",),
+                ).fetchone()[0]
+        self.engine.retrieve("StillCompleted")
+        with self.store.acquire_lock():
+            with self.store._open_connection() as conn:
+                audit_count_after = conn.execute(
+                    "SELECT COUNT(*) FROM memory_audit WHERE json_extract(details_json, '$.source_execution_id') = ?",
+                    ("exec-f05-crash-rollback",),
+                ).fetchone()[0]
+        self.assertEqual(audit_count_before, audit_count_after)
+
     # ------------------------------------------------------------------
     # F-06: Eliminación de fallbacks inseguros basados en `except TypeError:`
     # ------------------------------------------------------------------
@@ -1490,15 +1655,24 @@ class TestN83AuditRemediation(unittest.TestCase):
             memory_engine=None,
             lazy_init=True,
         )
-        cmds_empty = iter(["Hola jarvis", "salir"])
-        with patch.dict(os.environ, {"JARVIS_TEST_TEMP_ROOT": str(empty_iso)}):
+        cmds_empty = iter(["/privado --sin-historial", "/goal", "salir"])
+        db_state_during_console: list[tuple[str, bool]] = []
+
+        def _next_empty_command(_prompt: str) -> str:
+            command = next(cmds_empty)
+            db_state_during_console.append((command, empty_db.exists()))
+            return command
+        with patch.dict(os.environ, {"JARVIS_TEST_TEMP_ROOT": str(empty_iso)}), patch.object(
+            settings, "N8_AUTO_CAPTURE_ENABLED", True
+        ):
             jarvis_main.run_console_session(
                 bm_empty,
                 enable_tts=False,
-                input_fn=lambda _: next(cmds_empty),
+                input_fn=_next_empty_command,
                 output_fn=lambda _: None,
             )
         self.assertFalse(empty_db.exists())
+        self.assertTrue(all(not exists for _command, exists in db_state_during_console), db_state_during_console)
         self.assertIsNone(bm_empty.memory_engine)
 
         # 2) Con DB previa y SIN comandos `/` previos: primer turno conversacional consulta N8 bajo MemorySnapshotGuard.

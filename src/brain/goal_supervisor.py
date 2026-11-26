@@ -1519,7 +1519,12 @@ class ExecutionSupervisor:
     def _persist(self, plan: GoalPlan, event_type: str, payload: dict[str, Any]) -> None:
         target_store = self.active_goal_store
         if target_store is not None:
-            target_store.append_wal_event(plan.plan_id, event_type, payload)
+            target_store.append_wal_event(
+                plan.plan_id,
+                event_type,
+                payload,
+                n8_context_exposed=bool(getattr(plan, "n8_context_exposed", False)),
+            )
             target_store.save_plan(plan, set_active=True)
 
     def _build_result(

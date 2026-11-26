@@ -150,10 +150,23 @@ def _redact_nested_data(value: Any) -> Any:
     return redact_secrets(cleaned_n8) if isinstance(cleaned_n8, (str, list)) else cleaned_n8
 
 
-def sanitize_wal_payload(payload: Mapping[str, Any] | dict[str, Any]) -> dict[str, Any]:
+def sanitize_wal_payload(
+    payload: Mapping[str, Any] | dict[str, Any], *, n8_context_exposed: bool = False
+) -> dict[str, Any]:
     """Limpia un payload WAL excluyendo claves N8 volátiles, textos de recuerdos y redactando secretos."""
     if not isinstance(payload, Mapping):
         return {}
+    if n8_context_exposed:
+        # Una excepción puede incorporar texto arbitrario de una subtarea influida por N8.
+        # Conservamos códigos, estados e IDs útiles y omitimos los campos narrativos completos.
+        safe_keys = {
+            "task_id", "plan_id", "goal_id", "execution_id", "retry", "status",
+            "from_status", "to_status", "error_code", "error_category", "attempt",
+        }
+        return {
+            str(key): _redact_nested_data(value) if str(key) in safe_keys else "[DETALLE N8 OMITIDO]"
+            for key, value in payload.items()
+        }
     cleaned = strip_volatile_n8_keys_recursive(dict(payload))
     if not isinstance(cleaned, dict):
         return {}
@@ -194,7 +207,8 @@ def extract_persistable_plan_dict(
             "Violación de aislamiento privado: no se permite transferir ni persistir un plan privado en GoalStore."
         )
 
-    cloned = _sanitize_runtime_strings(plan.to_dict())
+    n8_exposed = bool(getattr(plan, "n8_context_exposed", False))
+    cloned = _sanitize_runtime_strings(plan.to_dict(), n8_context_exposed=n8_exposed)
     anchors = collect_grounded_anchors(plan.goal)
 
     # 1. Frontera estructural de Goal
@@ -420,6 +434,26 @@ def extract_persistable_plan_dict(
         cloned["plan_hash"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     # 3. Frontera en replan_history e history
+    if n8_goal_exposed:
+        # Los fallos de skills se guardan en los modelos de tareas antes de llegar al historial.
+        # El plan completo queda bajo frontera N8 para que excepciones anidadas no escapen.
+        for task_dict in cloned.get("tasks") or []:
+            if not isinstance(task_dict, dict):
+                continue
+            if task_dict.get("last_error"):
+                task_dict["last_error"] = "Error aislado por frontera N8 (detalle conservado solo en RAM)."
+            if task_dict.get("error_history"):
+                task_dict["error_history"] = [
+                    "Error aislado por frontera N8 (detalle conservado solo en RAM)."
+                ]
+            if task_dict.get("output_summary"):
+                task_dict["output_summary"] = "Resultado contextual N8 conservado solo en RAM."
+            evidence = task_dict.get("execution_evidence")
+            if isinstance(evidence, dict):
+                for key in ("summary", "notes", "upstream_snippets"):
+                    if key in evidence:
+                        evidence[key] = "[DETALLE N8 OMITIDO]"
+
     for decision in cloned.get("replan_history") or []:
         if not isinstance(decision, dict):
             continue
@@ -448,11 +482,19 @@ def extract_persistable_plan_dict(
             entry["message"] = "Replanificación controlada ejecutada (anotaciones N8 mantenidas solo en RAM)."
             if isinstance(entry.get("details"), dict) and "reason" in entry["details"]:
                 entry["details"]["reason"] = "Replanificación ejecutada bajo contexto consultivo N8 (detalle mantenido en RAM)."
+        if n8_goal_exposed:
+            entry["message"] = "Evento de ejecución bajo contexto consultivo N8 (detalle mantenido en RAM)."
+            entry["details"] = sanitize_wal_payload(
+                entry.get("details") if isinstance(entry.get("details"), dict) else {},
+                n8_context_exposed=True,
+            )
 
     return cloned
 
 
-def _sanitize_runtime_strings(payload: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_runtime_strings(
+    payload: dict[str, Any], *, n8_context_exposed: bool = False
+) -> dict[str, Any]:
     """Redacta posibles secretos en mensajes de error, contexto e historial antes de persistir."""
     precleaned = strip_volatile_n8_keys_recursive(payload)
     cloned = json.loads(json.dumps(precleaned, ensure_ascii=False))
@@ -483,7 +525,13 @@ def _sanitize_runtime_strings(payload: dict[str, Any]) -> dict[str, Any]:
 
     for entry in cloned.get("history") or []:
         if isinstance(entry, dict) and isinstance(entry.get("message"), str):
-            entry["message"] = redact_secrets(entry["message"])
+            entry["message"] = (
+                "Evento de ejecución bajo contexto consultivo N8 (detalle mantenido en RAM)."
+                if n8_context_exposed
+                else redact_secrets(entry["message"])
+            )
+            if n8_context_exposed and isinstance(entry.get("details"), dict):
+                entry["details"] = sanitize_wal_payload(entry["details"], n8_context_exposed=True)
 
     return cloned
 
@@ -562,11 +610,13 @@ class GoalStore:
                 _atomic_write_json(self.index_path, index_data)
             return snapshot_path
 
-    def append_wal_event(self, plan_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    def append_wal_event(
+        self, plan_id: str, event_type: str, payload: dict[str, Any], *, n8_context_exposed: bool = False
+    ) -> None:
         """Agrega un evento incremental redactado al WAL JSONL del plan."""
         with self._lock:
             wal_path = self._plan_wal_path(plan_id)
-            clean_payload = sanitize_wal_payload(payload)
+            clean_payload = sanitize_wal_payload(payload, n8_context_exposed=n8_context_exposed)
             record = {
                 "timestamp": utc_now_iso(),
                 "plan_id": _sanitize_identifier(plan_id, "plan_id"),
@@ -706,7 +756,9 @@ class EphemeralGoalStore:
             # Ruta virtual simbólica no utilizable como archivo real (cero escritura en disco).
             return Path(f"<ephemeral-ram>/plans/{safe_id}.goal.json")
 
-    def append_wal_event(self, plan_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    def append_wal_event(
+        self, plan_id: str, event_type: str, payload: dict[str, Any], *, n8_context_exposed: bool = False
+    ) -> None:
         """Registra evento WAL exclusivamente en RAM con redacción y limpieza N8."""
         with self._lock:
             safe_id = _sanitize_identifier(plan_id, "plan_id")

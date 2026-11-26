@@ -99,6 +99,7 @@ class MemoryEngine:
         self._state_lock: threading.RLock = threading.RLock()
         self._pending_rollback_invalidations: dict[str, dict[str, str]] = {}
         self._pending_invalidation_error: str | None = None
+        self._n5_rollback_execution_provider: Callable[[], tuple[str, ...] | list[str]] | None = None
 
     # ------------------------------------------------------------------
     # Control centralizado de Modo Privado e Invalidaciones Diferidas (F-05)
@@ -135,6 +136,12 @@ class MemoryEngine:
                 # Se conserva la cola pendiente y `_pending_invalidation_error` para operar
                 # en modo fail-closed ante cualquier lectura posterior hasta poder drenarla.
                 pass
+
+    def set_n5_rollback_execution_provider(
+        self, provider: Callable[[], tuple[str, ...] | list[str]] | None
+    ) -> None:
+        """Conecta el lector read-only del journal N5 usado antes de cada lectura N8."""
+        self._n5_rollback_execution_provider = provider
 
     def queue_pending_rollback_invalidation(
         self,
@@ -253,6 +260,14 @@ class MemoryEngine:
         Antes de cualquier consulta fuera de modo privado, exige que toda invalidación de
         rollback N5 encolada en RAM se haya aplicado en SQLite; si falla, falla cerrado.
         """
+        if self._n5_rollback_execution_provider is not None:
+            execution_ids = self._n5_rollback_execution_provider()
+            outcomes = self.reconcile_confirmed_n5_rollbacks(execution_ids)
+            pending = {key: value for key, value in outcomes.items() if value.startswith("pending:")}
+            if pending:
+                raise MemoryPersistenceError(
+                    "La lectura N8 queda bloqueada hasta reconciliar los rollbacks N5 confirmados."
+                )
         if not self.is_private_mode and self.has_pending_rollback_invalidations():
             self.flush_pending_rollback_invalidations()
 
@@ -506,6 +521,41 @@ class MemoryEngine:
             actor=actor,
             private_mode=self.is_private_mode,
         )
+
+    def reconcile_confirmed_n5_rollbacks(
+        self, execution_ids: tuple[str, ...] | list[str]
+    ) -> dict[str, str]:
+        """Reconcilia estados ROLLED_BACK ya confirmados en N5, incluso durante modo privado.
+
+        Solo modifica los recuerdos `EXECUTION_VERIFIED` de cada ID confirmado. No recibe ni
+        persiste contenido conversacional, y verifica el tombstone antes de dar cada ID por listo.
+        Los errores se devuelven por ejecución para permitir que el resto avance y que el llamador
+        reintente las fallidas al siguiente ciclo de recuperación.
+        """
+        outcomes: dict[str, str] = {}
+        for execution_id in sorted(set(execution_ids)):
+            try:
+                invalidation = self.store.invalidate_by_execution(
+                    execution_id,
+                    reason="n5_confirmed_rollback_reconciliation",
+                    actor="n5_journal_recovery",
+                    private_mode=False,
+                )
+                if not self.store.is_execution_invalidated(execution_id):
+                    self.store.mark_execution_rollback_tombstone(
+                        execution_id,
+                        reason="n5_confirmed_rollback_reconciliation",
+                        actor="n5_journal_recovery",
+                        private_mode=False,
+                    )
+                if not self.store.is_execution_invalidated(execution_id):
+                    raise MemoryPersistenceError(
+                        "La invalidación de rollback no quedó verificada en la persistencia N8."
+                    )
+                outcomes[execution_id] = f"reconciled:{invalidation.invalidated_count}"
+            except Exception as exc:
+                outcomes[execution_id] = f"pending:{type(exc).__name__}"
+        return outcomes
 
     def is_execution_invalidated(self, execution_id: str) -> bool:
         """Consulta si una ejecución fue revertida (en cola RAM pendiente o en SQLite)."""

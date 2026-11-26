@@ -40,6 +40,7 @@ class MemoryConsoleHandler:
         self,
         *,
         memory_engine: Optional[MemoryEngine] = None,
+        memory_engine_factory: Optional[Callable[[], MemoryEngine]] = None,
         conversation_memory: Any = None,
         skill_manager: Any = None,
         default_import_path: Optional[Path | str] = None,
@@ -48,6 +49,7 @@ class MemoryConsoleHandler:
         output_fn: Callable[[str], None] = print,
     ) -> None:
         self._engine: Optional[MemoryEngine] = memory_engine
+        self._memory_engine_factory = memory_engine_factory
         self._conversation_memory: Any = conversation_memory
         self._skill_manager: Any = skill_manager
         self._default_import_path: Optional[Path | str] = default_import_path
@@ -77,6 +79,14 @@ class MemoryConsoleHandler:
     @property
     def engine(self) -> MemoryEngine:
         if self._engine is None:
+            if self._memory_engine_factory is not None:
+                created_engine = self._memory_engine_factory()
+                created_engine.set_private_mode(
+                    enabled=self._private_mode,
+                    allow_history=self._allow_history,
+                )
+                self._engine = created_engine
+                return created_engine
             conv_mem = self._conversation_memory
             # Propagar de forma inmediata las restricciones de privacidad previas al crear
             # el motor perezoso, cerrando cualquier ventana donde el motor opere en modo normal.

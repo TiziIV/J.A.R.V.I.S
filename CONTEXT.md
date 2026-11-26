@@ -1397,3 +1397,35 @@ Se implementó **N8.3 Subfase 2** conectando de forma desacoplada las ejecucione
 
 - Actualizados [docs/N8_LONG_TERM_MEMORY.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N8_LONG_TERM_MEMORY.md), [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/docs/N6_AUTONOMOUS_GOAL_ENGINE.md) y `CONTEXT.md`.
 - **Pendiente:** verificación independiente puntual de las remediaciones F-01 a F-09 por Antigravity Argon antes de emitir aprobación oficial y tag definitivo de cierre de N8.3.
+
+---
+
+## Proyecto J.A.R.V.I.S. — Remediación focalizada N8.3 F-01/F-04/F-05/F-09 (2026-11-26)
+
+**Estado:** Cambios implementados y validados localmente. N8.3 permanece pendiente de auditoría independiente final por Antigravity Argon. No se creó tag de cierre.
+
+### Archivos cambiados
+
+- `src/brain/transaction_manager.py`: listado read-only de ejecuciones confirmadas `ROLLED_BACK` desde journals N5; un journal corrupto propaga error para fail-closed.
+- `src/memory/engine.py`: reconciliación idempotente por ejecución, verificando el tombstone persistido; reintenta cada lectura y continúa con otros IDs si una ejecución falla temporalmente.
+- `src/brain/chain_orchestrator.py`: reconciliación global después de recuperar transacciones, incluso para rollbacks terminales anteriores que ya no generan un `RecoveryReport` nuevo.
+- `main.py`, `src/memory/console.py`, `src/brain/goal_console.py`: conexión read-only al journal antes de entregar N8 en la integración de aplicación; construcción diferida del motor/captura y propagación de flags privados antes de inicializar.
+- `src/brain/goal_persistence.py`, `src/brain/goal_supervisor.py`: saneamiento estructural de historial N6, errores/output de tareas y WAL al existir exposición N8.
+- `tests/test_memory_n8_audit_remediation.py`: prueba de canario F-01 y reproducción con subproceso `os._exit(99)` para F-05, fallo parcial, idempotencia y no afectación de ejecución completada.
+- `prompts_history.txt` conserva el prompt adjunto íntegro y permanece ignorado por Git.
+
+### Verificaciones ejecutadas
+
+- `py_compile` de `main.py`, `src/memory/{engine,console}.py`, `src/brain/{transaction_manager,chain_orchestrator,goal_console,goal_persistence,goal_supervisor}.py` y `tests/test_memory_n8_audit_remediation.py`: **OK**.
+- Pruebas enfocadas F-01/F-04/F-05/F-09: **4/4 OK**.
+- `JARVIS_ENV=test; python -B -m unittest tests.test_memory_n8_audit_remediation -v`: **12/12 OK en 33.600 s**.
+- Regresiones `test_memory_n8_persistence`, `test_memory_n8_lifecycle`, `test_memory_n8_v2_persistence`, `test_memory_n8_capture_and_rollback`, `test_memory_n8_consultative_n6`, `test_memory_n8_snapshot_guard`, `test_goal_engine`, `test_transaction_recovery`, `test_file_editor_and_chain`: **188/188 OK en 158.869 s**.
+- Suite global `JARVIS_ENV=test; python -B -m unittest discover -s tests -p "test_*.py" -q`: **658/658 OK en 252.895 s**; 0 fallos, 0 errores, 0 omitidas.
+- `git diff --check`: **OK**. Los tests `setUp/tearDown` verificaron que los datos reales `memory_store.json`, `file_editor_audit.jsonl`, `experiences.db` y `goals/` conservaron su estado.
+
+### Pendientes y límites
+
+- Pendiente: verificación independiente final de Argon. N8.3 no se declara cerrada.
+- La búsqueda de rollbacks terminales inspecciona journals completos en lecturas N8; su costo crece con el historial N5. Se eligió esta lectura durable para que una falla o caída no pueda borrar el pendiente.
+- No se ejecutaron pruebas físicas de hardware de audio; el test de integración de voz usó dobles sin micrófono/altavoz reales.
+- `data/` contiene solo `file_editor_audit.jsonl` (283.090 bytes; SHA-256 `a556adf1e3446dc23ebdd544e873b9623803d772fc273595b59dac27badda139`) y `memory_store.json` (1.218 bytes; SHA-256 `83640eaadff5e33feb9126f6eebb9f7960f924f01bb3a1968468014223341222`). No se observaron otros archivos ni directorios de datos.

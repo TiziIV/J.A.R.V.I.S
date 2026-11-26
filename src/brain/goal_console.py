@@ -30,6 +30,7 @@ class GoalConsoleHandler:
         context_engine: Any = None,
         ensure_orchestrator_fn: Optional[Callable[[], Any]] = None,
         memory_capture_service: Any = None,
+        memory_capture_service_factory: Optional[Callable[[], Any]] = None,
         memory_engine: Any = None,
         is_private_mode_fn: Optional[Callable[[], bool]] = None,
         allow_history_in_private_fn: Optional[Callable[[], bool]] = None,
@@ -42,6 +43,7 @@ class GoalConsoleHandler:
         self._context_engine = context_engine
         self._ensure_orchestrator_fn = ensure_orchestrator_fn
         self._memory_capture_service = memory_capture_service
+        self._memory_capture_service_factory = memory_capture_service_factory
         self._memory_engine = memory_engine
         self._is_private_mode_fn = is_private_mode_fn
         self._allow_history_in_private_fn = allow_history_in_private_fn
@@ -217,6 +219,7 @@ class GoalConsoleHandler:
                         return confirmed
 
                     if rest_lower == "reanudar":
+                        self._ensure_memory_capture_service()
                         result = self.engine.resume_plan(
                             active,
                             execute=True,
@@ -225,6 +228,7 @@ class GoalConsoleHandler:
                             strict_approval=False,
                         )
                     else:
+                        self._ensure_memory_capture_service()
                         result = self.engine.execute_plan(
                             active,
                             approval_callback=_console_approval,
@@ -258,3 +262,11 @@ class GoalConsoleHandler:
         msg = "Comando N6 no reconocido."
         active_out(f"JARVIS: {msg}")
         return msg
+
+    def _ensure_memory_capture_service(self) -> None:
+        """Crea captura N8 solo al comenzar una ejecución N6 que puede generar evidencia."""
+        if self.engine.memory_capture_service is None and self._memory_capture_service_factory is not None:
+            service = self._memory_capture_service_factory()
+            if service is not None:
+                self._memory_capture_service = service
+                self.engine.set_memory_capture_service(service)

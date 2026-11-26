@@ -810,11 +810,12 @@ class TransactionJournal:
        (`xb`), `flush()` + `os.fsync()` y reemplazo atómico `os.replace()`.
     """
 
-    def __init__(self, journal_dir: Optional[Path | str] = None) -> None:
+    def __init__(self, journal_dir: Optional[Path | str] = None, *, create_dirs: bool = True) -> None:
         self.journal_dir: Path = resolve_safe_journal_dir(journal_dir)
         self.locks_dir: Path = (self.journal_dir / "locks").resolve()
-        self.journal_dir.mkdir(parents=True, exist_ok=True)
-        self.locks_dir.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            self.journal_dir.mkdir(parents=True, exist_ok=True)
+            self.locks_dir.mkdir(parents=True, exist_ok=True)
         # Hook opcional para simular fallos controlados en pruebas entre etapas de persistencia
         self.fault_injector: Optional[Callable[[str, str, Optional[str]], None]] = None
 
@@ -1177,6 +1178,20 @@ class TransactionJournal:
                 elif entry.name.endswith(".wal.jsonl"):
                     tx_ids.add(entry.name[: -len(".wal.jsonl")])
         return sorted(tx_ids)
+
+    def list_confirmed_rollback_execution_ids(self) -> list[str]:
+        """Lee los execution_id terminales ROLLED_BACK como fuente durable de reconciliación."""
+        execution_ids: set[str] = set()
+        for transaction_id in self.list_transaction_ids():
+            try:
+                record, _ = self.validate_and_load_transaction(transaction_id)
+            except JournalCorruptionError:
+                # Si N8 no puede establecer el estado terminal de un journal, debe bloquear
+                # la entrega de recuerdos hasta que la recuperación N5 resuelva la corrupción.
+                raise
+            if record.state == TransactionState.ROLLED_BACK.value and record.execution_id:
+                execution_ids.add(record.execution_id)
+        return sorted(execution_ids)
 
 
 # ==============================================================================

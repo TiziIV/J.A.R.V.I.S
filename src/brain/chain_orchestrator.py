@@ -1143,6 +1143,17 @@ class ChainOrchestrator:
                         )
                     except Exception:
                         pass
+        # Un rollback terminal ya no aparece en `reports` tras el primer reinicio. El journal
+        # conserva la fuente durable, así que cada recuperación vuelve a reconciliarlo hasta
+        # que N8 confirme el tombstone (la operación es idempotente y privada-safe).
+        capture_engine = getattr(self.memory_capture_service, "memory_engine", None)
+        if capture_engine is not None:
+            execution_ids = self.transaction_manager.journal.list_confirmed_rollback_execution_ids()
+            outcomes = capture_engine.reconcile_confirmed_n5_rollbacks(execution_ids)
+            failed = {execution_id: outcome for execution_id, outcome in outcomes.items()
+                      if outcome.startswith("pending:")}
+            if failed:
+                logger.warning("Invalidaciones N5/N8 pendientes para reintento: %s", sorted(failed))
         return reports
 
     def rehydrate_execution(self, execution_id: str) -> Optional[ChainExecutionRecord]:

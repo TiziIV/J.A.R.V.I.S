@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from config.prompts import JARVIS_SYSTEM_PROMPT
@@ -132,6 +133,29 @@ def _resolve_existing_n8_db_path() -> Optional[Any]:
     return candidate if candidate.exists() and candidate.is_file() else None
 
 
+def _n5_rollback_execution_provider() -> Callable[[], list[str]]:
+    """Construye un lector del journal durable sin iniciar recuperación ni tocar N5."""
+    from config import settings
+
+    env_name = os.environ.get("JARVIS_ENV", "").strip().lower()
+    if env_name in {"test", "testing"}:
+        test_root_raw = os.environ.get("JARVIS_TEST_TEMP_ROOT", "").strip()
+        journal_dir = (Path(test_root_raw).resolve() / "transactions") if test_root_raw else None
+    else:
+        journal_dir = Path(settings.TRANSACTION_JOURNAL_DIR).resolve()
+
+    def read_confirmed_rollbacks() -> list[str]:
+        if journal_dir is None or not journal_dir.exists():
+            return []
+        from src.brain.transaction_manager import TransactionJournal
+
+        return TransactionJournal(
+            journal_dir, create_dirs=False
+        ).list_confirmed_rollback_execution_ids()
+
+    return read_confirmed_rollbacks
+
+
 def attach_existing_memory_engine(
     brain_manager: BrainManager,
     *,
@@ -183,6 +207,7 @@ def attach_existing_memory_engine(
         ),
     )
     engine.set_private_mode(enabled=priv_now, allow_history=allow_hist_now)
+    engine.set_n5_rollback_execution_provider(_n5_rollback_execution_provider())
     brain_manager.memory_engine = engine
     return engine
 
@@ -270,6 +295,9 @@ def run_console_session(
                     ),
                 )
                 memory_engine_instance.set_private_mode(enabled=priv_now, allow_history=allow_hist_now)
+                memory_engine_instance.set_n5_rollback_execution_provider(
+                    _n5_rollback_execution_provider()
+                )
                 brain_manager.memory_engine = memory_engine_instance
         elif getattr(brain_manager, "memory_engine", None) is None:
             brain_manager.memory_engine = memory_engine_instance
@@ -311,12 +339,12 @@ def run_console_session(
             return memory_capture_instance
         from config import settings
 
+        # La captura requiere un motor real, pero habilitar captura automática no significa
+        # que un comando de planificación deba crear la base de datos antes de ejecutar.
         should_attach = bool(
             memory_engine_instance is not None
-            or (
-                settings.N8_ENABLED
-                and (settings.N8_AUTO_CAPTURE_ENABLED or settings.EXPERIENCES_DB_PATH.exists())
-            )
+            or (settings.N8_ENABLED and settings.EXPERIENCES_DB_PATH.exists())
+            or (settings.N8_ENABLED and settings.N8_AUTO_CAPTURE_ENABLED)
         )
         if not should_attach:
             return None
@@ -333,7 +361,10 @@ def run_console_session(
             from src.memory.console import MemoryConsoleHandler
 
             memory_console_handler = MemoryConsoleHandler(
-                memory_engine=_ensure_memory_engine(),
+                # El handler conserva privacidad en RAM y construye el motor solo al ejecutar
+                # un comando que efectivamente consulta o modifica N8.
+                memory_engine=_resolve_existing_memory_engine(),
+                memory_engine_factory=_ensure_memory_engine,
                 conversation_memory=brain_manager.memory,
                 skill_manager=getattr(brain_manager, "skill_manager", None),
                 on_private_mode_changed=_on_private_mode_changed,
@@ -399,7 +430,8 @@ def run_console_session(
                 brain_manager=brain_manager,
                 context_engine=_ensure_context_engine(),
                 ensure_orchestrator_fn=_ensure_orchestrator,
-                memory_capture_service=_ensure_memory_capture_service(),
+                memory_capture_service=memory_capture_instance,
+                memory_capture_service_factory=_ensure_memory_capture_service,
                 memory_engine=_resolve_existing_memory_engine(),
                 is_private_mode_fn=_is_private_mode_active,
                 allow_history_in_private_fn=_allow_history_in_private,
