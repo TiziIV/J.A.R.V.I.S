@@ -1429,3 +1429,61 @@ Se implementó **N8.3 Subfase 2** conectando de forma desacoplada las ejecucione
 - La búsqueda de rollbacks terminales inspecciona journals completos en lecturas N8; su costo crece con el historial N5. Se eligió esta lectura durable para que una falla o caída no pueda borrar el pendiente.
 - No se ejecutaron pruebas físicas de hardware de audio; el test de integración de voz usó dobles sin micrófono/altavoz reales.
 - `data/` contiene solo `file_editor_audit.jsonl` (283.090 bytes; SHA-256 `a556adf1e3446dc23ebdd544e873b9623803d772fc273595b59dac27badda139`) y `memory_store.json` (1.218 bytes; SHA-256 `83640eaadff5e33feb9126f6eebb9f7960f924f01bb3a1968468014223341222`). No se observaron otros archivos ni directorios de datos.
+
+---
+
+## Proyecto J.A.R.V.I.S. — Remediación final focalizada N8.3 (H-01 a H-07) (2026-11-27)
+
+**Estado:** Remediación de los siete hallazgos reproducibles del informe independiente de Antigravity Argon sobre `a10652b` implementada y verificada en entorno aislado. **N8.3 permanece pendiente de verificación independiente final por Antigravity Argon; no se creó tag definitivo.**
+
+### 1. Causas raíz, correcciones y nuevas garantías
+
+- **H-01 — Reconciliación fail-closed ante estados intermedios y parciales (`src/brain/transaction_manager.py`, `src/memory/store.py`, `src/memory/engine.py`, `src/memory/capture.py`):**
+  - *Causa raíz:* `list_confirmed_rollback_execution_ids()` filtraba únicamente `state == ROLLED_BACK`, permitiendo entregar recuerdos `ACTIVE` tras una caída (`os._exit(99)`) con archivos ya restaurados en `ROLLING_BACK`, `RECOVERY_REQUIRED`, `RECOVERING`, `RECOVERY_FAILED` o `FAILED` parcial.
+  - *Solución:* `TransactionJournal.assess_reconciliation_state()` clasifica cada transacción en 8 estados explícitos (`COMMITTED_CLEAN`, `ROLLBACK_CONFIRMED`, `ROLLBACK_STARTED`, `ROLLBACK_PARTIAL`, `RECOVERY_PENDING`, `RECOVERY_FAILED`, `CORRUPT_OR_UNREADABLE`, `INSUFFICIENT_EVIDENCE`). Las operaciones individuales con reversión confirmada en rollbacks parciales se invalidan granularmente (`ExperienceStore.invalidate_by_execution_operations()` + tombstones por operación) sin marcar prematuramente como revertidas las operaciones no revertidas ni tocar ejecuciones `COMMITTED` independientes, mientras cualquier incertidumbre transaccional o error SQLite bloquea la lectura/exportación N8 de forma cerrada (`MemoryPersistenceError`) hasta que N5 resuelva la recuperación.
+- **H-02 — Proveedor N5 por defecto, resolución de rutas sin `Path.exists()` y `logger` en recuperación (`src/brain/chain_orchestrator.py`, `src/brain/transaction_manager.py`, `src/memory/engine.py`, `src/memory/store.py`, `src/memory/capture.py`, `main.py`):**
+  - *Causa raíz:* `chain_orchestrator.py` invocaba `logger.warning(...)` sin importar `logger` (`NameError`), `MemoryEngine` nacía con `_n5_rollback_execution_provider = None`, `main.py` usaba `Path.exists()` (ocultando `PermissionError` como ausencia) y en `JARVIS_ENV=test` podía divergir el directorio del journal.
+  - *Solución:* Importado `logger` desde `src.utils.logger` y registrado en `RecoveryReport` (`n8_reconciled=False`, `n8_reconciliation_error`) + `orch.n8_reconciliation_pending` cuando falla la reconciliación SQLite (sin declarar éxito falso y permitiendo reintento limpio). `inspect_journal_directory_status()` usa `os.stat()` explícito distinguiendo `FileNotFoundError` (instalación limpia) de `PermissionError`/`OSError` (fail-closed). Toda instancia de `MemoryEngine` conecta por defecto `_default_n5_rollback_provider()` y `ChainOrchestrator` vincula su `journal_dir` real en `ExperienceCaptureService`/`store_metadata`.
+- **H-03 — Cobertura de reconciliación en todas las APIs públicas de `MemoryEngine` (`src/memory/engine.py`):**
+  - *Causa raíz:* `get_revisions()`, `get_stats()`, `create_backup()`, `preview_preferences_import()` y `commit_preferences_import()` omitían `_ensure_pending_invalidations_applied_for_read()`.
+  - *Solución:* Todas las APIs públicas de lectura, estadísticas, revisiones, confirmación/corrección, respaldos e importación ejecutan la frontera de reconciliación antes de operar, usando `reconciliation_scope()` para evitar escaneos duplicados dentro de una misma llamada compuesta y garantizando que ningún backup congele como `ACTIVE` recuerdos revertidos.
+- **H-04 — Conservación durable de `n8_context_exposed` al recargar `GoalPlan` (`src/brain/goal_models.py`, `src/brain/goal_persistence.py`):**
+  - *Causa raíz:* `GoalPlan.to_dict()` / `from_dict()` no preservaban `n8_context_exposed`, perdiendo la frontera de saneamiento tras reiniciar el proceso o revocar recuerdos.
+  - *Solución:* Se persiste `"n8_context_exposed"` en el snapshot (fuera de `compute_plan_hash()` para compatibilidad total de aprobaciones) y se refuerza con `GoalPlan.infer_n8_exposure()` a partir de metadatos estructurales (`n8_query_id`, `n8_trust_boundary`, `n8_memory_refs`, `n8_influenced`, `llm_with_n8`), funcionando incluso con recuerdo revocado, sin `MemoryEngine` o en `--sin-historial`.
+- **H-05 — Propagación estructural de contaminación N8 en síntesis multi-etapa con hardware N7 (`src/brain/goal_supervisor.py`, `src/brain/goal_persistence.py`):**
+  - *Causa raíz:* `_execute_internal_synthesis()` etiquetaba sobres mixtos N7+N8 como `n7_context_awareness` cuando `safe_hw_ctx` no estaba vacío y propagaba resúmenes contaminados dentro de `untrusted_envelope["observations"]`.
+  - *Solución:* El sobre mixto se etiqueta como `provenance="n8_and_n7_mixed"`, `trust_level="untrusted_long_term_memory"`, `n8_tainted=True`; `observations` excluye toda subtarea upstream con linaje `n8_tainted`, y `extract_persistable_plan_dict()` elimina cualquier observación o referencia histórica contaminada preservando únicamente telemetría estructural N7 pura si existe.
+- **H-06 — Saneamiento de `goal.cancellation_reason`, replanificación post-revocación y paridad en `EphemeralGoalStore` (`src/brain/goal_persistence.py`, `src/brain/goal_supervisor.py`, `src/brain/goal_engine.py`):**
+  - *Causa raíz:* `cancellation_reason` no se sustituía bajo exposición N8, `EphemeralGoalStore.append_wal_event()` ignoraba `n8_context_exposed` y `_attempt_replan()` fijaba `replan_saw_n8=False` si el recuerdo había sido revocado antes del replan.
+  - *Solución:* `extract_persistable_plan_dict()` y `_sanitize_runtime_strings()` sanean `cancellation_reason`, `GoalStore` y `EphemeralGoalStore` transmiten e infieren `n8_context_exposed` de forma simétrica en `append_wal_event()`, y `_attempt_replan()` mantiene activa la frontera `replan_saw_n8` siempre que el plan o la tarea fallida tengan exposición previa a N8.
+- **H-07 — Prevención de creación innecesaria de `experiences.db` durante modo privado (`main.py`, `src/memory/console.py`):**
+  - *Causa raíz:* `_ensure_memory_capture_service()` creaba `MemoryEngine` en `/plan ejecutar` cuando `N8_AUTO_CAPTURE_ENABLED=True` aunque `/privado` estuviera activo, y comandos de `/memoria` evaluaban `self.engine` antes de verificar la restricción privada/`--sin-historial`.
+  - *Solución:* `_ensure_memory_capture_service()` omite crear motor/DB en modo privado cuando `experiences.db` no existe (adjuntando únicamente DBs ya existentes para no interrumpir invalidaciones obligatorias N5/N8), y `MemoryConsoleHandler` verifica `_is_private_active()` e `_is_history_allowed_now()` antes de acceder a `self.engine`.
+
+### 2. Optimización de rendimiento de reconciliación (Sección 12)
+
+Se eliminaron las escrituras `BEGIN IMMEDIATE` repetitivas mediante pre-chequeo de lectura (`inspect_unreconciled_n5_rollbacks`), seguimiento en memoria de tombstones verificados atado a la firma `(mtime_ns, size)` en disco de `experiences.db`/`-wal`, verificación por hash SHA-256 de bytes crudos de `.tx.json`/`.wal.jsonl` en cada escaneo (detecta cualquier nuevo rollback o corrupción de 1 bit) y eliminación de escaneos intermedios redundantes en `MemorySnapshotGuard.validate_before_dispatch`:
+
+| Transacciones N5 | Rollbacks | Turno antes (`a10652b`) | Turno después (estacionario) | `retrieve()` frío | `retrieve()` estacionario | Escrituras SQLite / turno (antes -> después) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5 | 0 | 82.89 ms | 88.05 ms | 21.70 ms | 16.79 ms | 0 -> 0 |
+| 5 | 1 | 183.65 ms | 79.96 ms | 133.71 ms | 18.05 ms | 8 -> 0 |
+| 50 | 5 | 1,024.54 ms | 202.29 ms | 759.29 ms | 47.69 ms | 40 -> 0 |
+| 250 | 25 | 5,091.52 ms | 727.09 ms | 3,617.86 ms | 179.52 ms | 200 -> 0 |
+| 500 | 50 | 10,091.97 ms | 1,407.08 ms | 7,097.93 ms | 343.62 ms | 400 -> 0 |
+
+### 3. Verificaciones ejecutadas e integridad de datos
+
+- `py_compile` sobre los 14 módulos modificados: **OK (código 0)**.
+- Suite adversarial ampliada (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -B -m unittest tests.test_memory_n8_audit_remediation -v`): **20/20 OK en 65.146 s**.
+- Regresiones N8/N5/N6 (`test_memory_n8_persistence`, `test_memory_n8_lifecycle`, `test_memory_n8_v2_persistence`, `test_memory_n8_capture_and_rollback`, `test_memory_n8_consultative_n6`, `test_memory_n8_snapshot_guard`, `test_goal_engine`, `test_transaction_recovery`, `test_file_editor_and_chain`): **188/188 OK en 170.446 s**.
+- Suite global aislada (`$env:JARVIS_ENV="test"; .\venv\Scripts\python.exe -B -m unittest discover -s tests -p "test_*.py" -q`): **666/666 OK en 303.122 s** (0 fallos, 0 errores, 0 omitidas).
+- Arranque liviano sin carga de módulos pesados de voz/GPU (`HEAVY_MODULES: []`): **OK**.
+- Integridad de `data/` intacta antes y después de toda la batería:
+  - `data/file_editor_audit.jsonl`: **283.090 bytes**, SHA-256 `a556adf1e3446dc23ebdd544e873b9623803d772fc273595b59dac27badda139`.
+  - `data/memory_store.json`: **1.218 bytes**, SHA-256 `83640eaadff5e33feb9126f6eebb9f7960f924f01bb3a1968468014223341222`.
+  - `data/experiences.db`, `data/goals/`, `data/backups/`: inexistentes (`False`).
+- **Limitaciones pendientes:**
+  - En Windows NTFS, cada escaneo de reconciliación sigue leyendo y verificando por SHA-256 los archivos del journal para garantizar detección estricta de nuevos rollbacks y corrupciones sin índices paralelos (`~343 ms` por escaneo con 500 transacciones).
+  - No se ejecutaron pruebas con micrófono o altavoces físicos reales (la ruta `--voice` se validó mediante dobles de prueba).
+  - Pendiente la verificación independiente final de Antigravity Argon antes de aprobar definitivamente N8.3 y crear su tag de cierre.

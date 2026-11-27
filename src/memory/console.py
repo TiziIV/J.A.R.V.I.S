@@ -120,6 +120,52 @@ class MemoryConsoleHandler:
             self._engine = created_engine
         return self._engine
 
+    def _is_private_active(self) -> bool:
+        """Evalúa el estado privado vigente sin instanciar `self.engine` ni crear `experiences.db`."""
+        return bool(
+            self._private_mode
+            or (
+                self._conversation_memory is not None
+                and getattr(self._conversation_memory, "is_private_mode", False) is True
+            )
+            or (self._engine is not None and self._engine.is_private_mode is True)
+        )
+
+    def _is_history_allowed_now(self) -> bool:
+        """Evalúa si la lectura histórica N8 está permitida sin instanciar `self.engine`."""
+        if not self._is_private_active():
+            return True
+        return bool(
+            self._allow_history
+            and (
+                self._conversation_memory is None
+                or getattr(self._conversation_memory, "private_allow_history", True) is not False
+            )
+            and (self._engine is None or self._engine.allow_history_reads is not False)
+        )
+
+    def _has_existing_or_live_db(self) -> bool:
+        """Comprueba sin escribir en disco si ya existe un motor vivo o un archivo `experiences.db`."""
+        if self._engine is not None:
+            return True
+        try:
+            from src.memory.store import _default_db_path
+
+            cand = _default_db_path()
+            return cand.exists() and cand.is_file()
+        except Exception:
+            return False
+
+    def _reconcile_existing_db_if_present(self) -> None:
+        """
+        Si la base N8 ya existe en disco durante `--sin-historial`, ejecuta únicamente la
+        reconciliación obligatoria de seguridad N5/N8 sin exponer recuerdos ni crear DB nueva.
+        """
+        if self._has_existing_or_live_db():
+            eng = self.engine
+            if hasattr(eng, "_ensure_pending_invalidations_applied_for_read"):
+                eng._ensure_pending_invalidations_applied_for_read()
+
     @staticmethod
     def is_memory_command(text: str) -> bool:
         """Indica si el comando pertenece a `/memoria`, `/privado` o `/incognito`."""
@@ -362,6 +408,10 @@ class MemoryConsoleHandler:
                 msg = "[Error] `/memoria backup` no acepta argumentos posicionales."
                 active_out(f"JARVIS: {msg}")
                 return msg
+            if self._is_private_active():
+                raise MemoryPrivateModeError(
+                    "Operación de escritura bloqueada en memoria N8 porque el modo privado está activo."
+                )
             info = self.engine.create_backup(actor="console_user")
             msg = (
                 f"[Confirmación] Backup creado y verificado correctamente.\n"
@@ -423,6 +473,16 @@ class MemoryConsoleHandler:
             if (project_key or app_key)
             else None
         )
+        if not self._is_history_allowed_now():
+            self._reconcile_existing_db_if_present()
+            msg = "[Advertencia] Lectura histórica bloqueada porque `/privado --sin-historial` está activo."
+            active_out(f"JARVIS: {msg}")
+            return msg
+        if self._is_private_active() and not self._has_existing_or_live_db():
+            msg = f"No se encontraron recuerdos activos relevantes para '{query}'."
+            active_out(f"JARVIS: {msg}")
+            return msg
+
         res = self.engine.retrieve(query, target=target, context_scope=scope_ctx)
         if res.blocked_by_history_policy:
             msg = "[Advertencia] Lectura histórica bloqueada porque `/privado --sin-historial` está activo."
@@ -465,6 +525,16 @@ class MemoryConsoleHandler:
             active_out(f"JARVIS: {msg}")
             return msg
 
+        if not self._is_history_allowed_now():
+            self._reconcile_existing_db_if_present()
+            msg = "[Advertencia] Lectura histórica bloqueada porque `/privado --sin-historial` está activo."
+            active_out(f"JARVIS: {msg}")
+            return msg
+        if self._is_private_active() and not self._has_existing_or_live_db():
+            msg = "No hay recuerdos que coincidan con el filtro solicitado."
+            active_out(f"JARVIS: {msg}")
+            return msg
+
         records = self.engine.list_memories(status=status_filter, pending_only=pending_only, limit=50)
         if not records:
             msg = "No hay recuerdos que coincidan con el filtro solicitado."
@@ -486,6 +556,16 @@ class MemoryConsoleHandler:
         mem_id = (arg_str or "").strip()
         if not mem_id or " " in mem_id:
             msg = "[Error] Uso: /memoria ver <memory_id>"
+            active_out(f"JARVIS: {msg}")
+            return msg
+
+        if not self._is_history_allowed_now():
+            self._reconcile_existing_db_if_present()
+            msg = "[Advertencia] Lectura histórica bloqueada porque `/privado --sin-historial` está activo."
+            active_out(f"JARVIS: {msg}")
+            return msg
+        if self._is_private_active() and not self._has_existing_or_live_db():
+            msg = f"[Error] No se encontró ningún recuerdo con ID '{mem_id}'."
             active_out(f"JARVIS: {msg}")
             return msg
 
@@ -527,6 +607,10 @@ class MemoryConsoleHandler:
             msg = "[Error] Uso: /memoria corregir <memory_id> [nuevo contenido]"
             active_out(f"JARVIS: {msg}")
             return msg
+        if self._is_private_active():
+            raise MemoryPrivateModeError(
+                "Operación de escritura bloqueada en memoria N8 porque el modo privado está activo."
+            )
 
         mem_id = parts[0].strip()
         existing = self.engine.get_memory(mem_id)
@@ -566,6 +650,10 @@ class MemoryConsoleHandler:
             msg = "[Error] Uso: /memoria confirmar <memory_id>"
             active_out(f"JARVIS: {msg}")
             return msg
+        if self._is_private_active():
+            raise MemoryPrivateModeError(
+                "Operación de escritura bloqueada en memoria N8 porque el modo privado está activo."
+            )
 
         rec = self.engine.confirm_memory(mem_id, actor="console_user")
         msg = (
@@ -581,6 +669,10 @@ class MemoryConsoleHandler:
             msg = "[Error] Uso: /memoria olvidar <memory_id> [motivo]"
             active_out(f"JARVIS: {msg}")
             return msg
+        if self._is_private_active():
+            raise MemoryPrivateModeError(
+                "Operación de escritura bloqueada en memoria N8 porque el modo privado está activo."
+            )
 
         mem_id = parts[0].strip()
         reason = parts[1].strip() if len(parts) > 1 else "Olvidado por instrucción del usuario (/memoria olvidar)"
@@ -605,8 +697,8 @@ class MemoryConsoleHandler:
             active_out(f"JARVIS: {msg}")
             return msg
 
-        # Verificamos primero bloqueo de modo privado y existencia del recuerdo antes de confirmar.
-        if self.engine.is_private_mode:
+        # Verificamos primero bloqueo de modo privado sin instanciar `self.engine` (H-07).
+        if self._is_private_active():
             raise MemoryPrivateModeError("No se permite purgar registros durante el modo privado.")
 
         rec = self.engine.get_memory(mem_id)
@@ -654,6 +746,10 @@ class MemoryConsoleHandler:
         active_in: Callable[[str], str],
         active_out: Callable[[str], None],
     ) -> str:
+        if self._is_private_active():
+            raise MemoryPrivateModeError(
+                "La importación de preferencias modifica `experiences.db` y está bloqueada en modo privado."
+            )
         cleaned_arg = arg_str.strip().strip('"').strip("'").strip()
         raw_path: Optional[Path | str] = cleaned_arg if cleaned_arg else self._default_import_path
         preview = self.engine.preview_preferences_import(raw_path)
@@ -721,7 +817,7 @@ class MemoryConsoleHandler:
         active_in: Callable[[str], str],
         active_out: Callable[[str], None],
     ) -> str:
-        if self.engine.is_private_mode:
+        if self._is_private_active():
             raise MemoryPrivateModeError("No se permite restaurar la base de memoria durante el modo privado.")
 
         backups = self.engine.list_backups()

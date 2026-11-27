@@ -912,6 +912,19 @@ class ExperienceCaptureService:
         self._auto_capture_override: bool | None = auto_capture_enabled
         self._lock = threading.RLock()
         self._invalidated_executions: set[str] = set()
+        self._n5_journal_dirs: list[Path] = []
+
+    def register_n5_journal_dir(self, journal_dir: Path | str) -> None:
+        """Vincula el directorio real de transacciones N5 con el motor N8 subyacente (H-02)."""
+        resolved = Path(journal_dir).resolve()
+        with self._lock:
+            if all(str(p).lower() != str(resolved).lower() for p in self._n5_journal_dirs):
+                self._n5_journal_dirs.append(resolved)
+        if hasattr(self.memory_engine, "register_n5_journal_dir"):
+            self.memory_engine.register_n5_journal_dir(
+                resolved,
+                persist_metadata=not self.memory_engine.is_private_mode,
+            )
 
     @property
     def is_enabled(self) -> bool:
@@ -997,6 +1010,23 @@ class ExperienceCaptureService:
                         reason=(
                             f"Ejecución '{contract.source_execution_id}' invalidada por rollback previo; "
                             "captura rechazada de forma cerrada."
+                        ),
+                    )
+                if (
+                    contract.source_task_id
+                    and hasattr(self.memory_engine, "is_execution_operation_invalidated")
+                    and self.memory_engine.is_execution_operation_invalidated(
+                        contract.source_execution_id,
+                        contract.source_task_id,
+                    )
+                ):
+                    return CaptureUnitOutcome(
+                        canonical_unit_id=contract.canonical_unit_id,
+                        source_execution_id=contract.source_execution_id,
+                        status="invalidated_execution",
+                        reason=(
+                            f"Operación '{contract.source_execution_id}/{contract.source_task_id}' "
+                            "invalidada por rollback parcial previo; captura rechazada."
                         ),
                     )
 
@@ -1222,6 +1252,11 @@ class ExperienceCaptureService:
                 scope_type=scope_type,
                 scope_key=scope_key,
             )
+            with self._lock:
+                j_dirs = list(self._n5_journal_dirs)
+            if j_dirs and hasattr(self.memory_engine, "register_n5_journal_dir"):
+                for j_dir in j_dirs:
+                    self.memory_engine.register_n5_journal_dir(j_dir, persist_metadata=True)
             return self.capture_contracts(
                 contracts,
                 source_layer="N5_CHAIN_ORCHESTRATOR",

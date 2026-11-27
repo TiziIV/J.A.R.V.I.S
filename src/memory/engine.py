@@ -10,11 +10,13 @@ mantiene N8 estrictamente separado de N5 (autoridad/ejecución) y N6 (`GoalStore
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 import json
+import os
 from pathlib import Path
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Sequence
 
 from config import settings
 from src.brain.exceptions import is_sensitive_key, redact_secrets
@@ -68,6 +70,9 @@ _AMBIGUOUS_PREFERENCE_KEY_MARKERS: tuple[str, ...] = (
 )
 
 
+_DEFAULT_PROVIDER_SENTINEL: object = object()
+
+
 class MemoryEngine:
     """
     Fachada central N8.2 sobre persistencia (`ExperienceStore`), recuperación (`MemoryRetriever`),
@@ -83,6 +88,8 @@ class MemoryEngine:
         backup_dir: Path | str | None = None,
         is_private_mode_fn: Callable[[], bool] | None = None,
         allow_history_in_private_fn: Callable[[], bool] | None = None,
+        n5_journal_dir: Path | str | Sequence[Path | str] | None = None,
+        n5_rollback_execution_provider: Any = _DEFAULT_PROVIDER_SENTINEL,
     ) -> None:
         self.policy: MemoryPolicy = policy or (store.policy if store is not None else MemoryPolicy())
         self.store: ExperienceStore = store or ExperienceStore(policy=self.policy)
@@ -94,12 +101,31 @@ class MemoryEngine:
         self._allow_history_in_private: bool = True
         self._is_private_mode_fn: Callable[[], bool] | None = is_private_mode_fn
         self._allow_history_in_private_fn: Callable[[], bool] | None = allow_history_in_private_fn
-        # Remediación F-05: cola RAM mínima de invalidaciones de rollback N5 recibidas durante
-        # modo privado (exclusivamente execution_id + motivo/actor sanitizados, nunca texto privado).
+        # Remediación F-05 / H-01 / H-02: cola RAM mínima para rollbacks diferidos y proveedor N5
+        # conectado por defecto sobre el journal durable sin depender de clausuras de main.py.
         self._state_lock: threading.RLock = threading.RLock()
         self._pending_rollback_invalidations: dict[str, dict[str, str]] = {}
         self._pending_invalidation_error: str | None = None
-        self._n5_rollback_execution_provider: Callable[[], tuple[str, ...] | list[str]] | None = None
+        self._registered_n5_journal_dirs: list[Path] = []
+        if n5_journal_dir is not None:
+            if isinstance(n5_journal_dir, (str, Path)):
+                self._registered_n5_journal_dirs.append(Path(n5_journal_dir).resolve())
+            else:
+                for item in n5_journal_dir:
+                    self._registered_n5_journal_dirs.append(Path(item).resolve())
+
+        self._custom_n5_provider_set: bool = n5_rollback_execution_provider is not _DEFAULT_PROVIDER_SENTINEL
+        self._n5_rollback_execution_provider: Callable[[], Any] | None = (
+            self._default_n5_rollback_provider
+            if n5_rollback_execution_provider is _DEFAULT_PROVIDER_SENTINEL
+            else n5_rollback_execution_provider
+        )
+        # Estado local para evitar transacciones SQLite de escritura sobre tombstones ya verificados
+        # frente a la firma exacta en disco de experiences.db (+ WAL), sin omitir nuevos rollbacks.
+        self._verified_db_signature: tuple[Any, ...] | None = None
+        self._verified_reconciled_execs: set[str] = set()
+        self._verified_reconciled_ops: set[tuple[str, str]] = set()
+        self._reconciliation_tls: threading.local = threading.local()
 
     # ------------------------------------------------------------------
     # Control centralizado de Modo Privado e Invalidaciones Diferidas (F-05)
@@ -138,10 +164,213 @@ class MemoryEngine:
                 pass
 
     def set_n5_rollback_execution_provider(
-        self, provider: Callable[[], tuple[str, ...] | list[str]] | None
+        self, provider: Callable[[], Any] | None
     ) -> None:
-        """Conecta el lector read-only del journal N5 usado antes de cada lectura N8."""
-        self._n5_rollback_execution_provider = provider
+        """
+        Conecta o actualiza el lector read-only del journal N5 usado antes de cada operación N8.
+        Admite proveedores que retornen `JournalReconciliationAssessment` o `Sequence[str]`.
+        """
+        with self._state_lock:
+            self._custom_n5_provider_set = True
+            self._n5_rollback_execution_provider = provider
+
+    @property
+    def has_n5_rollback_provider(self) -> bool:
+        with self._state_lock:
+            return self._n5_rollback_execution_provider is not None
+
+    def register_n5_journal_dir(
+        self,
+        journal_dir: Path | str,
+        *,
+        persist_metadata: bool = False,
+    ) -> None:
+        """
+        Vincula un directorio real de transacciones N5 con esta instancia de `MemoryEngine`.
+        Si `persist_metadata=True` y la escritura está permitida, anota la ruta en `store_metadata`
+        para que tras un reinicio de proceso la reconciliación encuentre el mismo journal (H-02).
+        """
+        resolved = Path(journal_dir).resolve()
+        with self._state_lock:
+            if all(str(p).lower() != str(resolved).lower() for p in self._registered_n5_journal_dirs):
+                self._registered_n5_journal_dirs.append(resolved)
+        if persist_metadata and not self.is_private_mode:
+            try:
+                self.store.record_n5_journal_dir_metadata(resolved)
+            except Exception:
+                pass
+
+    def _discover_n5_journal_dirs(self) -> list[Path]:
+        """
+        Resuelve de forma determinista y sin `Path.exists()` los directorios de journals N5 que
+        deben inspeccionarse para proteger los recuerdos de esta instancia (remediación H-02).
+        """
+        from src.brain.transaction_manager import PRODUCTION_JOURNAL_DIR
+
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        def _add(raw_path: Path | str | None) -> None:
+            if raw_path is None:
+                return
+            s_raw = str(raw_path).strip()
+            if not s_raw:
+                return
+            resolved = Path(s_raw).resolve()
+            norm_key = str(resolved).lower()
+            if norm_key not in seen:
+                seen.add(norm_key)
+                candidates.append(resolved)
+
+        with self._state_lock:
+            registered_copy = list(self._registered_n5_journal_dirs)
+        for reg_dir in registered_copy:
+            _add(reg_dir)
+
+        for meta_dir in self.store.read_registered_n5_journal_dirs():
+            _add(meta_dir)
+
+        env_name = os.environ.get("JARVIS_ENV", "").strip().lower()
+        cfg_journal = Path(settings.TRANSACTION_JOURNAL_DIR).resolve()
+        if env_name not in {"test", "testing"}:
+            _add(cfg_journal)
+            return candidates
+
+        # En modo test nunca tocamos data/transactions productivo salvo override explícito seguro.
+        if cfg_journal != PRODUCTION_JOURNAL_DIR:
+            _add(cfg_journal)
+
+        test_root_raw = os.environ.get("JARVIS_TEST_TEMP_ROOT", "").strip()
+        if test_root_raw:
+            _add(Path(test_root_raw).resolve() / "transactions")
+
+        # Descubrimiento acotado al directorio aislado de la prueba propietaria de `db_path`
+        # (nunca escanea la raíz global compartida `temp/jarvis_test_isolated`).
+        shared_sandbox_root = (settings.BASE_DIR / "temp" / "jarvis_test_isolated").resolve()
+        db_parent = self.store.db_path.resolve().parent
+        if db_parent != shared_sandbox_root:
+            _add(db_parent / "transactions")
+            _add(db_parent / "backups" / "transactions")
+            try:
+                with os.scandir(str(db_parent)) as it:
+                    for entry in sorted(list(it), key=lambda d: d.name):
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        sub_path = Path(entry.path).resolve()
+                        low_name = entry.name.lower()
+                        if low_name in {"journal", "tx_journal", "n5_journal", "n5_transactions"} or low_name.startswith("tx_run_"):
+                            _add(sub_path)
+                            continue
+                        try:
+                            with os.scandir(str(sub_path)) as sub_it:
+                                if any(
+                                    child.name.endswith((".tx.json", ".wal.jsonl"))
+                                    for child in sub_it
+                                ):
+                                    _add(sub_path)
+                        except PermissionError:
+                            # Si un subdirectorio candidato tiene permisos denegados, lo incluimos
+                            # para que `inspect_journal_directory_status` falle cerrado si procede.
+                            if "tx" in low_name or "journal" in low_name or "transaction" in low_name:
+                                _add(sub_path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        return candidates
+
+    def _default_n5_rollback_provider(self) -> Any:
+        """
+        Evalúa todos los journals N5 aplicables y devuelve un `JournalReconciliationAssessment`
+        consolidado, preservando errores de corrupción o permisos para fallar cerrado (H-01/H-02).
+        """
+        from src.brain.transaction_manager import (
+            JournalReconciliationAssessment,
+            TransactionJournal,
+            inspect_journal_directory_status,
+        )
+
+        dirs = self._discover_n5_journal_dirs()
+        confirmed_execs: set[str] = set()
+        partial_ops_map: dict[str, set[str]] = {}
+        ambiguous_entries: list[Any] = []
+        committed_clean: set[str] = set()
+        all_entries: list[Any] = []
+        any_accessible = False
+
+        for j_dir in dirs:
+            status = inspect_journal_directory_status(j_dir)
+            if status == "absent":
+                continue
+            any_accessible = True
+            assessment = TransactionJournal(j_dir, create_dirs=False).assess_reconciliation_state()
+            confirmed_execs.update(assessment.confirmed_rollback_execution_ids)
+            committed_clean.update(assessment.committed_clean_execution_ids)
+            ambiguous_entries.extend(assessment.ambiguous_or_pending_transactions)
+            all_entries.extend(assessment.entries)
+            for eid, ops in assessment.partial_rollback_operations:
+                partial_ops_map.setdefault(eid, set()).update(ops)
+
+        # Si una ejecución aparece confirmada por completo, no requiere además entrada parcial redundante.
+        for full_eid in confirmed_execs:
+            partial_ops_map.pop(full_eid, None)
+
+        return JournalReconciliationAssessment(
+            journal_dir=";".join(str(d) for d in dirs),
+            directory_status="accessible" if any_accessible else "absent",
+            confirmed_rollback_execution_ids=tuple(sorted(confirmed_execs)),
+            partial_rollback_operations=tuple(
+                (eid, tuple(sorted(ops))) for eid, ops in sorted(partial_ops_map.items()) if ops
+            ),
+            ambiguous_or_pending_transactions=tuple(ambiguous_entries),
+            committed_clean_execution_ids=tuple(sorted(committed_clean - confirmed_execs)),
+            entries=tuple(all_entries),
+        )
+
+    def _current_db_disk_signature(self) -> tuple[Any, ...] | None:
+        """Obtiene la huella `(mtime_ns, size)` de `experiences.db` y su `-wal` para validar caché local."""
+        sig: list[Any] = [str(self.store.db_path)]
+        for suffix in ("", "-wal"):
+            target = f"{self.store.db_path}{suffix}"
+            try:
+                st = os.stat(target)
+                sig.append((st.st_mtime_ns, st.st_size))
+            except FileNotFoundError:
+                if suffix == "":
+                    return None
+                sig.append(None)
+            except OSError:
+                return None
+        return tuple(sig)
+
+    def _store_invalidation_methods_patched(self) -> bool:
+        store_vars = getattr(self.store, "__dict__", {})
+        return any(
+            k in store_vars
+            for k in (
+                "invalidate_by_execution",
+                "invalidate_by_execution_operations",
+                "is_execution_invalidated",
+                "is_execution_operation_invalidated",
+                "mark_execution_rollback_tombstone",
+                "inspect_unreconciled_n5_rollbacks",
+            )
+        )
+
+    @contextmanager
+    def reconciliation_scope(self) -> Iterator[None]:
+        """
+        Ejecuta la reconciliación fail-closed N5/N8 una sola vez en el borde de una operación
+        compuesta de `MemoryEngine`, evitando escaneos redundantes internos (H-03 / Sección 12).
+        """
+        depth = int(getattr(self._reconciliation_tls, "depth", 0))
+        if depth == 0:
+            self._ensure_pending_invalidations_applied_for_read()
+        self._reconciliation_tls.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._reconciliation_tls.depth = depth
 
     def queue_pending_rollback_invalidation(
         self,
@@ -257,17 +486,67 @@ class MemoryEngine:
 
     def _ensure_pending_invalidations_applied_for_read(self) -> None:
         """
-        Antes de cualquier consulta fuera de modo privado, exige que toda invalidación de
-        rollback N5 encolada en RAM se haya aplicado en SQLite; si falla, falla cerrado.
+        Frontera fail-closed unificada antes de exponer, respaldar, clasificar o modificar
+        recuerdos en `MemoryEngine` (remediaciones F-05, H-01, H-02, H-03 y Sección 12):
+        1. Inspecciona el journal N5 durable mediante el proveedor conectado.
+        2. Aplica reconciliaciones confirmadas completas y granulares por operación.
+        3. Bloquea de forma cerrada (`MemoryPersistenceError`) ante cualquier error del proveedor,
+           corrupción/inaccesibilidad del journal, estado ambiguo (`ROLLING_BACK`, recuperación
+           inconclusa o fallida) o fallo SQLite pendiente de reintento.
         """
-        if self._n5_rollback_execution_provider is not None:
-            execution_ids = self._n5_rollback_execution_provider()
-            outcomes = self.reconcile_confirmed_n5_rollbacks(execution_ids)
-            pending = {key: value for key, value in outcomes.items() if value.startswith("pending:")}
-            if pending:
+        if int(getattr(self._reconciliation_tls, "depth", 0)) > 0:
+            return
+
+        provider = self._n5_rollback_execution_provider
+        if provider is not None:
+            from src.brain.transaction_manager import (
+                JournalReconciliationAssessment,
+                TransactionJournal,
+            )
+
+            try:
+                bound_owner = getattr(provider, "__self__", None)
+                if (
+                    isinstance(bound_owner, TransactionJournal)
+                    and getattr(provider, "__name__", "") == "list_confirmed_rollback_execution_ids"
+                    and "list_confirmed_rollback_execution_ids" not in getattr(bound_owner, "__dict__", {})
+                ):
+                    raw_state = bound_owner.assess_reconciliation_state()
+                else:
+                    raw_state = provider()
+            except MemoryPersistenceError:
+                raise
+            except Exception as exc:
+                clean_msg = redact_secrets(str(exc)) or type(exc).__name__
                 raise MemoryPersistenceError(
-                    "La lectura N8 queda bloqueada hasta reconciliar los rollbacks N5 confirmados."
-                )
+                    f"Reconciliación N5/N8 bloqueada de forma cerrada ({type(exc).__name__}): {clean_msg}"
+                ) from exc
+
+            if isinstance(raw_state, JournalReconciliationAssessment):
+                outcomes = self.reconcile_n5_journal_assessment(raw_state)
+                pending = {k: v for k, v in outcomes.items() if v.startswith("pending:")}
+                if pending:
+                    raise MemoryPersistenceError(
+                        "La operación N8 queda bloqueada hasta reconciliar los rollbacks N5 confirmados."
+                    )
+                if raw_state.has_blocking_uncertainty:
+                    reasons = "; ".join(
+                        f"{e.transaction_id}({e.state}:{e.classification.value})"
+                        for e in raw_state.ambiguous_or_pending_transactions[:5]
+                    )
+                    raise MemoryPersistenceError(
+                        f"Lectura/operación N8 bloqueada (fail-closed) por transacción N5 ambigua o "
+                        f"pendiente de recuperación: {reasons}"
+                    )
+            else:
+                execution_ids = list(raw_state or ())
+                outcomes = self.reconcile_confirmed_n5_rollbacks(execution_ids)
+                pending = {key: value for key, value in outcomes.items() if value.startswith("pending:")}
+                if pending:
+                    raise MemoryPersistenceError(
+                        "La lectura N8 queda bloqueada hasta reconciliar los rollbacks N5 confirmados."
+                    )
+
         if not self.is_private_mode and self.has_pending_rollback_invalidations():
             self.flush_pending_rollback_invalidations()
 
@@ -392,10 +671,26 @@ class MemoryEngine:
         return filtered
 
     def get_revisions(self, memory_id: str) -> list[MemoryRevision]:
+        self._ensure_pending_invalidations_applied_for_read()
         return self.store.get_revisions(memory_id)
 
     def get_stats(self) -> StoreStats:
-        return self.store.get_stats()
+        self._ensure_pending_invalidations_applied_for_read()
+        stats = self.store.get_stats()
+        if not self.has_pending_rollback_invalidations():
+            return stats
+        suppressed_count = sum(
+            1
+            for rec in self.store.list_memories(status=MemoryStatus.ACTIVE, limit=self.policy.max_active_memories)
+            if self._record_suppressed_by_pending_rollback(rec)
+        )
+        if suppressed_count <= 0:
+            return stats
+        return dataclass_replace(
+            stats,
+            active_memories=max(0, stats.active_memories - suppressed_count),
+            revoked_memories=stats.revoked_memories + suppressed_count,
+        )
 
     def get_store_version_token(self) -> str:
         """Devuelve el token monótono actual (`epoch:seq`) del almacén de experiencias."""
@@ -459,6 +754,7 @@ class MemoryEngine:
     ) -> MemoryRecord:
         """Corrige un recuerdo ACTIVE preservando su versión anterior en `memory_revisions`."""
         self._assert_write_allowed()
+        self._ensure_pending_invalidations_applied_for_read()
         return self.store.update_memory_with_revision(
             memory_id,
             title=title,
@@ -481,6 +777,7 @@ class MemoryEngine:
     ) -> MemoryRecord:
         """Confirma un recuerdo pendiente o activo para habilitarlo con confianza verificada."""
         self._assert_write_allowed()
+        self._ensure_pending_invalidations_applied_for_read()
         return self.store.confirm_memory(
             memory_id,
             actor=actor,
@@ -523,17 +820,97 @@ class MemoryEngine:
         )
 
     def reconcile_confirmed_n5_rollbacks(
-        self, execution_ids: tuple[str, ...] | list[str]
+        self,
+        execution_ids: tuple[str, ...] | list[str],
+        *,
+        partial_operations: Sequence[tuple[str, Sequence[str]]] = (),
     ) -> dict[str, str]:
-        """Reconcilia estados ROLLED_BACK ya confirmados en N5, incluso durante modo privado.
+        """Reconcilia estados ROLLED_BACK confirmados (totales o por operación) en N5, incluso en privado.
 
-        Solo modifica los recuerdos `EXECUTION_VERIFIED` de cada ID confirmado. No recibe ni
-        persiste contenido conversacional, y verifica el tombstone antes de dar cada ID por listo.
-        Los errores se devuelven por ejecución para permitir que el resto avance y que el llamador
-        reintente las fallidas al siguiente ciclo de recuperación.
+        Optimizaciones seguras (Sección 12):
+        1. Si todas las ejecuciones/operaciones solicitadas ya fueron verificadas contra la firma
+           exacta en disco de `experiences.db` (+ `-wal`) y los métodos del store no están parcheados,
+           evita abrir conexiones o iniciar transacciones de escritura redundantes.
+        2. Cuando existen candidatos no verificados, consulta primero con una sola conexión de lectura
+           (`inspect_unreconciled_n5_rollbacks`) antes de ejecutar `BEGIN IMMEDIATE` únicamente sobre
+           los IDs que aún carecen de invalidación o tombstone.
         """
+        unique_execs = tuple(sorted({str(e).strip() for e in execution_ids if str(e).strip()}))
+        norm_partials = tuple(
+            (str(eid).strip(), tuple(sorted({str(op).strip() for op in ops if str(op).strip()})))
+            for eid, ops in partial_operations
+            if str(eid).strip() and ops
+        )
+        norm_partials = tuple((eid, ops) for eid, ops in norm_partials if ops)
+
+        if not unique_execs and not norm_partials:
+            return {}
+
         outcomes: dict[str, str] = {}
-        for execution_id in sorted(set(execution_ids)):
+        patched = self._store_invalidation_methods_patched()
+        disk_sig = None if patched else self._current_db_disk_signature()
+
+        with self._state_lock:
+            if disk_sig is None or disk_sig != self._verified_db_signature:
+                self._verified_reconciled_execs.clear()
+                self._verified_reconciled_ops.clear()
+                self._verified_db_signature = disk_sig
+
+            unverified_execs = [
+                eid for eid in unique_execs if patched or eid not in self._verified_reconciled_execs
+            ]
+            unverified_partials: list[tuple[str, tuple[str, ...]]] = []
+            for eid, ops in norm_partials:
+                rem_ops = tuple(
+                    op for op in ops if patched or (eid, op) not in self._verified_reconciled_ops
+                )
+                if rem_ops:
+                    unverified_partials.append((eid, rem_ops))
+
+        for eid in unique_execs:
+            if eid not in unverified_execs:
+                outcomes[eid] = "reconciled:0"
+        for eid, ops in norm_partials:
+            if all((eid, op) in self._verified_reconciled_ops for op in ops) and not patched:
+                outcomes[f"{eid}#ops"] = "reconciled:0"
+
+        if not unverified_execs and not unverified_partials:
+            return outcomes
+
+        # Pre-chequeo en una sola conexión de lectura cuando los métodos no fueron sustituidos en mocks.
+        execs_to_write: list[str] = list(unverified_execs)
+        partials_to_write: list[tuple[str, tuple[str, ...]]] = list(unverified_partials)
+        if not patched:
+            try:
+                _tok, missing_execs, missing_partials = self.store.inspect_unreconciled_n5_rollbacks(
+                    unverified_execs,
+                    unverified_partials,
+                )
+                missing_exec_set = set(missing_execs)
+                missing_partial_map = {eid: set(ops) for eid, ops in missing_partials}
+                with self._state_lock:
+                    cur_sig = self._current_db_disk_signature()
+                    self._verified_db_signature = cur_sig
+                    for eid in unverified_execs:
+                        if eid not in missing_exec_set:
+                            if cur_sig is not None:
+                                self._verified_reconciled_execs.add(eid)
+                            outcomes[eid] = "reconciled:0"
+                    for eid, ops in unverified_partials:
+                        pend = missing_partial_map.get(eid, set())
+                        for op in ops:
+                            if op not in pend and cur_sig is not None:
+                                self._verified_reconciled_ops.add((eid, op))
+                        if not pend:
+                            outcomes[f"{eid}#ops"] = "reconciled:0"
+                execs_to_write = list(missing_execs)
+                partials_to_write = list(missing_partials)
+            except Exception:
+                # Ante fallo del pre-chequeo pasamos a la ruta por unidad para registrar pending exacto.
+                execs_to_write = list(unverified_execs)
+                partials_to_write = list(unverified_partials)
+
+        for execution_id in execs_to_write:
             try:
                 invalidation = self.store.invalidate_by_execution(
                     execution_id,
@@ -553,9 +930,59 @@ class MemoryEngine:
                         "La invalidación de rollback no quedó verificada en la persistencia N8."
                     )
                 outcomes[execution_id] = f"reconciled:{invalidation.invalidated_count}"
+                if not patched:
+                    with self._state_lock:
+                        cur_sig = self._current_db_disk_signature()
+                        self._verified_db_signature = cur_sig
+                        if cur_sig is not None:
+                            self._verified_reconciled_execs.add(execution_id)
             except Exception as exc:
-                outcomes[execution_id] = f"pending:{type(exc).__name__}"
+                msg = redact_secrets(str(exc)) or type(exc).__name__
+                outcomes[execution_id] = f"pending:{type(exc).__name__}:{msg}"
+
+        for execution_id, op_ids in partials_to_write:
+            key = f"{execution_id}#ops"
+            try:
+                invalidation = self.store.invalidate_by_execution_operations(
+                    execution_id,
+                    op_ids,
+                    reason="n5_partial_rollback_operation_reconciliation",
+                    actor="n5_journal_recovery",
+                    private_mode=False,
+                )
+                for op_id in op_ids:
+                    if not self.store.is_execution_operation_invalidated(execution_id, op_id):
+                        raise MemoryPersistenceError(
+                            f"La invalidación parcial de '{execution_id}/{op_id}' no quedó verificada."
+                        )
+                outcomes[key] = f"reconciled:{invalidation.invalidated_count}"
+                if not patched:
+                    with self._state_lock:
+                        cur_sig = self._current_db_disk_signature()
+                        self._verified_db_signature = cur_sig
+                        if cur_sig is not None:
+                            for op_id in op_ids:
+                                self._verified_reconciled_ops.add((execution_id, op_id))
+            except Exception as exc:
+                msg = redact_secrets(str(exc)) or type(exc).__name__
+                outcomes[key] = f"pending:{type(exc).__name__}:{msg}"
+
         return outcomes
+
+    def reconcile_n5_journal_assessment(self, assessment: Any) -> dict[str, str]:
+        """Aplica la evaluación completa de un `JournalReconciliationAssessment` sobre N8."""
+        confirmed_ids = tuple(getattr(assessment, "confirmed_rollback_execution_ids", ()) or ())
+        partial_ops = tuple(getattr(assessment, "partial_rollback_operations", ()) or ())
+        return self.reconcile_confirmed_n5_rollbacks(
+            confirmed_ids,
+            partial_operations=partial_ops,
+        )
+
+    def is_execution_operation_invalidated(self, execution_id: str, operation_id: str) -> bool:
+        """Indica si `(execution_id, operation_id)` fue revertida en cola RAM o en SQLite."""
+        if self.is_execution_pending_invalidation(execution_id):
+            return True
+        return self.store.is_execution_operation_invalidated(execution_id, operation_id)
 
     def is_execution_invalidated(self, execution_id: str) -> bool:
         """Consulta si una ejecución fue revertida (en cola RAM pendiente o en SQLite)."""
@@ -607,13 +1034,14 @@ class MemoryEngine:
     # ------------------------------------------------------------------
 
     def create_backup(self, *, retention: int | None = None, actor: str = "user") -> BackupInfo:
-        """Crea un backup SQLite validado con SHA-256 sin tocar ni escribir en modo privado."""
+        """Crea un backup SQLite validado con SHA-256 tras reconciliar rollbacks N5 pendientes."""
         self._assert_write_allowed()
-        return self.store.create_backup(
-            self.backup_dir,
-            retention=retention,
-            actor=actor,
-        )
+        with self.reconciliation_scope():
+            return self.store.create_backup(
+                self.backup_dir,
+                retention=retention,
+                actor=actor,
+            )
 
     def list_backups(self) -> list[BackupInfo]:
         return self.store.list_backups(self.backup_dir)
@@ -814,7 +1242,11 @@ class MemoryEngine:
             )
 
         prefs_dict: dict[str, Any] = raw_data["preferences"]
-        active_memories = self.store.list_memories(status=MemoryStatus.ACTIVE, limit=1000)
+        active_memories = [
+            m
+            for m in self.store.list_memories(status=MemoryStatus.ACTIVE, limit=1000)
+            if not self._record_suppressed_by_pending_rollback(m)
+        ]
         by_fingerprint = {m.content_fingerprint: m for m in active_memories}
         by_pref_key: dict[str, MemoryRecord] = {}
         for mem in active_memories:
@@ -911,14 +1343,15 @@ class MemoryEngine:
     ) -> PreferenceImportPreview:
         """
         Inspecciona en solo lectura el JSON legacy y devuelve la vista previa clasificada
-        sin modificar ni el JSON de origen ni la base `experiences.db`.
+        sin modificar ni el JSON de origen ni la base `experiences.db`, previa reconciliación N5.
         """
         self.policy.assert_enabled()
         raw_src = self._default_import_source_path() if source_path is None else source_path
         validated_src = validate_safe_read_json_path(raw_src)
-        with self.store.acquire_lock():
-            preview, _ = self._classify_import_preview_locked(validated_src)
-            return preview
+        with self.reconciliation_scope():
+            with self.store.acquire_lock():
+                preview, _ = self._classify_import_preview_locked(validated_src)
+                return preview
 
     def commit_preferences_import(
         self,
@@ -929,9 +1362,9 @@ class MemoryEngine:
         actor: str = "user",
     ) -> PreferenceImportResult:
         """
-        Ejecuta la importación manual confirmada dentro de `ExperienceStoreLock`.
-        Nunca modifica el JSON origen; ante `resolve_conflicts='supersede'` sustituye el
-        recuerdo conflictivo previo marcándolo `SUPERSEDED`.
+        Ejecuta la importación manual confirmada dentro de `ExperienceStoreLock` previa
+        reconciliación N5/N8. Nunca modifica el JSON origen; ante `resolve_conflicts='supersede'`
+        sustituye el recuerdo conflictivo previo marcándolo `SUPERSEDED`.
         """
         self._assert_write_allowed()
         if not confirmed:
@@ -944,45 +1377,46 @@ class MemoryEngine:
         raw_src = self._default_import_source_path() if source_path is None else source_path
         validated_src = validate_safe_read_json_path(raw_src)
 
-        with self.store.acquire_lock():
-            preview, payloads = self._classify_import_preview_locked(validated_src)
-            if not preview.valid:
-                raise MemoryValidationError(preview.error or "No se pudo validar el archivo JSON de origen.")
+        with self.reconciliation_scope():
+            with self.store.acquire_lock():
+                preview, payloads = self._classify_import_preview_locked(validated_src)
+                if not preview.valid:
+                    raise MemoryValidationError(preview.error or "No se pudo validar el archivo JSON de origen.")
 
-            created_ids: list[str] = []
-            conflicts_resolved = 0
-            conflicts_skipped = 0
-            extra_duplicates = 0
+                created_ids: list[str] = []
+                conflicts_resolved = 0
+                conflicts_skipped = 0
+                extra_duplicates = 0
 
-            for candidate, conflicting_id in payloads:
-                if conflicting_id is not None and resolve_conflicts == "skip":
-                    conflicts_skipped += 1
-                    continue
+                for candidate, conflicting_id in payloads:
+                    if conflicting_id is not None and resolve_conflicts == "skip":
+                        conflicts_skipped += 1
+                        continue
 
-                write_res = self.store.create_memory(
-                    candidate,
-                    private_mode=self.is_private_mode,
-                    actor=actor,
+                    write_res = self.store.create_memory(
+                        candidate,
+                        private_mode=self.is_private_mode,
+                        actor=actor,
+                    )
+                    if write_res.created:
+                        created_ids.append(write_res.record.memory_id)
+                        if conflicting_id is not None and resolve_conflicts == "supersede":
+                            self.store.transition_status(
+                                conflicting_id,
+                                new_status=MemoryStatus.SUPERSEDED,
+                                superseded_by=write_res.record.memory_id,
+                                reason="superseded_by_preference_import",
+                                actor=actor,
+                            )
+                            conflicts_resolved += 1
+                    else:
+                        extra_duplicates += 1
+
+                return PreferenceImportResult(
+                    imported_count=len(created_ids),
+                    skipped_duplicates=len(preview.duplicates) + extra_duplicates,
+                    conflicts_resolved=conflicts_resolved,
+                    conflicts_skipped=conflicts_skipped,
+                    rejected_count=len(preview.rejected),
+                    created_memory_ids=tuple(created_ids),
                 )
-                if write_res.created:
-                    created_ids.append(write_res.record.memory_id)
-                    if conflicting_id is not None and resolve_conflicts == "supersede":
-                        self.store.transition_status(
-                            conflicting_id,
-                            new_status=MemoryStatus.SUPERSEDED,
-                            superseded_by=write_res.record.memory_id,
-                            reason="superseded_by_preference_import",
-                            actor=actor,
-                        )
-                        conflicts_resolved += 1
-                else:
-                    extra_duplicates += 1
-
-            return PreferenceImportResult(
-                imported_count=len(created_ids),
-                skipped_duplicates=len(preview.duplicates) + extra_duplicates,
-                conflicts_resolved=conflicts_resolved,
-                conflicts_skipped=conflicts_skipped,
-                rejected_count=len(preview.rejected),
-                created_memory_ids=tuple(created_ids),
-            )

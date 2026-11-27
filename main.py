@@ -133,8 +133,11 @@ def _resolve_existing_n8_db_path() -> Optional[Any]:
     return candidate if candidate.exists() and candidate.is_file() else None
 
 
-def _n5_rollback_execution_provider() -> Callable[[], list[str]]:
-    """Construye un lector del journal durable sin iniciar recuperación ni tocar N5."""
+def _n5_rollback_execution_provider() -> Callable[[], Any]:
+    """
+    Construye un lector fail-closed del journal N5 sin iniciar recuperación ni usar `Path.exists()`
+    (remediación H-01/H-02).
+    """
     from config import settings
 
     env_name = os.environ.get("JARVIS_ENV", "").strip().lower()
@@ -144,16 +147,41 @@ def _n5_rollback_execution_provider() -> Callable[[], list[str]]:
     else:
         journal_dir = Path(settings.TRANSACTION_JOURNAL_DIR).resolve()
 
-    def read_confirmed_rollbacks() -> list[str]:
-        if journal_dir is None or not journal_dir.exists():
-            return []
-        from src.brain.transaction_manager import TransactionJournal
+    def read_journal_assessment() -> Any:
+        if journal_dir is None:
+            return ()
+        from src.brain.transaction_manager import (
+            TransactionJournal,
+            inspect_journal_directory_status,
+        )
 
+        status = inspect_journal_directory_status(journal_dir)
+        if status == "absent":
+            return ()
         return TransactionJournal(
             journal_dir, create_dirs=False
-        ).list_confirmed_rollback_execution_ids()
+        ).assess_reconciliation_state()
 
-    return read_confirmed_rollbacks
+    return read_journal_assessment
+
+
+def _ensure_engine_n5_and_privacy_wired(
+    engine: Any,
+    brain_manager: BrainManager,
+) -> Any:
+    """Garantiza que cualquier `MemoryEngine` existente tenga proveedor N5 y privacidad vigente."""
+    conv_mem = getattr(brain_manager, "memory", None)
+    if conv_mem is not None and hasattr(engine, "set_private_mode"):
+        priv_now = bool(getattr(conv_mem, "is_private_mode", False) is True)
+        if priv_now:
+            allow_hist_now = getattr(conv_mem, "private_allow_history", True) is not False
+            engine.set_private_mode(enabled=True, allow_history=allow_hist_now)
+    if (
+        hasattr(engine, "set_n5_rollback_execution_provider")
+        and not getattr(engine, "has_n5_rollback_provider", True)
+    ):
+        engine.set_n5_rollback_execution_provider(_n5_rollback_execution_provider())
+    return engine
 
 
 def attach_existing_memory_engine(
@@ -163,16 +191,17 @@ def attach_existing_memory_engine(
 ) -> Optional[Any]:
     """
     Conecta perezosamente una única instancia de `MemoryEngine` a `brain_manager` cuando
-    `settings.N8_ENABLED` está activo y `experiences.db` ya existe en disco (remediación F-09).
+    `settings.N8_ENABLED` está activo y `experiences.db` ya existe en disco (remediación F-09/H-02).
 
     Garantías:
     - Reutiliza cualquier instancia ya existente en `memory_engine` o `brain_manager.memory_engine`.
     - Nunca crea `experiences.db` ni directorios de memoria solo por arrancar J.A.R.V.I.S.
-    - Aplica el estado de privacidad actual de `brain_manager.memory` antes de exponer el motor.
+    - Aplica el estado de privacidad actual de `brain_manager.memory` y verifica proveedor N5.
     - No importa ningún módulo de audio, STT, TTS ni GPU.
     """
     existing = memory_engine or getattr(brain_manager, "memory_engine", None)
     if existing is not None:
+        _ensure_engine_n5_and_privacy_wired(existing, brain_manager)
         if getattr(brain_manager, "memory_engine", None) is None:
             brain_manager.memory_engine = existing
         return existing
@@ -207,7 +236,6 @@ def attach_existing_memory_engine(
         ),
     )
     engine.set_private_mode(enabled=priv_now, allow_history=allow_hist_now)
-    engine.set_n5_rollback_execution_provider(_n5_rollback_execution_provider())
     brain_manager.memory_engine = engine
     return engine
 
@@ -271,6 +299,7 @@ def run_console_session(
         if memory_engine_instance is None:
             existing_attached = getattr(brain_manager, "memory_engine", None)
             if existing_attached is not None:
+                _ensure_engine_n5_and_privacy_wired(existing_attached, brain_manager)
                 memory_engine_instance = existing_attached
             else:
                 from src.memory.engine import MemoryEngine
@@ -295,9 +324,6 @@ def run_console_session(
                     ),
                 )
                 memory_engine_instance.set_private_mode(enabled=priv_now, allow_history=allow_hist_now)
-                memory_engine_instance.set_n5_rollback_execution_provider(
-                    _n5_rollback_execution_provider()
-                )
                 brain_manager.memory_engine = memory_engine_instance
         elif getattr(brain_manager, "memory_engine", None) is None:
             brain_manager.memory_engine = memory_engine_instance
@@ -339,19 +365,33 @@ def run_console_session(
             return memory_capture_instance
         from config import settings
 
-        # La captura requiere un motor real, pero habilitar captura automática no significa
-        # que un comando de planificación deba crear la base de datos antes de ejecutar.
+        # Remediación H-07: durante el modo privado, la captura automática está bloqueada por
+        # política. Si aún no existe `experiences.db` ni una instancia viva de `MemoryEngine`,
+        # no debemos crear la base SQLite en disco solo por ejecutar `/plan ejecutar` en privado.
+        # En cambio, si `experiences.db` YA existe, la adjuntamos sin crear archivos nuevos para
+        # que las invalidaciones obligatorias de seguridad N5/N8 sigan funcionando.
+        existing_db_path = _resolve_existing_n8_db_path()
+        if _is_private_mode_active() and memory_engine_instance is None and existing_db_path is None:
+            return None
+
         should_attach = bool(
             memory_engine_instance is not None
-            or (settings.N8_ENABLED and settings.EXPERIENCES_DB_PATH.exists())
+            or existing_db_path is not None
             or (settings.N8_ENABLED and settings.N8_AUTO_CAPTURE_ENABLED)
         )
         if not should_attach:
             return None
         from src.memory.capture import ExperienceCaptureService
 
+        target_engine = (
+            _resolve_existing_memory_engine()
+            if (_is_private_mode_active() and memory_engine_instance is None)
+            else _ensure_memory_engine()
+        )
+        if target_engine is None:
+            return None
         memory_capture_instance = ExperienceCaptureService(
-            memory_engine=_ensure_memory_engine(),
+            memory_engine=target_engine,
         )
         return memory_capture_instance
 

@@ -14,7 +14,7 @@ from enum import Enum
 import hashlib
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 import uuid
 
 from config import settings
@@ -1101,7 +1101,51 @@ class GoalPlan:
         self.updated_at = utc_now_iso()
         return entry
 
+    def infer_n8_exposure(self) -> bool:
+        """
+        Determina de forma durable si el plan estuvo expuesto a memoria N8 evaluando tanto el
+        flag explícito como los metadatos técnicos verificables de objetivo, tareas e historial
+        (remediación H-04). No depende de que los recuerdos sigan activos ni de `MemoryEngine`.
+        """
+        if self.n8_context_exposed or getattr(self.goal, "_n8_exposed_during_planning", False):
+            return True
+        extra = self.goal.context.extra if isinstance(self.goal.context.extra, Mapping) else {}
+        if (
+            extra.get("n8_query_id")
+            or extra.get("n8_trust_boundary") == "untrusted_long_term_memory"
+            or "n8_memory_refs" in extra
+            or extra.get("n8_last_revalidated_at")
+        ):
+            return True
+        for t in self.tasks:
+            meta = t.metadata if isinstance(t.metadata, Mapping) else {}
+            ev = t.execution_evidence if isinstance(t.execution_evidence, Mapping) else {}
+            env = t.untrusted_envelope if isinstance(t.untrusted_envelope, Mapping) else {}
+            if (
+                getattr(t, "n8_influenced", False)
+                or getattr(t, "n8_exposed_at_exec", False)
+                or getattr(t, "provenance_origin", "") == "llm_with_n8"
+                or meta.get("n8_influenced")
+                or meta.get("provenance_origin") == "llm_with_n8"
+                or meta.get("n8_query_id")
+                or ev.get("n8_exposed_at_exec")
+                or ev.get("n8_tainted")
+                or env.get("n8_tainted")
+                or env.get("trust_level") == "untrusted_long_term_memory"
+                or env.get("provenance") == "n8_memory"
+            ):
+                return True
+        for dec in self.replan_history:
+            if "n8" in str(getattr(dec, "strategy", "") or "").lower():
+                return True
+        for h in self.history:
+            det = h.details if isinstance(h.details, Mapping) else {}
+            if det.get("n8_query_id") or "n8" in str(h.event_type or "").lower():
+                return True
+        return False
+
     def to_dict(self) -> dict[str, Any]:
+        eff_n8_exposed = bool(self.n8_context_exposed or self.infer_n8_exposure())
         return {
             "plan_id": self.plan_id,
             "goal": self.goal.to_dict(),
@@ -1113,6 +1157,7 @@ class GoalPlan:
             "approval_bound_hash": self.approval_bound_hash,
             "history": [entry.to_dict() for entry in self.history],
             "replan_history": [decision.to_dict() for decision in self.replan_history],
+            "n8_context_exposed": eff_n8_exposed,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -1133,6 +1178,11 @@ class GoalPlan:
             created_at=str(data.get("created_at") or utc_now_iso()),
             updated_at=str(data.get("updated_at") or utc_now_iso()),
         )
+        raw_flag = bool(data.get("n8_context_exposed", False))
+        inferred_flag = plan.infer_n8_exposure()
+        if raw_flag or inferred_flag:
+            plan.n8_context_exposed = True
+            plan.goal._n8_exposed_during_planning = True
         if not plan.verify_integrity():
             raise GoalPersistenceError(
                 f"Integridad comprometida en GoalPlan '{plan.plan_id}': el hash estructural no coincide."

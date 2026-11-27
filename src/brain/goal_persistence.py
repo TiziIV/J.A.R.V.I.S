@@ -157,11 +157,12 @@ def sanitize_wal_payload(
     if not isinstance(payload, Mapping):
         return {}
     if n8_context_exposed:
-        # Una excepción puede incorporar texto arbitrario de una subtarea influida por N8.
-        # Conservamos códigos, estados e IDs útiles y omitimos los campos narrativos completos.
+        # Una excepción o motivo narrativo puede incorporar texto de una subtarea influida por N8.
+        # Conservamos códigos, estados e IDs técnicos permitidos y omitimos los campos narrativos.
         safe_keys = {
             "task_id", "plan_id", "goal_id", "execution_id", "retry", "status",
             "from_status", "to_status", "error_code", "error_category", "attempt",
+            "n8_query_id", "n8_ref_count",
         }
         return {
             str(key): _redact_nested_data(value) if str(key) in safe_keys else "[DETALLE N8 OMITIDO]"
@@ -207,15 +208,21 @@ def extract_persistable_plan_dict(
             "Violación de aislamiento privado: no se permite transferir ni persistir un plan privado en GoalStore."
         )
 
-    n8_exposed = bool(getattr(plan, "n8_context_exposed", False))
+    inferred_exposed = (
+        plan.infer_n8_exposure() if hasattr(plan, "infer_n8_exposure") else False
+    )
+    n8_exposed = bool(getattr(plan, "n8_context_exposed", False) or inferred_exposed)
+    if n8_exposed:
+        plan.n8_context_exposed = True
     cloned = _sanitize_runtime_strings(plan.to_dict(), n8_context_exposed=n8_exposed)
+    cloned["n8_context_exposed"] = n8_exposed
     anchors = collect_grounded_anchors(plan.goal)
 
     # 1. Frontera estructural de Goal
     goal_dict = cloned.get("goal")
     n8_goal_exposed = bool(
         getattr(plan.goal, "_n8_exposed_during_planning", False)
-        or getattr(plan, "n8_context_exposed", False)
+        or n8_exposed
     )
     if isinstance(goal_dict, dict):
         ctx_dict = goal_dict.get("context")
@@ -235,8 +242,16 @@ def extract_persistable_plan_dict(
             if isinstance(ctx_dict, dict):
                 ctx_dict["target_app"] = baseline.get("target_app")
 
-        if n8_goal_exposed and isinstance(goal_dict.get("error_summary"), str):
+        if n8_goal_exposed and isinstance(goal_dict.get("error_summary"), str) and goal_dict["error_summary"].strip():
             goal_dict["error_summary"] = "Ejecución con incidencias (detalle contextual N8 mantenido solo en RAM)."
+        if (
+            n8_goal_exposed
+            and isinstance(goal_dict.get("cancellation_reason"), str)
+            and goal_dict["cancellation_reason"].strip()
+        ):
+            goal_dict["cancellation_reason"] = (
+                "Objetivo cancelado bajo contexto consultivo N8 (detalle mantenido solo en RAM)."
+            )
 
     # 2. Frontera estructural de GoalTask (`persistable_skeleton`)
     task_objs = {t.task_id: t for t in plan.tasks}
@@ -342,16 +357,51 @@ def extract_persistable_plan_dict(
                 )
             )
             or (
+                isinstance(task_dict.get("untrusted_envelope"), dict)
+                and (
+                    task_dict["untrusted_envelope"].get("n8_tainted")
+                    or task_dict["untrusted_envelope"].get("trust_level") == "untrusted_long_term_memory"
+                    or task_dict["untrusted_envelope"].get("provenance") in {"n8_memory", "n8_and_n7_mixed"}
+                    or bool(task_dict["untrusted_envelope"].get("historical_references"))
+                )
+            )
+            or (
                 task_dict.get("skill_name") is None
-                and getattr(plan, "n8_context_exposed", False)
+                and n8_exposed
             )
         )
 
-        # Limpieza incondicional de untrusted_envelope si contiene datos de memoria N8.
+        # Limpieza incondicional de untrusted_envelope si contiene o propaga datos de memoria N8 (H-05).
         env_raw = task_dict.get("untrusted_envelope")
         if isinstance(env_raw, dict):
-            if env_raw.get("trust_level") == "untrusted_long_term_memory" or env_raw.get("provenance") == "n8_memory":
-                task_dict["untrusted_envelope"] = None
+            if (
+                env_raw.get("trust_level") == "untrusted_long_term_memory"
+                or env_raw.get("provenance") in {"n8_memory", "n8_and_n7_mixed"}
+                or env_raw.get("n8_tainted")
+                or bool(env_raw.get("historical_references"))
+            ):
+                # Si existe telemetría N7 pura separada, conservamos solo los datos estructurales N7
+                # excluyendo cualquier observación narrativa o referencia histórica N8.
+                pure_hw = env_raw.get("hardware")
+                if isinstance(pure_hw, dict) and pure_hw:
+                    task_dict["untrusted_envelope"] = {
+                        "provenance": "n7_context_awareness",
+                        "trust_level": "untrusted_system_context",
+                        "allow_system_prompt_promotion": False,
+                        "allow_tool_execution_from_content": False,
+                        "allow_permission_grant": False,
+                        "hardware": _redact_nested_data(pure_hw),
+                    }
+                else:
+                    task_dict["untrusted_envelope"] = None
+            elif exec_tainted or n8_goal_exposed:
+                cleaned_env = _redact_nested_data(env_raw)
+                if isinstance(cleaned_env, dict):
+                    cleaned_env.pop("observations", None)
+                    cleaned_env.pop("historical_references", None)
+                    task_dict["untrusted_envelope"] = cleaned_env if cleaned_env else None
+                else:
+                    task_dict["untrusted_envelope"] = None
             else:
                 task_dict["untrusted_envelope"] = _redact_nested_data(env_raw)
 
@@ -501,9 +551,17 @@ def _sanitize_runtime_strings(
     goal_dict = cloned.get("goal")
     if isinstance(goal_dict, dict):
         if isinstance(goal_dict.get("error_summary"), str):
-            goal_dict["error_summary"] = redact_secrets(goal_dict["error_summary"])
+            goal_dict["error_summary"] = (
+                "Ejecución con incidencias (detalle contextual N8 mantenido solo en RAM)."
+                if n8_context_exposed and goal_dict["error_summary"].strip()
+                else redact_secrets(goal_dict["error_summary"])
+            )
         if isinstance(goal_dict.get("cancellation_reason"), str):
-            goal_dict["cancellation_reason"] = redact_secrets(goal_dict["cancellation_reason"])
+            goal_dict["cancellation_reason"] = (
+                "Objetivo cancelado bajo contexto consultivo N8 (detalle mantenido solo en RAM)."
+                if n8_context_exposed and goal_dict["cancellation_reason"].strip()
+                else redact_secrets(goal_dict["cancellation_reason"])
+            )
         if isinstance(goal_dict.get("context"), dict):
             goal_dict["context"] = _redact_nested_data(goal_dict["context"])
         if isinstance(goal_dict.get("missing_info"), list):
@@ -610,13 +668,28 @@ class GoalStore:
                 _atomic_write_json(self.index_path, index_data)
             return snapshot_path
 
+    def _is_plan_persisted_n8_exposed(self, plan_id: str) -> bool:
+        snap = self._plan_snapshot_path(plan_id)
+        if not snap.exists():
+            return False
+        try:
+            raw = json.loads(snap.read_text(encoding="utf-8"))
+            return isinstance(raw, dict) and bool(raw.get("n8_context_exposed"))
+        except Exception:
+            return False
+
     def append_wal_event(
         self, plan_id: str, event_type: str, payload: dict[str, Any], *, n8_context_exposed: bool = False
     ) -> None:
         """Agrega un evento incremental redactado al WAL JSONL del plan."""
         with self._lock:
             wal_path = self._plan_wal_path(plan_id)
-            clean_payload = sanitize_wal_payload(payload, n8_context_exposed=n8_context_exposed)
+            eff_exposed = bool(
+                n8_context_exposed
+                or (isinstance(payload, Mapping) and bool(payload.get("n8_query_id")))
+                or self._is_plan_persisted_n8_exposed(plan_id)
+            )
+            clean_payload = sanitize_wal_payload(payload, n8_context_exposed=eff_exposed)
             record = {
                 "timestamp": utc_now_iso(),
                 "plan_id": _sanitize_identifier(plan_id, "plan_id"),
@@ -759,10 +832,16 @@ class EphemeralGoalStore:
     def append_wal_event(
         self, plan_id: str, event_type: str, payload: dict[str, Any], *, n8_context_exposed: bool = False
     ) -> None:
-        """Registra evento WAL exclusivamente en RAM con redacción y limpieza N8."""
+        """Registra evento WAL exclusivamente en RAM con redacción y limpieza N8 (H-06)."""
         with self._lock:
             safe_id = _sanitize_identifier(plan_id, "plan_id")
-            clean_payload = sanitize_wal_payload(payload)
+            stored_plan = self._plans.get(safe_id)
+            eff_exposed = bool(
+                n8_context_exposed
+                or (isinstance(payload, Mapping) and bool(payload.get("n8_query_id")))
+                or (isinstance(stored_plan, Mapping) and bool(stored_plan.get("n8_context_exposed")))
+            )
+            clean_payload = sanitize_wal_payload(payload, n8_context_exposed=eff_exposed)
             record = {
                 "timestamp": utc_now_iso(),
                 "plan_id": safe_id,

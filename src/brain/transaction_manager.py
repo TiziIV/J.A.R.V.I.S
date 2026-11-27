@@ -33,6 +33,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import threading
 import time
@@ -790,10 +791,122 @@ class RecoveryReport:
     idempotent_repeat: bool = False
     attempt_number: int = 0
     timestamp: str = field(default_factory=_utc_now_iso)
+    n8_reconciled: bool = True
+    n8_reconciliation_error: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convierte el reporte a diccionario serializable."""
         return asdict(self)
+
+
+class JournalTransactionClassification(str, Enum):
+    """
+    Clasificación explícita del estado de cada transacción N5 para la reconciliación
+    fail-closed de memoria a largo plazo N8 (remediación H-01).
+
+    Distingue sin ambigüedad:
+    1. COMMITTED_CLEAN: comprometida o parcial hacia adelante sin rastro de reversión.
+    2. ROLLBACK_CONFIRMED: reversión completa confirmada (`ROLLED_BACK`).
+    3. ROLLBACK_STARTED: reversión iniciada pero inconclusa (`ROLLING_BACK`).
+    4. ROLLBACK_PARTIAL: reversión parcial (solo algunas operaciones `ROLLED_BACK`).
+    5. RECOVERY_PENDING: recuperación N5 pendiente o interrumpida (`RECOVERY_REQUIRED`, `RECOVERING`, etc.).
+    6. RECOVERY_FAILED: recuperación o rollback fallido (`RECOVERY_FAILED` o `ROLLBACK_FAILED`).
+    7. CORRUPT_OR_UNREADABLE: archivo/directorio del journal corrupto o inaccesible.
+    8. INSUFFICIENT_EVIDENCE: registro sin `execution_id`, sin operaciones o con evidencia contradictoria.
+    """
+
+    COMMITTED_CLEAN = "COMMITTED_CLEAN"
+    ROLLBACK_CONFIRMED = "ROLLBACK_CONFIRMED"
+    ROLLBACK_STARTED = "ROLLBACK_STARTED"
+    ROLLBACK_PARTIAL = "ROLLBACK_PARTIAL"
+    RECOVERY_PENDING = "RECOVERY_PENDING"
+    RECOVERY_FAILED = "RECOVERY_FAILED"
+    CORRUPT_OR_UNREADABLE = "CORRUPT_OR_UNREADABLE"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+@dataclass(frozen=True)
+class TransactionReconciliationEntry:
+    """Resumen inmutable y verificable de una transacción del journal para reconciliación N8."""
+
+    transaction_id: str
+    execution_id: str
+    state: str
+    classification: JournalTransactionClassification
+    rolled_back_operation_ids: tuple[str, ...] = ()
+    applied_operation_ids: tuple[str, ...] = ()
+    rollback_failed_operation_ids: tuple[str, ...] = ()
+    blocking_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class JournalReconciliationAssessment:
+    """
+    Evaluación agregada y fail-closed de un directorio de transacciones N5 para N8.
+
+    - `confirmed_rollback_execution_ids`: ejecuciones completas con `ROLLED_BACK` confirmado.
+    - `partial_rollback_operations`: pares `(execution_id, (op_id, ...))` cuyas operaciones
+      individuales tienen reversión física confirmada aunque la transacción completa no esté
+      en `ROLLED_BACK` (granularidad de operación sin invalidar operaciones no revertidas).
+    - `ambiguous_or_pending_transactions`: transacciones inconclusas, parciales, fallidas en
+      recuperación o sin evidencia suficiente que obligan a N8 a bloquear lecturas (fail-closed).
+    """
+
+    journal_dir: str
+    directory_status: str
+    confirmed_rollback_execution_ids: tuple[str, ...] = ()
+    partial_rollback_operations: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    ambiguous_or_pending_transactions: tuple[TransactionReconciliationEntry, ...] = ()
+    committed_clean_execution_ids: tuple[str, ...] = ()
+    entries: tuple[TransactionReconciliationEntry, ...] = ()
+
+    @property
+    def has_blocking_uncertainty(self) -> bool:
+        return bool(self.ambiguous_or_pending_transactions)
+
+
+def inspect_journal_directory_status(journal_dir: Path | str) -> str:
+    """
+    Inspecciona el directorio del journal mediante `os.stat()` explícito (remediación H-02).
+
+    Nunca utiliza `Path.exists()` porque en Python `exists()` oculta `PermissionError` como `False`.
+    - Instalación nueva sin directorio (`FileNotFoundError`) -> `"absent"`.
+    - Permisos denegados u otro `OSError` -> lanza `JournalCorruptionError` (fail-closed).
+    - Ruta existente que no es directorio -> lanza `JournalCorruptionError` (fail-closed).
+    - Directorio legible -> `"accessible"`.
+    """
+    target = Path(journal_dir)
+    try:
+        st = os.stat(str(target))
+    except FileNotFoundError:
+        return "absent"
+    except PermissionError as exc:
+        raise JournalCorruptionError(
+            f"Directorio de journal N5 inaccesible por permisos ('{target}'): {exc}",
+            code="JOURNAL_DIR_INACCESSIBLE",
+        ) from exc
+    except OSError as exc:
+        raise JournalCorruptionError(
+            f"Error de E/S al inspeccionar directorio de journal N5 ('{target}'): {exc}",
+            code="JOURNAL_DIR_IO_ERROR",
+        ) from exc
+
+    if not stat.S_ISDIR(st.st_mode):
+        raise JournalCorruptionError(
+            f"La ruta del journal N5 existe pero no es un directorio válido: '{target}'.",
+            code="JOURNAL_NOT_DIRECTORY",
+        )
+    return "accessible"
+
+
+# Caché acotada en proceso para evitar re-parsear JSON y reconstruir cadenas canónicas sobre
+# pares (.tx.json, .wal.jsonl) cuyos bytes crudos en disco verificados por SHA-256 no cambiaron.
+# IMPORTANTE: En cada evaluación se listan todos los archivos del directorio y se leen y hashean
+# los bytes actuales de disco, por lo que cualquier archivo nuevo, borrado, truncado, corrupto
+# (1 bit) o con PermissionError se detecta de inmediato sin riesgo de omitir rollbacks recientes.
+_RECONCILIATION_CACHE_LOCK = threading.Lock()
+_RECONCILIATION_ENTRY_CACHE: dict[tuple[str, str, str], TransactionReconciliationEntry] = {}
+_RECONCILIATION_CACHE_MAX_ENTRIES = 2048
 
 
 # ==============================================================================
@@ -1167,31 +1280,398 @@ class TransactionJournal:
         return record, wal_events
 
     def list_transaction_ids(self) -> list[str]:
-        """Lista todos los `transaction_id` presentes en `self.journal_dir` (por `.tx.json` o `.wal.jsonl`)."""
-        tx_ids: set[str] = set()
-        if not self.journal_dir.exists():
+        """
+        Lista todos los `transaction_id` presentes en `self.journal_dir` (por `.tx.json` o `.wal.jsonl`).
+
+        Distingue explícitamente directorio ausente (`FileNotFoundError` -> `[]`) de directorio
+        inaccesible o corrupto (`PermissionError` / `OSError` -> `JournalCorruptionError`).
+        """
+        status = inspect_journal_directory_status(self.journal_dir)
+        if status == "absent":
             return []
-        for entry in sorted(self.journal_dir.iterdir(), key=lambda p: p.name):
-            if entry.is_file():
-                if entry.name.endswith(".tx.json"):
-                    tx_ids.add(entry.name[: -len(".tx.json")])
-                elif entry.name.endswith(".wal.jsonl"):
-                    tx_ids.add(entry.name[: -len(".wal.jsonl")])
+
+        tx_ids: set[str] = set()
+        try:
+            with os.scandir(str(self.journal_dir)) as it:
+                entries = sorted(list(it), key=lambda d: d.name)
+                for entry in entries:
+                    if entry.is_file(follow_symlinks=False):
+                        if entry.name.endswith(".tx.json"):
+                            tx_ids.add(entry.name[: -len(".tx.json")])
+                        elif entry.name.endswith(".wal.jsonl"):
+                            tx_ids.add(entry.name[: -len(".wal.jsonl")])
+        except PermissionError as exc:
+            raise JournalCorruptionError(
+                f"Permiso denegado al enumerar journal N5 '{self.journal_dir}': {exc}",
+                code="JOURNAL_DIR_INACCESSIBLE",
+            ) from exc
+        except OSError as exc:
+            raise JournalCorruptionError(
+                f"Error de E/S al enumerar journal N5 '{self.journal_dir}': {exc}",
+                code="JOURNAL_DIR_IO_ERROR",
+            ) from exc
         return sorted(tx_ids)
 
+    @staticmethod
+    def classify_record_for_n8_reconciliation(
+        record: TransactionRecord,
+    ) -> TransactionReconciliationEntry:
+        """
+        Clasifica un `TransactionRecord` validado según su estado transaccional y la evidencia
+        física de cada operación individual para reconciliación fail-closed con N8 (H-01).
+        """
+        tx_id = (record.transaction_id or "").strip() or "unknown_tx"
+        exec_id = (record.execution_id or "").strip()
+        state_val = (record.state or "").strip()
+
+        if not exec_id or not record.operations:
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=JournalTransactionClassification.INSUFFICIENT_EVIDENCE,
+                blocking_reason=(
+                    f"Transacción '{tx_id}' carece de execution_id u operaciones verificables."
+                ),
+            )
+
+        rolled_back_ops: list[str] = []
+        rollback_failed_ops: list[str] = []
+        applied_ops: list[str] = []
+        in_flight_disk_ops: list[str] = []
+
+        for op_id, op in sorted(record.operations.items()):
+            op_status = (op.status or "").strip().upper()
+            op_stage = (op.op_stage or "").strip().upper()
+            if (
+                op_status == OperationJournalStage.ROLLED_BACK.value
+                or op_stage == OperationJournalStage.ROLLED_BACK.value
+            ):
+                rolled_back_ops.append(op_id)
+            elif (
+                op_status == OperationJournalStage.ROLLBACK_FAILED.value
+                or op_stage == OperationJournalStage.ROLLBACK_FAILED.value
+            ):
+                rollback_failed_ops.append(op_id)
+            elif (
+                op_status == OperationJournalStage.APPLIED.value
+                or op_stage == OperationJournalStage.APPLIED.value
+            ):
+                applied_ops.append(op_id)
+            elif op_stage == OperationJournalStage.FILE_MODIFIED.value:
+                in_flight_disk_ops.append(op_id)
+
+        saw_rolling_back = any(
+            isinstance(entry, Mapping)
+            and (
+                entry.get("from_state") == TransactionState.ROLLING_BACK.value
+                or entry.get("to_state") == TransactionState.ROLLING_BACK.value
+            )
+            for entry in (record.state_history or [])
+        )
+
+        rb_tuple = tuple(rolled_back_ops)
+        ap_tuple = tuple(applied_ops)
+        rbf_tuple = tuple(rollback_failed_ops)
+
+        if state_val == TransactionState.ROLLED_BACK.value:
+            if applied_ops or in_flight_disk_ops or rollback_failed_ops:
+                return TransactionReconciliationEntry(
+                    transaction_id=tx_id,
+                    execution_id=exec_id,
+                    state=state_val,
+                    classification=JournalTransactionClassification.INSUFFICIENT_EVIDENCE,
+                    rolled_back_operation_ids=rb_tuple,
+                    applied_operation_ids=ap_tuple,
+                    rollback_failed_operation_ids=rbf_tuple,
+                    blocking_reason=(
+                        f"Transacción '{tx_id}' declara ROLLED_BACK pero retiene operaciones "
+                        "APPLIED/FILE_MODIFIED/ROLLBACK_FAILED."
+                    ),
+                )
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=JournalTransactionClassification.ROLLBACK_CONFIRMED,
+                rolled_back_operation_ids=rb_tuple,
+            )
+
+        if state_val in {
+            TransactionState.COMMITTED.value,
+            TransactionState.PARTIALLY_APPLIED.value,
+        }:
+            if rolled_back_ops or rollback_failed_ops or in_flight_disk_ops or saw_rolling_back:
+                cls_kind = (
+                    JournalTransactionClassification.ROLLBACK_PARTIAL
+                    if rolled_back_ops
+                    else JournalTransactionClassification.INSUFFICIENT_EVIDENCE
+                )
+                return TransactionReconciliationEntry(
+                    transaction_id=tx_id,
+                    execution_id=exec_id,
+                    state=state_val,
+                    classification=cls_kind,
+                    rolled_back_operation_ids=rb_tuple,
+                    applied_operation_ids=ap_tuple,
+                    rollback_failed_operation_ids=rbf_tuple,
+                    blocking_reason=(
+                        f"Transacción '{tx_id}' en {state_val} contiene rastro de rollback "
+                        "o modificación inconclusa."
+                    ),
+                )
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=JournalTransactionClassification.COMMITTED_CLEAN,
+                applied_operation_ids=ap_tuple,
+            )
+
+        if state_val == TransactionState.ROLLING_BACK.value:
+            cls_kind = (
+                JournalTransactionClassification.ROLLBACK_PARTIAL
+                if rolled_back_ops
+                else JournalTransactionClassification.ROLLBACK_STARTED
+            )
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=cls_kind,
+                rolled_back_operation_ids=rb_tuple,
+                applied_operation_ids=ap_tuple,
+                rollback_failed_operation_ids=rbf_tuple,
+                blocking_reason=(
+                    f"Rollback en curso o interrumpido en '{tx_id}' "
+                    f"(revertidas={len(rb_tuple)}, aplicadas={len(ap_tuple)})."
+                ),
+            )
+
+        if state_val in {
+            TransactionState.RECOVERY_REQUIRED.value,
+            TransactionState.RECOVERING.value,
+        }:
+            cls_kind = (
+                JournalTransactionClassification.ROLLBACK_PARTIAL
+                if rolled_back_ops
+                else JournalTransactionClassification.RECOVERY_PENDING
+            )
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=cls_kind,
+                rolled_back_operation_ids=rb_tuple,
+                applied_operation_ids=ap_tuple,
+                rollback_failed_operation_ids=rbf_tuple,
+                blocking_reason=f"Recuperación N5 pendiente o en curso en '{tx_id}' ({state_val}).",
+            )
+
+        if state_val == TransactionState.RECOVERY_FAILED.value:
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=JournalTransactionClassification.RECOVERY_FAILED,
+                rolled_back_operation_ids=rb_tuple,
+                applied_operation_ids=ap_tuple,
+                rollback_failed_operation_ids=rbf_tuple,
+                blocking_reason=f"Recuperación N5 fallida en '{tx_id}' (RECOVERY_FAILED).",
+            )
+
+        if state_val == TransactionState.FAILED.value:
+            if rolled_back_ops:
+                return TransactionReconciliationEntry(
+                    transaction_id=tx_id,
+                    execution_id=exec_id,
+                    state=state_val,
+                    classification=JournalTransactionClassification.ROLLBACK_PARTIAL,
+                    rolled_back_operation_ids=rb_tuple,
+                    applied_operation_ids=ap_tuple,
+                    rollback_failed_operation_ids=rbf_tuple,
+                    blocking_reason=(
+                        f"Rollback parcial terminado en FAILED en '{tx_id}' "
+                        f"(revertidas={len(rb_tuple)}, fallidas={len(rbf_tuple)})."
+                    ),
+                )
+            if rollback_failed_ops or saw_rolling_back or in_flight_disk_ops or applied_ops:
+                return TransactionReconciliationEntry(
+                    transaction_id=tx_id,
+                    execution_id=exec_id,
+                    state=state_val,
+                    classification=JournalTransactionClassification.RECOVERY_FAILED,
+                    rolled_back_operation_ids=rb_tuple,
+                    applied_operation_ids=ap_tuple,
+                    rollback_failed_operation_ids=rbf_tuple,
+                    blocking_reason=(
+                        f"Transacción '{tx_id}' en FAILED con intento de rollback fallido "
+                        "o modificaciones físicas sin reconciliar."
+                    ),
+                )
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=JournalTransactionClassification.COMMITTED_CLEAN,
+            )
+
+        if state_val in {
+            TransactionState.CREATED.value,
+            TransactionState.PREPARING.value,
+            TransactionState.PREPARED.value,
+            TransactionState.EXECUTING.value,
+        }:
+            return TransactionReconciliationEntry(
+                transaction_id=tx_id,
+                execution_id=exec_id,
+                state=state_val,
+                classification=JournalTransactionClassification.RECOVERY_PENDING,
+                rolled_back_operation_ids=rb_tuple,
+                applied_operation_ids=ap_tuple,
+                rollback_failed_operation_ids=rbf_tuple,
+                blocking_reason=f"Transacción N5 inconclusa '{tx_id}' en estado {state_val}.",
+            )
+
+        return TransactionReconciliationEntry(
+            transaction_id=tx_id,
+            execution_id=exec_id,
+            state=state_val,
+            classification=JournalTransactionClassification.INSUFFICIENT_EVIDENCE,
+            rolled_back_operation_ids=rb_tuple,
+            applied_operation_ids=ap_tuple,
+            rollback_failed_operation_ids=rbf_tuple,
+            blocking_reason=f"Estado transaccional desconocido en '{tx_id}': {state_val!r}.",
+        )
+
+    def _load_reconciliation_entry_verified(
+        self, transaction_id: str
+    ) -> TransactionReconciliationEntry:
+        """
+        Valida o reutiliza de forma segura la clasificación de `transaction_id` verificando
+        siempre en disco los bytes actuales SHA-256 de `.tx.json` y `.wal.jsonl`.
+        """
+        snap_file = self.snapshot_path(transaction_id)
+        wal_file = self.wal_path(transaction_id)
+        try:
+            snap_bytes = snap_file.read_bytes()
+            wal_bytes = wal_file.read_bytes()
+        except OSError:
+            # Delegamos en validate_and_load_transaction para emitir el JournalCorruptionError exacto.
+            record, _ = self.validate_and_load_transaction(transaction_id)
+            return self.classify_record_for_n8_reconciliation(record)
+
+        cache_key = (
+            str(snap_file.resolve()),
+            hashlib.sha256(snap_bytes).hexdigest(),
+            hashlib.sha256(wal_bytes).hexdigest(),
+        )
+        with _RECONCILIATION_CACHE_LOCK:
+            cached = _RECONCILIATION_ENTRY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        record, _ = self.validate_and_load_transaction(transaction_id)
+        entry = self.classify_record_for_n8_reconciliation(record)
+        with _RECONCILIATION_CACHE_LOCK:
+            if len(_RECONCILIATION_ENTRY_CACHE) >= _RECONCILIATION_CACHE_MAX_ENTRIES:
+                _RECONCILIATION_ENTRY_CACHE.clear()
+            _RECONCILIATION_ENTRY_CACHE[cache_key] = entry
+        return entry
+
+    def assess_reconciliation_state(self) -> JournalReconciliationAssessment:
+        """
+        Evalúa el journal completo de manera fail-closed para reconciliación N5 -> N8 (H-01/H-02).
+
+        Lanza `JournalCorruptionError` si el directorio es inaccesible o algún archivo `.tx.json`/
+        `.wal.jsonl` está corrupto, truncado o ilegible.
+        """
+        dir_status = inspect_journal_directory_status(self.journal_dir)
+        if dir_status == "absent":
+            return JournalReconciliationAssessment(
+                journal_dir=str(self.journal_dir),
+                directory_status="absent",
+            )
+
+        tx_ids = self.list_transaction_ids()
+        if not tx_ids:
+            return JournalReconciliationAssessment(
+                journal_dir=str(self.journal_dir),
+                directory_status="accessible",
+            )
+
+        entries: list[TransactionReconciliationEntry] = []
+        by_exec: dict[str, list[TransactionReconciliationEntry]] = {}
+        ambiguous: list[TransactionReconciliationEntry] = []
+
+        for tx_id in tx_ids:
+            entry = self._load_reconciliation_entry_verified(tx_id)
+            entries.append(entry)
+            if entry.execution_id:
+                by_exec.setdefault(entry.execution_id, []).append(entry)
+            if entry.classification not in {
+                JournalTransactionClassification.COMMITTED_CLEAN,
+                JournalTransactionClassification.ROLLBACK_CONFIRMED,
+            }:
+                ambiguous.append(entry)
+
+        confirmed_execs: list[str] = []
+        committed_clean_execs: list[str] = []
+        partial_ops_map: dict[str, set[str]] = {}
+
+        for exec_id, exec_entries in sorted(by_exec.items()):
+            has_rb_confirmed = any(
+                e.classification == JournalTransactionClassification.ROLLBACK_CONFIRMED
+                for e in exec_entries
+            )
+            has_committed_applied = any(
+                e.classification == JournalTransactionClassification.COMMITTED_CLEAN
+                and bool(e.applied_operation_ids)
+                for e in exec_entries
+            )
+            has_uncertainty = any(
+                e.classification
+                not in {
+                    JournalTransactionClassification.COMMITTED_CLEAN,
+                    JournalTransactionClassification.ROLLBACK_CONFIRMED,
+                }
+                for e in exec_entries
+            )
+
+            if has_rb_confirmed and not has_committed_applied and not has_uncertainty:
+                confirmed_execs.append(exec_id)
+            else:
+                # Si en una ejecución multi-transacción o rollback parcial solo ciertas operaciones
+                # tienen reversión confirmada, invalidamos únicamente esas operaciones específicas.
+                rb_ops: set[str] = set()
+                for e in exec_entries:
+                    rb_ops.update(e.rolled_back_operation_ids)
+                if rb_ops:
+                    partial_ops_map[exec_id] = rb_ops
+
+                if not has_rb_confirmed and not has_uncertainty and has_committed_applied:
+                    committed_clean_execs.append(exec_id)
+
+        partial_pairs = tuple(
+            (exec_id, tuple(sorted(ops)))
+            for exec_id, ops in sorted(partial_ops_map.items())
+            if ops
+        )
+
+        return JournalReconciliationAssessment(
+            journal_dir=str(self.journal_dir),
+            directory_status="accessible",
+            confirmed_rollback_execution_ids=tuple(confirmed_execs),
+            partial_rollback_operations=partial_pairs,
+            ambiguous_or_pending_transactions=tuple(ambiguous),
+            committed_clean_execution_ids=tuple(committed_clean_execs),
+            entries=tuple(entries),
+        )
+
     def list_confirmed_rollback_execution_ids(self) -> list[str]:
-        """Lee los execution_id terminales ROLLED_BACK como fuente durable de reconciliación."""
-        execution_ids: set[str] = set()
-        for transaction_id in self.list_transaction_ids():
-            try:
-                record, _ = self.validate_and_load_transaction(transaction_id)
-            except JournalCorruptionError:
-                # Si N8 no puede establecer el estado terminal de un journal, debe bloquear
-                # la entrega de recuerdos hasta que la recuperación N5 resuelva la corrupción.
-                raise
-            if record.state == TransactionState.ROLLED_BACK.value and record.execution_id:
-                execution_ids.add(record.execution_id)
-        return sorted(execution_ids)
+        """Lee los execution_id terminales ROLLED_BACK verificados en el journal durable."""
+        assessment = self.assess_reconciliation_state()
+        return list(assessment.confirmed_rollback_execution_ids)
 
 
 # ==============================================================================

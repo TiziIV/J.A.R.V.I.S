@@ -324,3 +324,45 @@ $env:JARVIS_ENV = "test"
 - `py_compile` de los módulos modificados: **OK**; `git diff --check`: **OK**.
 - La reconciliación vuelve a consultar el journal completo para priorizar recuperación ante estados terminales; en instalaciones con journals extensos, esa lectura tiene costo proporcional a la cantidad de transacciones. No se cambia el esquema de N8 ni se crea un journal paralelo.
 - Pruebas físicas de micrófono/altavoz no ejecutadas; el flujo de voz fue verificado en la suite con dobles de prueba.
+
+---
+
+## 14. Remediación Final Focalizada N8.3: Hallazgos H-01 a H-07 (2026-11-27)
+
+**Estado:** Hallazgos H-01 a H-07 del informe independiente de Antigravity Argon sobre `a10652b` corregidos y verificados en suite global aislada (`666/666`). **N8.3 permanece pendiente de verificación independiente final por Antigravity Argon antes de emitir dictamen de cierre y tag definitivo.**
+
+### 1. Causas raíz, soluciones y garantías incorporadas
+
+1. **H-01 — Reconciliación fail-closed ante estados ambiguos y rollbacks parciales (`transaction_manager.py`, `store.py`, `engine.py`, `capture.py`):**
+   - `TransactionJournal.assess_reconciliation_state()` evalúa la máquina de estados N5 completa y distingue 8 categorías explícitas: `COMMITTED_CLEAN`, `ROLLBACK_CONFIRMED`, `ROLLBACK_STARTED`, `ROLLBACK_PARTIAL`, `RECOVERY_PENDING`, `RECOVERY_FAILED`, `CORRUPT_OR_UNREADABLE` e `INSUFFICIENT_EVIDENCE`.
+   - En rollbacks parciales o interrumpidos donde solo un subconjunto de operaciones posee evidencia `ROLLED_BACK`, N8 revoca de forma granular únicamente esas operaciones (`ExperienceStore.invalidate_by_execution_operations()` + tombstones `rollback_operation_tombstone`) sin marcar falsamente como revertida la transacción completa ni afectar ejecuciones `COMMITTED` independientes.
+   - Mientras exista cualquier transacción en estado ambiguo/pendiente/fallido (`ROLLING_BACK`, `RECOVERY_REQUIRED`, `RECOVERING`, `RECOVERY_FAILED`, `FAILED` con reversión incompleta o evidencia insuficiente), toda lectura, respaldo o clasificación en `MemoryEngine` falla de forma cerrada (`MemoryPersistenceError`) hasta que N5 complete la recuperación.
+2. **H-02 — Proveedor N5 por defecto, distinción de `PermissionError` y logging en recuperación (`chain_orchestrator.py`, `transaction_manager.py`, `engine.py`, `main.py`):**
+   - Importado `logger` en `chain_orchestrator.py` y añadido reporte explícito en `RecoveryReport` (`n8_reconciled=False`, `n8_reconciliation_error`) + `orch.n8_reconciliation_pending` cuando falla temporalmente SQLite, evitando `NameError` y falsos positivos de éxito.
+   - `inspect_journal_directory_status()` utiliza `os.stat()` directo (nunca `Path.exists()`) para distinguir ausencia legítima (`FileNotFoundError`) de permisos denegados o errores de E/S (`JournalCorruptionError` -> fail-closed).
+   - `MemoryEngine` inicializa siempre un proveedor N5 por defecto (`_default_n5_rollback_provider`) y `ChainOrchestrator` registra su `journal_dir` real sobre `ExperienceCaptureService` y `store_metadata`.
+3. **H-03 — Frontera de reconciliación en todas las APIs públicas de `MemoryEngine` (`engine.py`):**
+   - `get_revisions()`, `get_stats()`, `create_backup()`, `preview_preferences_import()`, `commit_preferences_import()`, `correct_memory()` y `confirm_memory()` ejecutan `_ensure_pending_invalidations_applied_for_read()` antes de operar, encapsulando operaciones compuestas en `reconciliation_scope()` para realizar un único escaneo del journal y evitar que un backup congele recuerdos `ACTIVE` revertidos.
+4. **H-04 — Persistencia e inferencia durable de `n8_context_exposed` (`goal_models.py`, `goal_persistence.py`):**
+   - `GoalPlan` serializa `"n8_context_exposed"` fuera de `compute_plan_hash()` y lo reconstruye junto con `GoalPlan.infer_n8_exposure()` evaluando `n8_query_id`, `n8_trust_boundary`, `n8_memory_refs`, `n8_influenced` y `llm_with_n8`, manteniendo el saneamiento de excepciones tras reinicios, revocaciones previas, ausencia de `MemoryEngine` o `--sin-historial`.
+5. **H-05 — Propagación estructural de contaminación N8 en síntesis multi-etapa con hardware N7 (`goal_supervisor.py`, `goal_persistence.py`):**
+   - `_execute_internal_synthesis()` marca cualquier combinación de contexto N8 con telemetría N7 como `provenance="n8_and_n7_mixed"`, `trust_level="untrusted_long_term_memory"`, `n8_tainted=True`, excluye salidas upstream contaminadas de `observations` y separa los datos N7 puros para que ningún resumen N8 llegue a `untrusted_envelope["observations"]`, `.goal.json` ni `.wal.jsonl`.
+6. **H-06 — Saneamiento de `cancellation_reason`, replanificación post-revocación y `EphemeralGoalStore` (`goal_persistence.py`, `goal_supervisor.py`, `goal_engine.py`):**
+   - `extract_persistable_plan_dict()` y `_sanitize_runtime_strings()` sanean `goal.cancellation_reason` bajo exposición N8; `EphemeralGoalStore.append_wal_event()` y `GoalStore.append_wal_event()` aplican `sanitize_wal_payload(..., n8_context_exposed=...)` con paridad total; y `_attempt_replan()` conserva `replan_saw_n8=True` si el plan o la subtarea fallida ya habían estado expuestos a N8 aunque el recuerdo haya sido revocado antes del replan.
+7. **H-07 — No inicialización de SQLite en operaciones privadas o bloqueadas (`main.py`, `console.py`):**
+   - `_ensure_memory_capture_service()` no instancia `MemoryEngine` ni crea `experiences.db` durante el modo privado cuando la base aún no existe en disco, y `MemoryConsoleHandler` comprueba `_is_private_active()` e `_is_history_allowed_now()` antes de acceder a `self.engine` en `/memoria purgar`, `backup`, `restaurar`, `corregir`, `confirmar`, `olvidar`, `importar-preferencias`, `buscar`, `listar` y `ver`, manteniendo activas las invalidaciones obligatorias sobre bases ya existentes.
+
+### 2. Costos de reconciliación antes y después
+
+| Transacciones N5 | Rollbacks | Turno `BrainManager` antes | Turno `BrainManager` después | `retrieve()` frío | `retrieve()` estacionario | `BEGIN IMMEDIATE` por turno (antes -> después) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5 | 1 | 183.65 ms | 79.96 ms | 133.71 ms | 18.05 ms | 8 -> 0 |
+| 50 | 5 | 1,024.54 ms | 202.29 ms | 759.29 ms | 47.69 ms | 40 -> 0 |
+| 250 | 25 | 5,091.52 ms | 727.09 ms | 3,617.86 ms | 179.52 ms | 200 -> 0 |
+| 500 | 50 | 10,091.97 ms | 1,407.08 ms | 7,097.93 ms | 343.62 ms | 400 -> 0 |
+
+### 3. Pruebas añadidas y limitaciones restantes
+
+- Se añadieron **8 escenarios adversariales nuevos** en [test_memory_n8_audit_remediation.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/tests/test_memory_n8_audit_remediation.py) (`20/20` OK en `65.146 s`), cubriendo caídas reales con `os._exit(99)` en `ROLLING_BACK`, rollback parcial y `RECOVERING`, fallos SQLite transitorios en `recover_pending_transactions` + `logger.warning`, `PermissionError` y corrupción en journals, las 5 APIs públicas de H-03 + inspección interna de backups `.db`, recarga post-revocación H-04, síntesis multi-etapa con GPU H-05, cancelación/replan/WAL efímero H-06 y secuencia completa de 10 pasos en modo privado + voz con dobles H-07.
+- Regresiones N8/N5/N6: **188/188 OK** (`170.446 s`). Suite global: **666/666 OK** (`303.122 s`).
+- **Limitaciones honestas:** la lectura y verificación SHA-256 de archivos del journal mantiene un costo lineal moderado en disco (`~343 ms` por escaneo con 500 transacciones en NTFS) para no introducir cachés ciegas que pudieran omitir un rollback reciente o una corrupción en disco; las pruebas de hardware físico de micrófono/altavoces requieren validación manual del usuario.

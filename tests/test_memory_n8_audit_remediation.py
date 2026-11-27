@@ -1971,6 +1971,867 @@ os._exit(99)
         all_txt = json.dumps([m.content for m in reopened.list_memories(status=None, limit=200)])
         self.assertNotIn("CONFIDENCIAL_EXIT_9001", all_txt)
 
+    # ------------------------------------------------------------------
+    # Remediación H-01 a H-07 (Verificación independiente Antigravity Argon)
+    # ------------------------------------------------------------------
+
+    def test_h01_crash_in_rolling_back_and_during_recovery_blocks_n8_until_resolved(self) -> None:
+        """
+        Caída real con os._exit(99) tras restaurar archivos antes de STATE_ROLLED_BACK y caída
+        durante recuperación N5: N8 falla cerrado con proveedor por defecto hasta completar N5,
+        preservando ejecuciones COMMITTED independientes.
+        """
+        cap_svc = ExperienceCaptureService(
+            memory_engine=self.engine,
+            enabled=True,
+            auto_capture_enabled=True,
+        )
+        _fe, orch = self._build_real_n5(cap_svc)
+        cfg_rb, sum_rb = self._run_real_n5_edit(
+            orch, exec_id="exec-h01-crash-mid-rb", game_name="HyperGame"
+        )
+        self.assertEqual(sum_rb["state"], ChainState.COMPLETED.value)
+        cfg_ok, sum_ok = self._run_real_n5_edit(
+            orch, exec_id="exec-h01-independent-ok", game_name="SteadyGame"
+        )
+        self.assertEqual(sum_ok["state"], ChainState.COMPLETED.value)
+        self.assertIn("sg.ShadowQuality=1", cfg_ok.read_text(encoding="utf-8"))
+
+        # Subproceso 1: inicia rollback real, restaura físicamente el archivo en disco y cae
+        # con os._exit(99) ANTES de registrar la transición final a ROLLED_BACK (queda ROLLING_BACK).
+        crash_mid_rollback = """\
+import os, sys
+from pathlib import Path
+from skills.file_editor_skill import AuditLogger, BackupManager, FileEditorSkill
+from src.brain.chain_orchestrator import ChainOrchestrator
+
+base, backup, journal, audit, target_exec = sys.argv[1:6]
+base_p, backup_p, journal_p, audit_p = Path(base), Path(backup), Path(journal), Path(audit)
+aud = AuditLogger(log_file=audit_p)
+ed = FileEditorSkill(
+    authorized_roots=[base_p, backup_p],
+    backup_dir=backup_p,
+    audit_logger=aud,
+    backup_manager=BackupManager(audit_logger=aud),
+)
+orig_rb = ed.rollback
+calls = {"n": 0}
+def _rb_then_crash(*args, **kwargs):
+    ok = orig_rb(*args, **kwargs)
+    calls["n"] += 1
+    if calls["n"] >= 2:
+        os._exit(99)
+    return ok
+ed.rollback = _rb_then_crash
+orch_c = ChainOrchestrator(file_editor=ed, journal_dir=journal_p)
+orch_c.rehydrate_execution(target_exec)
+orch_c.rollback_execution(target_exec)
+os._exit(98)
+"""
+        proc_rb = subprocess.run(
+            [
+                sys.executable, "-B", "-c", crash_mid_rollback,
+                str(self.cfg_root), str(self.n5_backup_dir), str(self.n5_journal_dir),
+                str(self.n5_audit_log), "exec-h01-crash-mid-rb",
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "JARVIS_ENV": "test"},
+        )
+        self.assertEqual(proc_rb.returncode, 99, proc_rb.stdout + proc_rb.stderr)
+        # Archivo ya restaurado físicamente en disco, pero journal en estado intermedio ROLLING_BACK.
+        self.assertIn("sg.ShadowQuality=3", cfg_rb.read_text(encoding="utf-8"))
+        journal_check = TransactionJournal(self.n5_journal_dir, create_dirs=False)
+        assess_mid = journal_check.assess_reconciliation_state()
+        self.assertTrue(assess_mid.has_blocking_uncertainty)
+
+        # Reinicio de N8 ANTES de ejecutar recuperación N5 (sin set_n5_rollback_execution_provider manual):
+        # el proveedor por defecto de MemoryEngine debe detectar ROLLING_BACK y fallar cerrado.
+        fresh_engine = MemoryEngine(store=ExperienceStore(self.db_path))
+        self.assertTrue(fresh_engine.has_n5_rollback_provider)
+        with self.assertRaises(MemoryPersistenceError):
+            fresh_engine.retrieve("HyperGame")
+        with self.assertRaises(MemoryPersistenceError):
+            fresh_engine.list_memories(status=MemoryStatus.ACTIVE)
+
+        # Subproceso 2: caída real con os._exit(99) DURANTE la propia recuperación N5 (estado RECOVERING).
+        crash_in_recovery = """\
+import os, sys
+from pathlib import Path
+from skills.file_editor_skill import AuditLogger, BackupManager, FileEditorSkill
+from src.brain.chain_orchestrator import ChainOrchestrator
+
+base_p, backup_p, journal_p, audit_p = map(Path, sys.argv[1:5])
+aud = AuditLogger(log_file=audit_p)
+ed = FileEditorSkill(
+    authorized_roots=[base_p, backup_p],
+    backup_dir=backup_p,
+    audit_logger=aud,
+    backup_manager=BackupManager(audit_logger=aud),
+)
+orch_r = ChainOrchestrator(file_editor=ed, journal_dir=journal_p)
+orig_transition = orch_r.transaction_manager.transition_transaction_state
+def _crash_on_recovering(record, new_state, **kw):
+    orig_transition(record, new_state, **kw)
+    if str(getattr(new_state, "value", new_state)) == "RECOVERING":
+        os._exit(99)
+orch_r.transaction_manager.transition_transaction_state = _crash_on_recovering
+orch_r.recover_pending_transactions()
+os._exit(97)
+"""
+        proc_rec = subprocess.run(
+            [
+                sys.executable, "-B", "-c", crash_in_recovery,
+                str(self.cfg_root), str(self.n5_backup_dir), str(self.n5_journal_dir),
+                str(self.n5_audit_log),
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "JARVIS_ENV": "test"},
+        )
+        self.assertEqual(proc_rec.returncode, 99, proc_rec.stdout + proc_rec.stderr)
+        with self.assertRaises(MemoryPersistenceError):
+            fresh_engine.retrieve("HyperGame")
+
+        # Ahora completamos la recuperación N5 + reconciliación N8 tras el reinicio.
+        fresh_cap = ExperienceCaptureService(memory_engine=fresh_engine, enabled=True, auto_capture_enabled=True)
+        _fe2, orch_after = self._build_real_n5(fresh_cap)
+        reps = orch_after.recover_pending_transactions()
+        self.assertTrue(any(r.final_state == "ROLLED_BACK" for r in reps))
+        self.assertFalse(orch_after.n8_reconciliation_pending)
+
+        # La ejecución revertida queda REVOKED; la ejecución COMMITTED independiente sigue ACTIVE.
+        ret_rb = fresh_engine.retrieve("HyperGame", scope_type=MemoryScopeType.APP_OR_GAME, scope_key="hypergame")
+        self.assertEqual(ret_rb.returned_count, 0)
+        ret_ok = fresh_engine.retrieve("SteadyGame", scope_type=MemoryScopeType.APP_OR_GAME, scope_key="steadygame")
+        self.assertGreaterEqual(ret_ok.returned_count, 1)
+        for mem in fresh_engine.list_memories(status=None, limit=100):
+            if mem.provenance.source_execution_id == "exec-h01-crash-mid-rb":
+                self.assertEqual(mem.status, MemoryStatus.REVOKED)
+            elif mem.provenance.source_execution_id == "exec-h01-independent-ok":
+                self.assertEqual(mem.status, MemoryStatus.ACTIVE)
+
+    def test_h01_partial_rollback_granularity_and_crash_recovery(self) -> None:
+        """
+        Caída real tras revertir solo 1 de las 2 operaciones (rollback parcial): N8 invalida en
+        SQLite únicamente la operación con evidencia ROLLED_BACK sin marcar falsamente la segunda
+        como revertida aún, bloquea lecturas hasta resolver la ambigüedad y luego completa N5.
+        """
+        cap_svc = ExperienceCaptureService(
+            memory_engine=self.engine,
+            enabled=True,
+            auto_capture_enabled=True,
+        )
+        _fe, orch = self._build_real_n5(cap_svc)
+        _cfg, sum_p = self._run_real_n5_edit(
+            orch, exec_id="exec-h01-partial-ops", game_name="PartialOpsGame"
+        )
+        self.assertEqual(sum_p["state"], ChainState.COMPLETED.value)
+        initial_mems = {
+            m.provenance.source_task_id: m
+            for m in self.store.list_memories(status=MemoryStatus.ACTIVE)
+            if m.provenance.source_execution_id == "exec-h01-partial-ops"
+        }
+        self.assertEqual(set(initial_mems.keys()), {"op-001", "op-002"})
+
+        # Subproceso cae con os._exit(99) justo después de registrar OPERATION_ROLLED_BACK para op-002
+        # (primera en orden LIFO), dejando op-001 todavía APPLIED y la transacción en ROLLING_BACK.
+        crash_partial = """\
+import os, sys
+from pathlib import Path
+from skills.file_editor_skill import AuditLogger, BackupManager, FileEditorSkill
+from src.brain.chain_orchestrator import ChainOrchestrator
+
+base_p, backup_p, journal_p, audit_p, target_exec = map(Path, sys.argv[1:6])
+exec_str = sys.argv[5]
+aud = AuditLogger(log_file=audit_p)
+ed = FileEditorSkill(
+    authorized_roots=[base_p, backup_p],
+    backup_dir=backup_p,
+    audit_logger=aud,
+    backup_manager=BackupManager(audit_logger=aud),
+)
+orch_p = ChainOrchestrator(file_editor=ed, journal_dir=journal_p)
+orig_log_rb = orch_p.transaction_manager.log_operation_rolled_back
+def _crash_after_first_op(record, op_id, **kw):
+    orig_log_rb(record, op_id, **kw)
+    os._exit(99)
+orch_p.transaction_manager.log_operation_rolled_back = _crash_after_first_op
+orch_p.rehydrate_execution(exec_str)
+orch_p.rollback_execution(exec_str)
+os._exit(98)
+"""
+        proc = subprocess.run(
+            [
+                sys.executable, "-B", "-c", crash_partial,
+                str(self.cfg_root), str(self.n5_backup_dir), str(self.n5_journal_dir),
+                str(self.n5_audit_log), "exec-h01-partial-ops",
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "JARVIS_ENV": "test"},
+        )
+        self.assertEqual(proc.returncode, 99, proc.stdout + proc.stderr)
+
+        fresh_store = ExperienceStore(self.db_path)
+        fresh_engine = MemoryEngine(store=fresh_store, n5_journal_dir=self.n5_journal_dir)
+        # La consulta debe fallar cerrado porque la transacción sigue en ROLLING_BACK parcial,
+        # pero antes habrá invalidado granularmente op-002 sin revocar prematuramente op-001 en SQLite.
+        with self.assertRaises(MemoryPersistenceError):
+            fresh_engine.retrieve("PartialOpsGame")
+
+        rec_op2 = fresh_store.get_memory(initial_mems["op-002"].memory_id)
+        rec_op1 = fresh_store.get_memory(initial_mems["op-001"].memory_id)
+        assert rec_op2 is not None and rec_op1 is not None
+        self.assertEqual(rec_op2.status, MemoryStatus.REVOKED)
+        self.assertEqual(rec_op1.status, MemoryStatus.ACTIVE)
+        self.assertTrue(fresh_store.is_execution_operation_invalidated("exec-h01-partial-ops", "op-002"))
+        self.assertFalse(fresh_store.is_execution_operation_invalidated("exec-h01-partial-ops", "op-001"))
+
+        # Al ejecutar la recuperación N5 completa, op-001 también se revierte y N8 queda consistente.
+        fresh_cap = ExperienceCaptureService(memory_engine=fresh_engine, enabled=True, auto_capture_enabled=True)
+        _fe2, orch_rec = self._build_real_n5(fresh_cap)
+        orch_rec.recover_pending_transactions()
+        self.assertEqual(fresh_store.get_memory(initial_mems["op-001"].memory_id).status, MemoryStatus.REVOKED)
+        self.assertEqual(fresh_engine.retrieve("PartialOpsGame").returned_count, 0)
+
+    def test_h02_logger_transient_error_retry_and_inaccessible_or_corrupt_journal_fail_closed(self) -> None:
+        """
+        Verifica ausencia de NameError en logger.warning ante fallo SQLite transitorio durante
+        recover_pending_transactions, no declaración falsa de éxito, reintento limpio, y fail-closed
+        ante journal corrupto o PermissionError (sin confundirlo con FileNotFoundError).
+        """
+        from src.brain.transaction_manager import JournalCorruptionError, inspect_journal_directory_status
+
+        cap_svc = ExperienceCaptureService(
+            memory_engine=self.engine,
+            enabled=True,
+            auto_capture_enabled=True,
+        )
+        _fe, orch = self._build_real_n5(cap_svc)
+        _cfg, sum_tx = self._run_real_n5_edit(
+            orch, exec_id="exec-h02-logger-retry", game_name="LoggerGame"
+        )
+        self.assertEqual(sum_tx["state"], ChainState.COMPLETED.value)
+
+        # Revertimos en un orquestador desconectado de N8 para simular caída antes de notificar a N8.
+        aud2 = AuditLogger(log_file=self.n5_audit_log)
+        fe2 = FileEditorSkill(
+            authorized_roots=[self.cfg_root, self.n5_backup_dir],
+            backup_dir=self.n5_backup_dir,
+            audit_logger=aud2,
+            backup_manager=BackupManager(audit_logger=aud2),
+        )
+        orch_no_n8 = ChainOrchestrator(file_editor=fe2, journal_dir=self.n5_journal_dir)
+        orch_no_n8.rehydrate_execution("exec-h02-logger-retry")
+        orch_no_n8.rollback_execution("exec-h02-logger-retry")
+
+        # 1) Forzamos fallo SQLite transitorio durante recover_pending_transactions:
+        #    NO debe lanzar NameError, debe registrar warning, marcar n8_reconciled=False y proteger N8.
+        fresh_store = ExperienceStore(self.db_path)
+        fresh_engine = MemoryEngine(store=fresh_store, n5_journal_dir=self.n5_journal_dir)
+        fresh_cap = ExperienceCaptureService(memory_engine=fresh_engine, enabled=True, auto_capture_enabled=True)
+        orch_rec = ChainOrchestrator(
+            file_editor=fe2,
+            journal_dir=self.n5_journal_dir,
+            memory_capture_service=fresh_cap,
+        )
+        with patch("src.brain.chain_orchestrator.logger.warning") as warn_spy:
+            with patch.object(
+                fresh_store,
+                "invalidate_by_execution",
+                side_effect=sqlite3.OperationalError("database is locked transient"),
+            ):
+                reps_fail = orch_rec.recover_pending_transactions()
+                self.assertTrue(warn_spy.called)
+                self.assertTrue(orch_rec.n8_reconciliation_pending)
+                self.assertTrue(any(not r.n8_reconciled for r in reps_fail))
+                with self.assertRaises(MemoryPersistenceError):
+                    fresh_engine.retrieve("LoggerGame")
+
+        # 2) El siguiente intento de recuperación completa la reconciliación y desbloquea N8.
+        reps_ok = orch_rec.recover_pending_transactions()
+        self.assertFalse(orch_rec.n8_reconciliation_pending)
+        self.assertTrue(all(r.n8_reconciled for r in reps_ok))
+        self.assertEqual(fresh_engine.retrieve("LoggerGame").returned_count, 0)
+
+        # 3) PermissionError al inspeccionar el directorio del journal JAMÁS se interpreta como vacío.
+        with patch("src.brain.transaction_manager.os.stat", side_effect=PermissionError("acceso denegado")):
+            with self.assertRaises(JournalCorruptionError):
+                inspect_journal_directory_status(self.n5_journal_dir)
+            with self.assertRaises(MemoryPersistenceError):
+                fresh_engine.retrieve("LoggerGame")
+
+        # 4) Corrupción real de un archivo WAL en un journal aislado falla cerrado.
+        corrupt_j_dir = self.work_dir / "corrupt_journal_case"
+        corrupt_j_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_j_dir / "tx_bad.tx.json").write_text("{json_corrupto", encoding="utf-8")
+        (corrupt_j_dir / "tx_bad.wal.jsonl").write_text("{wal_corrupto\n", encoding="utf-8")
+        corrupt_engine = MemoryEngine(store=fresh_store, n5_journal_dir=corrupt_j_dir)
+        with self.assertRaises(MemoryPersistenceError):
+            corrupt_engine.retrieve("LoggerGame")
+
+    def test_h03_all_public_memory_engine_apis_reconcile_and_backup_never_freezes_active_rollback(self) -> None:
+        """
+        Verifica que get_revisions, get_stats, create_backup, preview_preferences_import y
+        commit_preferences_import ejecutan reconciliación N5 antes de operar (sin llamar retrieve())
+        y fallan cerrado ante error del proveedor.
+        """
+        legacy_prefs = self.work_dir / "prefs_h03.json"
+        legacy_prefs.write_text(
+            json.dumps(
+                {"messages": [], "preferences": {"tema_hud": "azul_oscuro"}},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        api_names = (
+            "get_revisions",
+            "get_stats",
+            "create_backup",
+            "preview_preferences_import",
+            "commit_preferences_import",
+        )
+
+        for idx, api_name in enumerate(api_names):
+            case_root = self.work_dir / f"h03_{idx}_{api_name}"
+            case_root.mkdir(parents=True, exist_ok=True)
+            db_case = case_root / "experiences.db"
+            bkp_case = case_root / "mem_backups"
+            cfg_case = case_root / "cfg"
+            n5_bkp = case_root / "n5_bkp"
+            n5_j = case_root / "transactions"
+            n5_aud = case_root / "audit.jsonl"
+            cfg_case.mkdir(parents=True, exist_ok=True)
+            n5_bkp.mkdir(parents=True, exist_ok=True)
+
+            st_case = ExperienceStore(db_case)
+            eng_seed = MemoryEngine(store=st_case, backup_dir=bkp_case, n5_journal_dir=n5_j)
+            cap_case = ExperienceCaptureService(memory_engine=eng_seed, enabled=True, auto_capture_enabled=True)
+            aud_l = AuditLogger(log_file=n5_aud)
+            fe_c = FileEditorSkill(
+                authorized_roots=[cfg_case, n5_bkp],
+                backup_dir=n5_bkp,
+                audit_logger=aud_l,
+                backup_manager=BackupManager(audit_logger=aud_l),
+            )
+            orch_c = ChainOrchestrator(file_editor=fe_c, journal_dir=n5_j, memory_capture_service=cap_case)
+
+            ini_p = cfg_case / "GameUserSettings.ini"
+            ini_p.write_text("[ScalabilityGroups]\nsg.ShadowQuality=3\nsg.TextureQuality=3\n", encoding="utf-8")
+            exec_id = f"exec-h03-{idx}"
+            rec_c = orch_c.create_execution(exec_id)
+            snap_c = orch_c.inspect_target_config(ini_p)
+            hw_c = orch_c.detect_hardware_context("GTX 1660 6 GB")
+            recs_c = orch_c.investigate_optimizations(
+                execution_id=rec_c.execution_id,
+                user_goal="GTX 1660 6 GB",
+                application_name=f"H03Game{idx}",
+                config_snapshot=snap_c,
+                hardware_context=hw_c,
+            )
+            pl = orch_c.build_and_validate_plan(
+                execution_id=rec_c.execution_id,
+                user_goal="GTX 1660 6 GB",
+                application_name=f"H03Game{idx}",
+                config_snapshot=snap_c,
+                hardware_context=hw_c,
+                recommendations=recs_c,
+            )
+            sim_c = orch_c.simulate_plan(pl)
+            tok = orch_c.authorize_plan_interactively(
+                pl,
+                approval_hash=sim_c["approval_hash"],
+                selected_operation_ids=None,
+                input_fn=lambda _: "sí",
+            )
+            orch_c.execute_approved_plan(
+                pl,
+                approval_hash=sim_c["approval_hash"],
+                user_approved=True,
+                authorization_token=tok,
+            )
+            seeded_mems = st_case.list_memories(status=MemoryStatus.ACTIVE)
+            self.assertGreaterEqual(len(seeded_mems), 1)
+            mem_id = seeded_mems[0].memory_id
+
+            # Ejecutamos rollback desconectado de N8 para simular reinicio pendiente de reconciliación.
+            orch_rb = ChainOrchestrator(file_editor=fe_c, journal_dir=n5_j)
+            orch_rb.rehydrate_execution(exec_id)
+            orch_rb.rollback_execution(exec_id)
+            self.assertEqual(st_case.get_memory(mem_id).status, MemoryStatus.ACTIVE)
+
+            # Motor recién abierto tras reinicio: probamos primero fail-closed del proveedor.
+            eng_fail = MemoryEngine(
+                store=ExperienceStore(db_case),
+                backup_dir=bkp_case,
+                n5_rollback_execution_provider=lambda: (_ for _ in ()).throw(RuntimeError("journal_down")),
+            )
+            with self.assertRaises(MemoryPersistenceError):
+                if api_name == "get_revisions":
+                    eng_fail.get_revisions(mem_id)
+                elif api_name == "get_stats":
+                    eng_fail.get_stats()
+                elif api_name == "create_backup":
+                    eng_fail.create_backup()
+                elif api_name == "preview_preferences_import":
+                    eng_fail.preview_preferences_import(legacy_prefs)
+                elif api_name == "commit_preferences_import":
+                    eng_fail.commit_preferences_import(legacy_prefs, confirmed=True)
+
+            # Ahora probamos con el proveedor real ANTES de cualquier retrieve() y contamos escaneos.
+            eng_live = MemoryEngine(store=ExperienceStore(db_case), backup_dir=bkp_case, n5_journal_dir=n5_j)
+            scan_counter = {"n": 0}
+            orig_provider = eng_live._default_n5_rollback_provider
+
+            def _counted_provider():
+                scan_counter["n"] += 1
+                return orig_provider()
+
+            eng_live.set_n5_rollback_execution_provider(_counted_provider)
+
+            if api_name == "get_revisions":
+                eng_live.get_revisions(mem_id)
+            elif api_name == "get_stats":
+                stats = eng_live.get_stats()
+                self.assertEqual(stats.active_memories, 0)
+                self.assertGreaterEqual(stats.revoked_memories, 1)
+            elif api_name == "create_backup":
+                bkp_info = eng_live.create_backup()
+                with sqlite3.connect(bkp_info.backup_path) as bkp_conn:
+                    st_in_bkp = bkp_conn.execute(
+                        "SELECT status FROM memories WHERE memory_id = ?", (mem_id,)
+                    ).fetchone()[0]
+                self.assertEqual(st_in_bkp, MemoryStatus.REVOKED.value)
+            elif api_name == "preview_preferences_import":
+                prev = eng_live.preview_preferences_import(legacy_prefs)
+                self.assertTrue(prev.valid)
+            elif api_name == "commit_preferences_import":
+                imp = eng_live.commit_preferences_import(legacy_prefs, confirmed=True)
+                self.assertEqual(imp.imported_count, 1)
+
+            # La reconciliación ocurrió primero y sin escaneos duplicados en la misma operación.
+            self.assertEqual(scan_counter["n"], 1, f"Escaneos inesperados en {api_name}: {scan_counter['n']}")
+            self.assertEqual(ExperienceStore(db_case).get_memory(mem_id).status, MemoryStatus.REVOKED)
+
+    def test_h04_reloaded_plan_preserves_n8_exposure_after_revoke_and_isolates_exceptions(self) -> None:
+        """
+        Plan creado con recuerdo canario -> persistido -> recuerdo revocado -> proceso reiniciado
+        (incluso sin MemoryEngine o en --sin-historial) -> plan recargado -> subtarea lanza excepción
+        con canario -> cero apariciones del canario en .goal.json ni .wal.jsonl.
+        """
+        canary = "N8_CANARY_F01_7F29A1"
+        mem_id = self._seed_memory(
+            title="Configuracion historica H04",
+            content=f"Ajuste histórico {canary} para pruebas de recarga.",
+            scope_type=MemoryScopeType.APP_OR_GAME,
+            scope_key="valorant",
+            tags=("valorant", "optimizar"),
+            importance=95,
+        )
+
+        def _failing_with_canary(**_kw) -> str:
+            raise RuntimeError(f"Excepción de subtarea filtrando {canary} tras reinicio")
+
+        sm = _build_isolated_skill_manager(
+            self.export_dir,
+            extra={"canary_boom": _SimpleSkill("canary_boom", _failing_with_canary)},
+        )
+        ai_tasks = json.dumps(
+            [
+                {
+                    "task_id": "t_boom_raw",
+                    "title": f"Subtarea con {canary}",
+                    "description": f"Descripción con {canary}",
+                    "skill_name": "canary_boom",
+                    "skill_params": {},
+                    "depends_on": [],
+                    "expected_output": "Diagnóstico",
+                    "max_retries": 1,
+                }
+            ],
+            ensure_ascii=False,
+        )
+        fake_llm = _RecordingBrainRaw(
+            responses=[
+                json.dumps({"interpreted_summary": f"Diagnóstico IA {canary}"}),
+                ai_tasks,
+            ]
+        )
+        ge_initial = GoalEngine(
+            skill_manager=sm,
+            goal_store=self.goal_store,
+            brain_manager=fake_llm,
+            memory_engine=self.engine,
+            use_ai=True,
+        )
+        sub = ge_initial.submit_goal(
+            "Diagnosticar rendimiento de Valorant",
+            context=GoalContext(target_app="Valorant"),
+        )
+        assert sub.plan is not None
+        plan_id = sub.plan.plan_id
+        self.assertTrue(sub.plan.n8_context_exposed)
+
+        # Revocamos el recuerdo ANTES del reinicio.
+        self.engine.revoke_memory(mem_id, reason="Revocación previa a reinicio H-04")
+
+        # Simulamos reinicio completo: nuevo GoalStore y nuevo GoalEngine SIN MemoryEngine conectado.
+        restarted_store = GoalStore(store_dir=self.goal_store.store_dir)
+        reloaded_plan = restarted_store.load_plan(plan_id)
+        self.assertTrue(reloaded_plan.n8_context_exposed)
+
+        ge_restarted = GoalEngine(
+            skill_manager=sm,
+            goal_store=restarted_store,
+            memory_engine=None,
+            allow_history_in_private_fn=lambda: False,
+            use_ai=False,
+        )
+        exec_res = ge_restarted.execute_plan(
+            reloaded_plan,
+            approval_callback=lambda _pl, _tasks: True,
+            enable_replan=False,
+        )
+        self.assertEqual(exec_res.final_status, GoalStatus.FAILED)
+
+        snap_raw = (self.goal_store.plans_dir / f"{plan_id}.goal.json").read_text(encoding="utf-8")
+        wal_raw = (self.goal_store.wal_dir / f"{plan_id}.wal.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(canary, snap_raw)
+        self.assertNotIn(canary, wal_raw)
+
+    def test_h05_multistage_synthesis_with_gpu_hardware_never_persists_n8_canary(self) -> None:
+        """
+        Síntesis multi-etapa (t1 -> t2) con target_app='Valorant' y telemetría GPU no vacía:
+        el sobre mezclado jamás se etiqueta como N7 puro ni persiste canarios N8 en observations,
+        untrusted_envelope, output_summary, metadata, snapshots o WAL.
+        """
+        canary = "N8_CANARY_F01_7F29A1"
+        self._seed_memory(
+            title="Perfil termico Valorant",
+            content=f"Referencia histórica {canary} bajo carga GPU.",
+            summary=f"Resumen histórico {canary} para Valorant.",
+            scope_type=MemoryScopeType.APP_OR_GAME,
+            scope_key="valorant",
+            tags=("valorant", "gpu"),
+            importance=96,
+        )
+
+        sm = _build_isolated_skill_manager(self.export_dir)
+        ge = GoalEngine(
+            skill_manager=sm,
+            goal_store=self.goal_store,
+            memory_engine=self.engine,
+            use_ai=False,
+        )
+        t1 = GoalTask(
+            task_id="t1",
+            title="Síntesis etapa 1",
+            description="Consolidar telemetría inicial",
+            skill_name=None,
+            depends_on=[],
+        )
+        t2 = GoalTask(
+            task_id="t2",
+            title="Síntesis etapa 2",
+            description="Consolidar conclusión final",
+            skill_name=None,
+            depends_on=["t1"],
+        )
+        plan = ge.create_goal_and_plan(
+            "Analizar telemetría térmica de Valorant",
+            context=GoalContext(
+                target_app="Valorant",
+                hardware={"gpu": "NVIDIA GeForce GTX 1660 6GB", "vram_mb": 6144},
+            ),
+            custom_tasks=[t1, t2],
+        )
+        # Inyectamos consulta N8 previa a ejecución para que t1 reciba recuerdos + hardware GPU
+        # y propague su salida a t2.
+        ge._consult_n8_before_planning(plan.goal, stage="planning")
+        ge.memory_bridge.bind_plan(plan.goal.goal_id, plan.plan_id)
+
+        res = ge.execute_plan(plan)
+        self.assertEqual(res.final_status, GoalStatus.COMPLETED)
+
+        snap_text = (self.goal_store.plans_dir / f"{plan.plan_id}.goal.json").read_text(encoding="utf-8")
+        wal_text = (self.goal_store.wal_dir / f"{plan.plan_id}.wal.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(canary, snap_text)
+        self.assertNotIn(canary, wal_text)
+
+    def test_h06_cancellation_reason_replan_after_revoke_and_ephemeral_wal_sanitization(self) -> None:
+        """
+        Verifica saneamiento de goal.cancellation_reason, preservación de frontera N8 durante
+        replanificación tras revocar el recuerdo original, y paridad entre GoalStore y EphemeralGoalStore.
+        """
+        from src.brain.goal_persistence import EphemeralGoalStore
+        from src.brain.goal_supervisor import ExecutionSupervisor
+
+        canary = "N8_CANARY_F01_7F29A1"
+        mem_id = self._seed_memory(
+            title="Regla H06 Valorant",
+            content=f"Preferencia {canary} en Valorant.",
+            scope_type=MemoryScopeType.APP_OR_GAME,
+            scope_key="valorant",
+            tags=("valorant",),
+            importance=95,
+        )
+
+        # 1) Cancelación con razón contaminada en GoalStore persistente y recarga posterior.
+        sm = _build_isolated_skill_manager(
+            self.export_dir,
+            extra={
+                "web_search": _SimpleSkill(
+                    "web_search",
+                    lambda **_k: (_ for _ in ()).throw(RuntimeError(f"Fallo previo a replan {canary}")),
+                    parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+                ),
+            },
+        )
+        ge = GoalEngine(
+            skill_manager=sm,
+            goal_store=self.goal_store,
+            memory_engine=self.engine,
+            use_ai=False,
+        )
+        sub_cancel = ge.submit_goal(
+            "Diagnosticar configuración de Valorant",
+            context=GoalContext(target_app="Valorant"),
+        )
+        assert sub_cancel.plan is not None
+        cancelled = ge.cancel_active_goal(reason=f"Cancelado por conflicto con {canary}")
+        assert cancelled is not None
+        # Forzamos también evento WAL contaminado directo y error en WAL persistente.
+        self.goal_store.append_wal_event(
+            cancelled.plan_id,
+            "task_failed",
+            {"task_id": "t1", "error": f"Error WAL directo {canary}", "reason": f"Motivo {canary}"},
+            n8_context_exposed=True,
+        )
+        snap_cancel = (self.goal_store.plans_dir / f"{cancelled.plan_id}.goal.json").read_text(encoding="utf-8")
+        wal_cancel = (self.goal_store.wal_dir / f"{cancelled.plan_id}.wal.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(canary, snap_cancel)
+        self.assertNotIn(canary, wal_cancel)
+        reloaded_cancel = self.goal_store.load_plan(cancelled.plan_id)
+        self.assertNotIn(canary, reloaded_cancel.goal.cancellation_reason or "")
+
+        # 2) WAL efímero y cancelación en EphemeralGoalStore aplican exactamente la misma política.
+        eph_store = EphemeralGoalStore()
+        eph_plan = GoalPlan(
+            plan_id="plan_eph_h06",
+            goal=cancelled.goal,
+            tasks=[
+                GoalTask(
+                    task_id="t1",
+                    title="Tarea efímera",
+                    description="Lectura segura",
+                    skill_name="system_info",
+                )
+            ],
+        )
+        eph_plan.n8_context_exposed = True
+        eph_store.save_plan(eph_plan)
+        eph_store.append_wal_event(
+            eph_plan.plan_id,
+            "task_failed",
+            {"task_id": "t1", "error": f"Fuga WAL efímero {canary}", "notes": canary},
+            n8_context_exposed=True,
+        )
+        eph_dump = json.dumps(
+            {"plans": eph_store._plans, "wal": eph_store.read_wal_events(eph_plan.plan_id)},
+            ensure_ascii=False,
+        )
+        self.assertNotIn(canary, eph_dump)
+
+        # 3) Replanificación DESPUÉS de revocar el recuerdo original: replan_saw_n8 sigue activo.
+        t_fail = GoalTask(
+            task_id="t1",
+            title="Paso inicial",
+            description="Paso que fallará",
+            skill_name="web_search",
+            skill_params={"query": "valorant"},
+            risk_category=TaskRiskCategory.LOW_RISK_EXECUTION,
+            max_retries=0,
+        )
+        plan_replan = ge.create_goal_and_plan(
+            "Diagnosticar rendimiento de Valorant",
+            context=GoalContext(target_app="Valorant"),
+            custom_tasks=[t_fail],
+        )
+        ge._consult_n8_before_planning(plan_replan.goal, stage="planning")
+        plan_replan.n8_context_exposed = True
+        ge.memory_bridge.bind_plan(plan_replan.goal.goal_id, plan_replan.plan_id)
+        self.goal_store.save_plan(plan_replan)
+
+        # Revocamos el recuerdo antes de ejecutar y replanificar.
+        self.engine.revoke_memory(mem_id, reason="Revocar antes de replan H-06")
+
+        def _contaminated_replan_factory(_pl, _ft, **_kw):
+            return [
+                GoalTask(
+                    task_id=f"replan_{canary.lower()}",
+                    title=f"Replan contaminado {canary}",
+                    description=f"Detalle {canary}",
+                    skill_name="system_info",
+                    risk_category=TaskRiskCategory.LOW_RISK_EXECUTION,
+                    expected_output=f"Salida {canary}",
+                    metadata={"evil_replan_meta": canary, "proposed_by_ai": True},
+                )
+            ]
+
+        ge.supervisor.replan_factory = _contaminated_replan_factory
+        res_rp = ge.execute_plan(
+            plan_replan,
+            enable_replan=True,
+        )
+        self.assertEqual(res_rp.replan_count, 1)
+        self.assertEqual([t.task_id for t in plan_replan.tasks if t.replan_generation > 0], ["t_r1_1"])
+        self.assertEqual(plan_replan.get_task("t_r1_1").status, TaskStatus.COMPLETED)
+        snap_rp = (self.goal_store.plans_dir / f"{plan_replan.plan_id}.goal.json").read_text(encoding="utf-8")
+        wal_rp = (self.goal_store.wal_dir / f"{plan_replan.plan_id}.wal.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(canary, snap_rp)
+        self.assertNotIn(canary, wal_rp)
+        self.assertNotIn(canary.lower(), snap_rp)
+        self.assertNotIn(canary.lower(), wal_rp)
+
+    def test_h07_private_mode_sequence_never_creates_sqlite_and_voice_wires_provider(self) -> None:
+        """
+        Ejecuta la secuencia obligatoria de 10 pasos sobre instalación limpia sin experiences.db
+        con N8_AUTO_CAPTURE_ENABLED=True, comprobando cero creación de DB durante modo privado,
+        funcionamiento normal tras salir de privado, reutilización de instancia y modo voz con dobles.
+        """
+        import main as jarvis_main
+
+        clean_root = self.work_dir / "h07_clean_install"
+        clean_root.mkdir(parents=True, exist_ok=True)
+        expected_db = clean_root / "experiences.db"
+        conv_file = clean_root / "conv_memory.json"
+
+        conv_mem = ConversationMemory(max_turns=6, storage_file=conv_file, auto_save=True)
+        sm = _build_isolated_skill_manager(clean_root / "exports")
+        ollama_double = OllamaBrain()
+        ollama_double.client = MagicMock()
+        ollama_double.client.chat.return_value = iter([{"message": {"content": "Respuesta local OK."}}])
+
+        bm = BrainManager(
+            initial_mode="OLLAMA",
+            ollama_brain=ollama_double,
+            skill_manager=sm,
+            memory=conv_mem,
+            lazy_init=True,
+        )
+
+        # Pasos 1 a 9: ninguno de los comandos privados/bloqueados puede crear experiences.db.
+        private_commands = [
+            "/privado --sin-historial",
+            "/goal diagnosticar uso actual de cpu y memoria ram",
+            "/plan ejecutar",
+            "/memoria purgar mem_inexistente",
+            "/memoria backup",
+            "/memoria restaurar",
+            "/memoria buscar optimizacion",
+            "/memoria listar",
+            "/privado off",
+            "salir",
+        ]
+        console_outputs: list[str] = []
+        cmds_iter = iter(private_commands)
+
+        with patch.dict(os.environ, {"JARVIS_ENV": "test", "JARVIS_TEST_TEMP_ROOT": str(clean_root)}):
+            with patch.object(settings, "EXPERIENCES_DB_PATH", expected_db), patch.object(
+                settings, "N8_ENABLED", True
+            ), patch.object(settings, "N8_AUTO_CAPTURE_ENABLED", True):
+                jarvis_main.run_console_session(
+                    bm,
+                    enable_tts=False,
+                    input_fn=lambda _: next(cmds_iter),
+                    output_fn=console_outputs.append,
+                )
+                self.assertFalse(
+                    expected_db.exists(),
+                    f"experiences.db se creó indebidamente durante comandos privados: {console_outputs}",
+                )
+                self.assertIsNone(bm.memory_engine)
+                joined_priv_out = "\n".join(console_outputs)
+                self.assertIn("--sin-historial", joined_priv_out)
+                if conv_file.exists():
+                    self.assertNotIn("diagnosticar uso actual", conv_file.read_text(encoding="utf-8"))
+
+                # Paso 10: fuera de modo privado, una operación legítima de N8 inicializa la DB,
+                # reutiliza una única instancia de MemoryEngine y conecta el proveedor N5.
+                legit_cmds = iter(
+                    [
+                        "/goal diagnosticar uso actual de cpu y memoria ram",
+                        "/plan ejecutar",
+                        "/memoria listar",
+                        "salir",
+                    ]
+                )
+                post_outputs: list[str] = []
+                jarvis_main.run_console_session(
+                    bm,
+                    enable_tts=False,
+                    input_fn=lambda _: next(legit_cmds),
+                    output_fn=post_outputs.append,
+                )
+                self.assertTrue(expected_db.exists())
+                self.assertIsNotNone(bm.memory_engine)
+                self.assertTrue(bm.memory_engine.has_n5_rollback_provider)
+                engine_first_ref = bm.memory_engine
+
+                # Segunda sesión de consola y sesión de voz con dobles reutilizan la misma instancia.
+                reuse_cmds = iter(["/memoria listar", "salir"])
+                jarvis_main.run_console_session(
+                    bm,
+                    enable_tts=False,
+                    input_fn=lambda _: next(reuse_cmds),
+                    output_fn=lambda _: None,
+                )
+                self.assertIs(bm.memory_engine, engine_first_ref)
+
+                # Verificación en modo voz con dobles sin hardware físico.
+                bm_voice = BrainManager(
+                    initial_mode="OLLAMA",
+                    ollama_brain=ollama_double,
+                    skill_manager=sm,
+                    memory=ConversationMemory(max_turns=4, storage_file=None, auto_save=False),
+                    lazy_init=True,
+                )
+                fake_wake = MagicMock()
+                fake_wake.listen_for_wake_word.side_effect = [True]
+                fake_rec = MagicMock()
+                fake_rec.record_command.return_value = None
+                fake_stt = MagicMock()
+                fake_tts = MagicMock()
+                fake_tts.is_speaking = False
+                fake_tray = MagicMock()
+                fake_tray.is_exit_requested = False
+
+                def _stop_after_one_session(*_a, **_kw):
+                    fake_tray.is_exit_requested = True
+                    from src.session import SessionEnd
+
+                    return SessionEnd.EXIT
+
+                with patch("src.audio.wake_word.WakeWordDetector", return_value=fake_wake), patch(
+                    "src.audio.recorder.AudioRecorder", return_value=fake_rec
+                ), patch("src.audio.stt.SpeechToText", return_value=fake_stt), patch(
+                    "src.audio.tts.TextToSpeech", return_value=fake_tts
+                ), patch("src.ui.tray.JarvisTray", return_value=fake_tray), patch(
+                    "main.ActiveSession.run", side_effect=_stop_after_one_session
+                ):
+                    jarvis_main.run_voice_session(bm_voice)
+
+                self.assertIsNotNone(bm_voice.memory_engine)
+                self.assertTrue(bm_voice.memory_engine.has_n5_rollback_provider)
+
 
 if __name__ == "__main__":
     unittest.main()

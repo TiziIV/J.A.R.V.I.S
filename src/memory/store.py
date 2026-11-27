@@ -1383,8 +1383,120 @@ class ExperienceStore:
                     return True
             return False
 
+    @staticmethod
+    def _has_operation_rollback_audit_tx(
+        conn: sqlite3.Connection, execution_id: str, operation_id: str
+    ) -> bool:
+        """Comprueba si una operación individual `(execution_id, operation_id)` tiene marca de rollback."""
+        try:
+            hit = conn.execute(
+                """
+                SELECT 1 FROM memory_audit
+                WHERE action = 'REVOKE'
+                  AND json_valid(details_json) = 1
+                  AND json_extract(details_json, '$.source_execution_id') = ?
+                  AND (
+                      json_extract(details_json, '$.invalidation_kind')
+                          IN ('rollback_execution', 'rollback_execution_tombstone')
+                      OR (
+                          json_extract(details_json, '$.source_task_id') = ?
+                          AND json_extract(details_json, '$.invalidation_kind')
+                              IN ('rollback_operation', 'rollback_operation_tombstone')
+                      )
+                  )
+                LIMIT 1
+                """,
+                (execution_id, operation_id),
+            ).fetchone()
+            return hit is not None
+        except sqlite3.OperationalError:
+            cursor = conn.execute(
+                "SELECT details_json FROM memory_audit WHERE action = 'REVOKE' ORDER BY created_at DESC"
+            )
+            for row in cursor:
+                try:
+                    parsed = json.loads(str(row["details_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict) or parsed.get("source_execution_id") != execution_id:
+                    continue
+                kind = parsed.get("invalidation_kind")
+                if kind in {"rollback_execution", "rollback_execution_tombstone"}:
+                    return True
+                if parsed.get("source_task_id") == operation_id and kind in {
+                    "rollback_operation",
+                    "rollback_operation_tombstone",
+                }:
+                    return True
+            return False
+
+    @staticmethod
+    def _is_exec_fully_invalidated_tx(conn: sqlite3.Connection, execution_id: str) -> bool:
+        """
+        Verifica dentro de una conexión abierta que no queden recuerdos ACTIVE de `execution_id`
+        y que exista evidencia durable de revocación o tombstone de ejecución completa.
+        """
+        active_row = conn.execute(
+            """
+            SELECT 1 FROM memories
+            WHERE source = 'EXECUTION_VERIFIED'
+              AND source_execution_id = ?
+              AND status = 'ACTIVE'
+            LIMIT 1
+            """,
+            (execution_id,),
+        ).fetchone()
+        if active_row is not None:
+            return False
+        if ExperienceStore._has_rollback_audit_tx(conn, execution_id):
+            return True
+        revoked_row = conn.execute(
+            """
+            SELECT 1 FROM memories
+            WHERE source = 'EXECUTION_VERIFIED'
+              AND source_execution_id = ?
+              AND status = 'REVOKED'
+            LIMIT 1
+            """,
+            (execution_id,),
+        ).fetchone()
+        return revoked_row is not None
+
+    @staticmethod
+    def _is_exec_op_invalidated_tx(
+        conn: sqlite3.Connection, execution_id: str, operation_id: str
+    ) -> bool:
+        """Verifica en conexión abierta que `(execution_id, operation_id)` esté revertida y sin ACTIVE."""
+        active_row = conn.execute(
+            """
+            SELECT 1 FROM memories
+            WHERE source = 'EXECUTION_VERIFIED'
+              AND source_execution_id = ?
+              AND COALESCE(source_task_id, '') = ?
+              AND status = 'ACTIVE'
+            LIMIT 1
+            """,
+            (execution_id, operation_id),
+        ).fetchone()
+        if active_row is not None:
+            return False
+        if ExperienceStore._has_operation_rollback_audit_tx(conn, execution_id, operation_id):
+            return True
+        revoked_row = conn.execute(
+            """
+            SELECT 1 FROM memories
+            WHERE source = 'EXECUTION_VERIFIED'
+              AND source_execution_id = ?
+              AND COALESCE(source_task_id, '') = ?
+              AND status = 'REVOKED'
+            LIMIT 1
+            """,
+            (execution_id, operation_id),
+        ).fetchone()
+        return revoked_row is not None
+
     def is_execution_invalidated(self, execution_id: str) -> bool:
-        """Indica si `execution_id` figura revertida por rollback en memoria persistente."""
+        """Indica si `execution_id` completa figura revertida por rollback y sin recuerdos ACTIVE."""
         self.policy.assert_enabled()
         if not isinstance(execution_id, str) or not execution_id.strip():
             raise MemoryValidationError("execution_id no puede estar vacío.")
@@ -1398,19 +1510,329 @@ class ExperienceStore:
         with self.acquire_lock():
             with self._open_connection() as conn:
                 self._ensure_ready(conn)
+                return self._is_exec_fully_invalidated_tx(conn, clean_exec_id)
+
+    def is_execution_operation_invalidated(self, execution_id: str, operation_id: str) -> bool:
+        """Indica si una operación específica `(execution_id, operation_id)` fue revertida."""
+        self.policy.assert_enabled()
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise MemoryValidationError("execution_id no puede estar vacío.")
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise MemoryValidationError("operation_id no puede estar vacío.")
+        clean_exec_id = sanitize_memory_text(
+            execution_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="execution_id",
+            check_secrets=True,
+        )
+        clean_op_id = sanitize_memory_text(
+            operation_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="operation_id",
+            check_secrets=True,
+        )
+        with self.acquire_lock():
+            with self._open_connection() as conn:
+                self._ensure_ready(conn)
+                return self._is_exec_op_invalidated_tx(conn, clean_exec_id, clean_op_id)
+
+    def invalidate_by_execution_operations(
+        self,
+        execution_id: str,
+        operation_ids: Sequence[str],
+        *,
+        reason: str = "rollback_partial_operations",
+        actor: str = "system",
+        private_mode: bool = False,
+    ) -> ExecutionInvalidationResult:
+        """
+        Revoca de forma granular e idempotente únicamente los recuerdos `EXECUTION_VERIFIED`
+        cuyo `(source_execution_id, source_task_id)` coincide con operaciones revertidas,
+        registrando tombstones por operación sin invalidar operaciones no revertidas (H-01).
+        """
+        self.policy.assert_write_allowed(private_mode=private_mode)
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise MemoryValidationError("execution_id no puede estar vacío.")
+        clean_exec_id = sanitize_memory_text(
+            execution_id,
+            max_chars=128,
+            allow_newlines=False,
+            field_name="execution_id",
+            check_secrets=True,
+        )
+        clean_ops: list[str] = []
+        seen_ops: set[str] = set()
+        for raw_op in operation_ids:
+            if not isinstance(raw_op, str) or not raw_op.strip():
+                continue
+            c_op = sanitize_memory_text(
+                raw_op,
+                max_chars=128,
+                allow_newlines=False,
+                field_name="operation_id",
+                check_secrets=True,
+            )
+            if c_op and c_op not in seen_ops:
+                seen_ops.add(c_op)
+                clean_ops.append(c_op)
+
+        clean_reason = sanitize_memory_text(
+            reason,
+            max_chars=240,
+            allow_newlines=False,
+            field_name="reason",
+            check_secrets=True,
+        )
+        clean_actor = sanitize_memory_text(
+            actor,
+            max_chars=64,
+            allow_newlines=False,
+            field_name="actor",
+            check_secrets=True,
+        )
+
+        if not clean_ops:
+            return ExecutionInvalidationResult(
+                execution_id=clean_exec_id,
+                invalidated_count=0,
+                invalidated_memory_ids=(),
+                already_inactive_count=0,
+                store_version_token=self.get_store_version_token(),
+                reason=clean_reason,
+            )
+
+        placeholders = ", ".join("?" for _ in clean_ops)
+        with self.acquire_lock():
+            with self._open_connection(enable_wal=True) as conn:
+                fts_active = self._ensure_ready(conn)
+                now = utc_now_iso()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    active_rows = conn.execute(
+                        f"""
+                        SELECT memory_id, COALESCE(source_task_id, '') AS task_id
+                        FROM memories
+                        WHERE source = 'EXECUTION_VERIFIED'
+                          AND source_execution_id = ?
+                          AND COALESCE(source_task_id, '') IN ({placeholders})
+                          AND status = 'ACTIVE'
+                        ORDER BY created_at ASC, memory_id ASC
+                        """,
+                        (clean_exec_id, *clean_ops),
+                    ).fetchall()
+                    already_row = conn.execute(
+                        f"""
+                        SELECT COUNT(*) FROM memories
+                        WHERE source = 'EXECUTION_VERIFIED'
+                          AND source_execution_id = ?
+                          AND COALESCE(source_task_id, '') IN ({placeholders})
+                          AND status != 'ACTIVE'
+                        """,
+                        (clean_exec_id, *clean_ops),
+                    ).fetchone()
+                    already_inactive = int(already_row[0]) if already_row else 0
+
+                    invalidated_ids: list[str] = []
+                    revoked_task_ids: set[str] = set()
+                    if active_rows:
+                        new_token = bump_store_version_token_tx(conn, now=now)
+                        for row in active_rows:
+                            mem_id = str(row["memory_id"])
+                            op_tid = str(row["task_id"])
+                            revoked_task_ids.add(op_tid)
+                            conn.execute(
+                                """
+                                UPDATE memories
+                                SET status = 'REVOKED',
+                                    updated_at = ?,
+                                    revoked_at = ?
+                                WHERE memory_id = ?
+                                """,
+                                (now, now, mem_id),
+                            )
+                            if fts_active:
+                                conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (mem_id,))
+                            self._insert_audit_tx(
+                                conn,
+                                action=MemoryAuditAction.REVOKE,
+                                memory_id=mem_id,
+                                actor=clean_actor,
+                                reason=clean_reason,
+                                details={
+                                    "from_status": MemoryStatus.ACTIVE.value,
+                                    "to_status": MemoryStatus.REVOKED.value,
+                                    "source_execution_id": clean_exec_id,
+                                    "source_task_id": op_tid,
+                                    "invalidation_kind": "rollback_operation",
+                                    "store_version_token": new_token,
+                                },
+                                created_at=now,
+                            )
+                            invalidated_ids.append(mem_id)
+                    else:
+                        _, _, new_token = read_store_version_components(conn)
+
+                    for op_tid in clean_ops:
+                        if op_tid in revoked_task_ids:
+                            continue
+                        if not self._is_exec_op_invalidated_tx(conn, clean_exec_id, op_tid):
+                            self._insert_audit_tx(
+                                conn,
+                                action=MemoryAuditAction.REVOKE,
+                                memory_id=None,
+                                actor=clean_actor,
+                                reason=clean_reason,
+                                details={
+                                    "source_execution_id": clean_exec_id,
+                                    "source_task_id": op_tid,
+                                    "invalidation_kind": "rollback_operation_tombstone",
+                                },
+                                created_at=now,
+                            )
+
+                    conn.execute("COMMIT")
+                    return ExecutionInvalidationResult(
+                        execution_id=clean_exec_id,
+                        invalidated_count=len(invalidated_ids),
+                        invalidated_memory_ids=tuple(invalidated_ids),
+                        already_inactive_count=already_inactive,
+                        store_version_token=new_token,
+                        reason=clean_reason,
+                    )
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+    def inspect_unreconciled_n5_rollbacks(
+        self,
+        confirmed_execution_ids: Sequence[str],
+        partial_operations: Sequence[tuple[str, Sequence[str]]] = (),
+    ) -> tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...]]:
+        """
+        Comprueba en una única conexión de lectura qué rollbacks confirmados o parciales aún
+        no tienen revocación/tombstone verificados en SQLite, evitando `BEGIN IMMEDIATE`
+        innecesarios en estado estacionario (Sección 12).
+        """
+        self.policy.assert_enabled()
+        clean_execs = [
+            sanitize_memory_text(
+                eid, max_chars=128, allow_newlines=False, field_name="execution_id", check_secrets=True
+            )
+            for eid in sorted(set(confirmed_execution_ids))
+            if isinstance(eid, str) and eid.strip()
+        ]
+        clean_partials: list[tuple[str, tuple[str, ...]]] = []
+        for raw_exec, raw_ops in partial_operations:
+            if not isinstance(raw_exec, str) or not raw_exec.strip():
+                continue
+            ce = sanitize_memory_text(
+                raw_exec, max_chars=128, allow_newlines=False, field_name="execution_id", check_secrets=True
+            )
+            ops_clean = tuple(
+                sorted(
+                    {
+                        sanitize_memory_text(
+                            op, max_chars=128, allow_newlines=False, field_name="operation_id", check_secrets=True
+                        )
+                        for op in raw_ops
+                        if isinstance(op, str) and op.strip()
+                    }
+                )
+            )
+            if ce and ops_clean:
+                clean_partials.append((ce, ops_clean))
+
+        if not clean_execs and not clean_partials:
+            return "", (), ()
+
+        with self.acquire_lock():
+            with self._open_connection() as conn:
+                self._ensure_ready(conn)
+                _, _, ver_token = read_store_version_components(conn)
+                missing_execs = tuple(
+                    eid for eid in clean_execs if not self._is_exec_fully_invalidated_tx(conn, eid)
+                )
+                missing_partials: list[tuple[str, tuple[str, ...]]] = []
+                for ce, ops_tuple in clean_partials:
+                    pending_ops = tuple(
+                        op_id for op_id in ops_tuple if not self._is_exec_op_invalidated_tx(conn, ce, op_id)
+                    )
+                    if pending_ops:
+                        missing_partials.append((ce, pending_ops))
+                return ver_token, missing_execs, tuple(missing_partials)
+
+    def record_n5_journal_dir_metadata(self, journal_dir: Path | str) -> None:
+        """
+        Registra de forma durable en `store_metadata` el directorio de transacciones N5 asociado
+        a esta base cuando la base ya está inicializada y la escritura está permitida (H-02).
+        """
+        try:
+            st = os.stat(str(self.db_path))
+            if not os.path.isfile(str(self.db_path)) or st.st_size == 0:
+                return
+        except OSError:
+            return
+        norm_dir = str(Path(journal_dir).resolve())
+        with self.acquire_lock():
+            with self._open_connection(enable_wal=True) as conn:
+                self._ensure_ready(conn)
                 row = conn.execute(
-                    """
-                    SELECT 1 FROM memories
-                    WHERE source = 'EXECUTION_VERIFIED'
-                      AND source_execution_id = ?
-                      AND status = 'REVOKED'
-                    LIMIT 1
-                    """,
-                    (clean_exec_id,),
+                    "SELECT value FROM store_metadata WHERE key = 'n5_journal_dirs'"
                 ).fetchone()
-                if row is not None:
-                    return True
-                return self._has_rollback_audit_tx(conn, clean_exec_id)
+                existing: list[str] = []
+                if row and row[0]:
+                    try:
+                        parsed = json.loads(str(row[0]))
+                        if isinstance(parsed, list):
+                            existing = [str(x) for x in parsed if isinstance(x, str) and x.strip()]
+                    except (TypeError, json.JSONDecodeError):
+                        existing = []
+                if norm_dir in existing:
+                    return
+                updated = (existing + [norm_dir])[-16:]
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO store_metadata (key, value)
+                        VALUES ('n5_journal_dirs', ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (canonical_json(updated),),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+    def read_registered_n5_journal_dirs(self) -> tuple[str, ...]:
+        """Lee directorios de journal N5 previamente asociados sin crear ni modificar `experiences.db`."""
+        try:
+            os.stat(str(self.db_path))
+        except FileNotFoundError:
+            return ()
+        except OSError:
+            return ()
+        try:
+            with self.acquire_lock():
+                with self._open_connection() as conn:
+                    if not table_exists(conn, "store_metadata"):
+                        return ()
+                    row = conn.execute(
+                        "SELECT value FROM store_metadata WHERE key = 'n5_journal_dirs'"
+                    ).fetchone()
+                    if not row or not row[0]:
+                        return ()
+                    parsed = json.loads(str(row[0]))
+                    if not isinstance(parsed, list):
+                        return ()
+                    return tuple(str(x) for x in parsed if isinstance(x, str) and x.strip())
+        except Exception:
+            return ()
 
     def mark_execution_rollback_tombstone(
         self,

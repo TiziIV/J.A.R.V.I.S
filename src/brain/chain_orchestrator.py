@@ -38,6 +38,7 @@ from skills.file_editor_skill import (
     _split_line_ending,
     compute_sha256_file,
 )
+from src.brain.exceptions import redact_secrets
 from src.brain.transaction_manager import (
     InvalidTransactionStateError,
     JournalCorruptionError,
@@ -49,6 +50,7 @@ from src.brain.transaction_manager import (
     TransactionRecord,
     TransactionState,
 )
+from src.utils.logger import logger
 
 
 class ChainState(str, Enum):
@@ -1086,10 +1088,29 @@ class ChainOrchestrator:
         # Token opaco, de un solo uso y ligado a la aprobación; la garantía es local al proceso.
         self._approval_tokens: dict[str, dict[str, Any]] = {}
         self._approval_lock = threading.Lock()
+        self.last_n8_reconciliation_errors: dict[str, str] = {}
+        self.n8_reconciliation_pending: bool = False
+        self._bind_n5_journal_to_capture_service()
+
+    def _bind_n5_journal_to_capture_service(self) -> None:
+        """Conecta el directorio real de `TransactionJournal` con el motor N8 si está adjunto (H-02)."""
+        cap = self.memory_capture_service
+        if cap is None:
+            return
+        j_dir = getattr(getattr(self.transaction_manager, "journal", None), "journal_dir", None)
+        if j_dir is None:
+            return
+        if hasattr(cap, "register_n5_journal_dir"):
+            cap.register_n5_journal_dir(j_dir)
+        else:
+            eng = getattr(cap, "memory_engine", None)
+            if eng is not None and hasattr(eng, "register_n5_journal_dir"):
+                eng.register_n5_journal_dir(j_dir, persist_metadata=not getattr(eng, "is_private_mode", False))
 
     def set_memory_capture_service(self, capture_service: Optional[Any]) -> None:
         """Asocia o reemplaza de forma desacoplada el coordinador de captura/invalidación N8."""
         self.memory_capture_service = capture_service
+        self._bind_n5_journal_to_capture_service()
 
     def _purge_approval_tokens_locked(self) -> None:
         """Retira tokens consumidos o vencidos; requiere mantener `_approval_lock`."""
@@ -1146,14 +1167,60 @@ class ChainOrchestrator:
         # Un rollback terminal ya no aparece en `reports` tras el primer reinicio. El journal
         # conserva la fuente durable, así que cada recuperación vuelve a reconciliarlo hasta
         # que N8 confirme el tombstone (la operación es idempotente y privada-safe).
+        self._bind_n5_journal_to_capture_service()
         capture_engine = getattr(self.memory_capture_service, "memory_engine", None)
         if capture_engine is not None:
-            execution_ids = self.transaction_manager.journal.list_confirmed_rollback_execution_ids()
-            outcomes = capture_engine.reconcile_confirmed_n5_rollbacks(execution_ids)
-            failed = {execution_id: outcome for execution_id, outcome in outcomes.items()
-                      if outcome.startswith("pending:")}
-            if failed:
-                logger.warning("Invalidaciones N5/N8 pendientes para reintento: %s", sorted(failed))
+            failed_reconciliations: dict[str, str] = {}
+            try:
+                assessment = self.transaction_manager.journal.assess_reconciliation_state()
+                if hasattr(capture_engine, "reconcile_n5_journal_assessment"):
+                    outcomes = capture_engine.reconcile_n5_journal_assessment(assessment)
+                else:
+                    outcomes = capture_engine.reconcile_confirmed_n5_rollbacks(
+                        assessment.confirmed_rollback_execution_ids
+                    )
+                for key, outcome in outcomes.items():
+                    if outcome.startswith("pending:"):
+                        failed_reconciliations[key] = redact_secrets(outcome)
+            except Exception as exc:
+                err_txt = redact_secrets(str(exc)) or type(exc).__name__
+                failed_reconciliations["__journal__"] = f"pending:{type(exc).__name__}:{err_txt}"
+
+            if failed_reconciliations:
+                self.last_n8_reconciliation_errors = dict(failed_reconciliations)
+                self.n8_reconciliation_pending = True
+                logger.warning(
+                    "Invalidaciones N5/N8 pendientes para reintento (%s): %s",
+                    sorted(failed_reconciliations.keys()),
+                    failed_reconciliations,
+                )
+                rep_by_exec = {rep.execution_id: rep for rep in reports if rep.execution_id}
+                for key, detail in sorted(failed_reconciliations.items()):
+                    base_exec_id = key.split("#", 1)[0]
+                    note = f"N8_RECONCILIATION_PENDING: {detail}"
+                    if base_exec_id in rep_by_exec:
+                        target_rep = rep_by_exec[base_exec_id]
+                        target_rep.n8_reconciled = False
+                        target_rep.n8_reconciliation_error = detail
+                        if note not in target_rep.blocked_reasons:
+                            target_rep.blocked_reasons.append(note)
+                    else:
+                        reports.append(
+                            RecoveryReport(
+                                transaction_id=f"n8_reconcile:{base_exec_id}",
+                                execution_id=base_exec_id,
+                                plan_id="unknown",
+                                initial_state=TransactionState.ROLLED_BACK.value,
+                                final_state=TransactionState.ROLLED_BACK.value,
+                                decision="N8_RECONCILIATION_PENDING",
+                                blocked_reasons=[note],
+                                n8_reconciled=False,
+                                n8_reconciliation_error=detail,
+                            )
+                        )
+            else:
+                self.last_n8_reconciliation_errors = {}
+                self.n8_reconciliation_pending = False
         return reports
 
     def rehydrate_execution(self, execution_id: str) -> Optional[ChainExecutionRecord]:

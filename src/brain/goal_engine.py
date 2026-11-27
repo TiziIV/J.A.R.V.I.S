@@ -451,7 +451,12 @@ class GoalEngine:
             wal_payload: dict[str, Any] = {"goal_id": goal.goal_id}
             if goal.context.extra.get("n8_query_id"):
                 wal_payload["n8_query_id"] = goal.context.extra["n8_query_id"]
-            store.append_wal_event(plan.plan_id, "plan_created", wal_payload)
+            store.append_wal_event(
+                plan.plan_id,
+                "plan_created",
+                wal_payload,
+                n8_context_exposed=bool(plan.n8_context_exposed or plan.infer_n8_exposure()),
+            )
         return GoalSubmissionResult(goal=goal, plan=plan, needs_clarification=False)
 
     def create_goal_and_plan(
@@ -493,7 +498,12 @@ class GoalEngine:
             wal_payload: dict[str, Any] = {"goal_id": goal.goal_id}
             if goal.context.extra.get("n8_query_id"):
                 wal_payload["n8_query_id"] = goal.context.extra["n8_query_id"]
-            store.append_wal_event(plan.plan_id, "plan_created", wal_payload)
+            store.append_wal_event(
+                plan.plan_id,
+                "plan_created",
+                wal_payload,
+                n8_context_exposed=bool(plan.n8_context_exposed or plan.infer_n8_exposure()),
+            )
         return plan
 
     def clarify_pending_goal(
@@ -558,7 +568,12 @@ class GoalEngine:
             wal_payload: dict[str, Any] = {"goal_id": refined_goal.goal_id}
             if refined_goal.context.extra.get("n8_query_id"):
                 wal_payload["n8_query_id"] = refined_goal.context.extra["n8_query_id"]
-            store.append_wal_event(plan.plan_id, "plan_created_after_clarification", wal_payload)
+            store.append_wal_event(
+                plan.plan_id,
+                "plan_created_after_clarification",
+                wal_payload,
+                n8_context_exposed=bool(plan.n8_context_exposed or plan.infer_n8_exposure()),
+            )
         return GoalSubmissionResult(goal=refined_goal, plan=plan, needs_clarification=False)
 
     def get_active_plan(self, *, restore_from_disk: bool = True) -> Optional[GoalPlan]:
@@ -605,6 +620,7 @@ class GoalEngine:
                     "n8_query_id": target_plan.goal.context.extra.get("n8_query_id"),
                     "n8_ref_count": len(target_plan.goal.context.extra.get("n8_memory_refs") or []),
                 },
+                n8_context_exposed=bool(target_plan.n8_context_exposed or target_plan.infer_n8_exposure()),
             )
         if execute:
             return self.supervisor.execute_plan(

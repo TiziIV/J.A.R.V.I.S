@@ -887,14 +887,24 @@ class MemorySnapshotGuard:
         revalidations_used = 0
         refreshes_used = 0
 
-        # Caso A: token coincidente -> comprobamos referencias individuales y re-chequeamos token tras leerlas.
+        # Caso A: token coincidente -> comprobamos referencias individuales (sin re-escanear el
+        # journal N5 por cada recuerdo individual, ya reconciliado en `live_token`) y ejecutamos
+        # el post-check completo fuera del ámbito para detectar cualquier cambio concurrente.
         if live_token == snapshot.store_version_token:
-            valid_refs, valid_items, excluded, leak_needles, _sup = self._resolve_references_once(
-                references=snapshot.references,
-                existing_items_by_id=items_by_id,
-                engine=engine,
-                now_utc=now_utc,
+            from contextlib import nullcontext
+
+            rec_ctx = (
+                engine.reconciliation_scope()
+                if hasattr(engine, "reconciliation_scope")
+                else nullcontext()
             )
+            with rec_ctx:
+                valid_refs, valid_items, excluded, leak_needles, _sup = self._resolve_references_once(
+                    references=snapshot.references,
+                    existing_items_by_id=items_by_id,
+                    engine=engine,
+                    now_utc=now_utc,
+                )
             post_token = _read_live_token()
             if post_token is None:
                 return SnapshotValidationResult(
