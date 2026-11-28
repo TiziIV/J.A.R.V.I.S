@@ -1,8 +1,8 @@
 # J.A.R.V.I.S. — N8: Long-Term Memory & Experience (N8.1 + N8.2 + N8.3 Completa)
 
 > [!IMPORTANT]
-> **Alcance implementado actualmente:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración), **N8.3 Subfases 1 a 4** (`sqlite v2` + `store_version_token`, contratos v2.0 + `ExperienceCaptureService` + tombstones por rollback N5, integración consultiva N6 + `EphemeralGoalStore` + fronteras estructurales, y `MemorySnapshotGuard` + protección pre-dispatch en `BrainManager` y fallbacks) y la **ronda integral de remediación de auditoría independiente (F-01 a F-09)**.
-> **Estado de N8.3:** Hallazgos F-01 a F-09 remediados y verificados en suite global aislada, **pendientes de verificación independiente final por Antigravity Argon** antes del cierre oficial. Permanecen fuera de alcance actual los embeddings semánticos y la consolidación automática por LLM.
+> **Alcance implementado y estado actual:** Este documento cubre **N8.1** (persistencia base, modelos, políticas y locking), **N8.2** (recuperación determinista, API central, consola `/memoria` y `/privado`/`/incognito`, importación manual de preferencias, purga física y backups/restauración), **N8.3 Subfases 1 a 4** (`sqlite v2` + `store_version_token`, contratos v2.0 + `ExperienceCaptureService` + tombstones por rollback N5, integración consultiva N6 + `EphemeralGoalStore` + fronteras estructurales, y `MemorySnapshotGuard` + protección pre-dispatch en `BrainManager` y fallbacks) y sus remediaciones de auditoría (**F-01 a F-09** y **H-01 a H-07**).
+> **Estado final de N8.3:** **CERRADA** — aprobada por auditoría independiente de Antigravity Argon sobre `ed6f025f5e0c1ed215d42fff83b8b15554cdfe15` (tag `v5.5.0`). Permanecen fuera de alcance los embeddings semánticos y la consolidación automática por LLM.
 
 ---
 
@@ -366,3 +366,18 @@ $env:JARVIS_ENV = "test"
 - Se añadieron **8 escenarios adversariales nuevos** en [test_memory_n8_audit_remediation.py](file:///e:/Tiziano%20Facultad/J.A.R.V.I.S/jarvis-core/tests/test_memory_n8_audit_remediation.py) (`20/20` OK en `65.146 s`), cubriendo caídas reales con `os._exit(99)` en `ROLLING_BACK`, rollback parcial y `RECOVERING`, fallos SQLite transitorios en `recover_pending_transactions` + `logger.warning`, `PermissionError` y corrupción en journals, las 5 APIs públicas de H-03 + inspección interna de backups `.db`, recarga post-revocación H-04, síntesis multi-etapa con GPU H-05, cancelación/replan/WAL efímero H-06 y secuencia completa de 10 pasos en modo privado + voz con dobles H-07.
 - Regresiones N8/N5/N6: **188/188 OK** (`170.446 s`). Suite global: **666/666 OK** (`303.122 s`).
 - **Limitaciones honestas:** la lectura y verificación SHA-256 de archivos del journal mantiene un costo lineal moderado en disco (`~343 ms` por escaneo con 500 transacciones en NTFS) para no introducir cachés ciegas que pudieran omitir un rollback reciente o una corrupción en disco; las pruebas de hardware físico de micrófono/altavoces requieren validación manual del usuario.
+
+---
+
+## 15. Cierre Formal de N8.3 (`v5.5.0`) (2026-11-27)
+
+- **Estado final de N8.3:** **CERRADA**.
+- **Commit aprobado de N8.3:** `ed6f025f5e0c1ed215d42fff83b8b15554cdfe15` (`fix(n8.3): close rollback reconciliation and N8 persistence leaks`).
+- **Tag definitivo publicado:** `v5.5.0` apuntando exactamente a `ed6f025f5e0c1ed215d42fff83b8b15554cdfe15`.
+- **Dictamen independiente de Antigravity Argon:** **APROBADA**, validando el cierre completo de **H-01 a H-07**, recuperación ante caídas reales (`os._exit(99)`), reconciliación fail-closed N5/N8, frescura de caché SHA-256 sobre bytes crudos del journal, aislamiento de persistencia N8/N6, privacidad en `/privado --sin-historial` y protección intacta de `data/`.
+- **Resultados de pruebas reportados por la auditoría (`JARVIS_ENV=test`):**
+  - Suite global: **666/666 OK**.
+  - Suite adversarial N8.3: **20/20 OK**.
+  - Regresiones N8/N6/N5 (10 suites): **208/208 OK**.
+  - Compilación estática (`py_compile`): **120/120 OK**.
+- **Limitación pendiente:** `--voice` fue verificado con mocks/dobles de prueba; la validación física de micrófono y altavoces reales permanece sujeta a prueba manual.

@@ -25,7 +25,7 @@ El núcleo cognitivo coordina múltiples motores locales y en la nube bajo una i
 | **N5 — Gobernanza Transaccional y Ejecución Segura** (`v5.2.0`) | **Cerrada y Auditada** | `TransactionManager` WAL-First encadenado por SHA-256, `PolicyEngine`, `ChainOrchestrator`, `FileEditorSkill`, tokens de aprobación interactiva de un solo uso y aislamiento determinista de memoria (`JARVIS_ENV=test`). Documentado en [docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md](docs/audits/INDEPENDENT_SECURITY_AUDIT_N5_FINAL.md). |
 | **N6 — Autonomous Goal & Planning Engine** | **Cerrada y Verificada** | Comprensión de objetivos (`GoalUnderstandingEngine`), descomposición y validación DAG (`GoalPlanningEngine`), selector de riesgos (`GoalSkillSelector`), supervisión con timeouts/reintentos/replanificación (`ExecutionSupervisor`) y persistencia aislada (`GoalStore`). Documentado en [docs/N6_AUTONOMOUS_GOAL_ENGINE.md](docs/N6_AUTONOMOUS_GOAL_ENGINE.md). |
 | **N7 — Context Awareness Engine** | **Remediada y en verificación final** | Observación estructurada y estrictamente de **solo lectura** del entorno Windows, integrada opcionalmente con N6; remediaciones M1/M2 y B1–B4 en validación, documentadas en [docs/N7_CONTEXT_AWARENESS_ENGINE.md](docs/N7_CONTEXT_AWARENESS_ENGINE.md). |
-| **N8 — Memoria de Largo Plazo y Aprendizaje por Experiencia (N8.1 + N8.2)** | **N8.2 Implementada y Verificada** | Almacén SQLite independiente (`data/experiences.db`, WAL + FTS5 + respaldo SQL), políticas estrictas (`INFERENCE` bloqueada), recuperación determinista con ranking y presupuestos (`MemoryRetriever`), API central (`MemoryEngine`), consola (`/memoria`, `/privado`, `/incognito`), aislamiento real de modo privado, importación manual, purga física y backups/restauración con SHA-256. Documentado en [docs/N8_LONG_TERM_MEMORY.md](docs/N8_LONG_TERM_MEMORY.md); N8.3 (captura automática post-ejecución e integración N6) sigue reservada. |
+| **N8 — Memoria de Largo Plazo y Aprendizaje por Experiencia (N8.1 + N8.2 + N8.3)** (`v5.5.0`) | **Cerrada y Aprobada** | Almacén SQLite independiente (`data/experiences.db`, WAL + FTS5 + respaldo SQL v2), captura verificada N5/N6 (`ExperienceCaptureService`), reconciliación fail-closed ante rollbacks N5, aislamiento consultivo N6 (`EphemeralGoalStore` + fronteras estructurales), `MemorySnapshotGuard` pre-dispatch y remediación verificada H-01 a H-07 en `ed6f025` (auditoría independiente Argon: APROBADA; `--voice` validado con mocks). Documentado en [docs/N8_LONG_TERM_MEMORY.md](docs/N8_LONG_TERM_MEMORY.md). |
 
 ---
 
@@ -217,7 +217,7 @@ jarvis-core/
 - [x] **Fase N5 (`v5.2.0`):** Gobernanza transaccional WAL-First, `PolicyEngine`, `ChainOrchestrator`, aprobación interactiva y aislamiento de memoria.
 - [x] **Fase N6:** `Autonomous Goal & Planning Engine` (`/goal` y `/plan`) con validación DAG y supervisión de ejecución.
 - [x] **Fase N7:** `Context Awareness Engine` (`/contexto`) en solo lectura e integración con N6, con remediación de seguridad F1–F6 verificada.
-- [ ] **Fase N8 (Futura — No iniciada):** Memoria de largo plazo y aprendizaje basado en experiencias.
+- [x] **Fase N8 (`v5.5.0` — N8.1 + N8.2 + N8.3 Cerrada):** Memoria de largo plazo SQLite v2, captura verificada N5/N6, reconciliación fail-closed y aislamiento consultivo aprobados sobre `ed6f025`.
 
 ---
 

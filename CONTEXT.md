@@ -1487,3 +1487,21 @@ Se eliminaron las escrituras `BEGIN IMMEDIATE` repetitivas mediante pre-chequeo 
   - En Windows NTFS, cada escaneo de reconciliación sigue leyendo y verificando por SHA-256 los archivos del journal para garantizar detección estricta de nuevos rollbacks y corrupciones sin índices paralelos (`~343 ms` por escaneo con 500 transacciones).
   - No se ejecutaron pruebas con micrófono o altavoces físicos reales (la ruta `--voice` se validó mediante dobles de prueba).
   - Pendiente la verificación independiente final de Antigravity Argon antes de aprobar definitivamente N8.3 y crear su tag de cierre.
+
+---
+
+## Cierre formal de N8.3 — Verificación independiente final y publicación (2026-11-27)
+
+- **Estado final de N8.3:** **CERRADA** (implementada, remediada y aprobada).
+- **Commit aprobado de N8.3:** `ed6f025f5e0c1ed215d42fff83b8b15554cdfe15` (`fix(n8.3): close rollback reconciliation and N8 persistence leaks`).
+- **Tag definitivo:** `v5.5.0` apuntando exactamente a `ed6f025f5e0c1ed215d42fff83b8b15554cdfe15`.
+- **Dictamen independiente de Antigravity Argon:** **APROBADA** sobre `ed6f025`.
+  - Validado el cierre definitivo de **H-01 a H-07**: reconciliación fail-closed ante estados intermedios/parciales y caídas reales (`os._exit(99)`), proveedor N5 por defecto y manejo de errores de directorio/SQLite sin `NameError`, cobertura de reconciliación en APIs públicas de `MemoryEngine`, preservación de `n8_context_exposed` tras recarga y revocación, aislamiento en síntesis multi-etapa N7+N8, saneamiento de `cancellation_reason` / WAL efímero / replanificación y prevención de creación de `experiences.db` en `/privado --sin-historial`.
+  - Verificaciones reportadas por la auditoría independiente (`JARVIS_ENV=test`):
+    - Suite global aislada: **666/666 OK**.
+    - Suite adversarial N8.3 (`tests.test_memory_n8_audit_remediation`): **20/20 OK**.
+    - Regresiones N8/N6/N5 (10 suites): **208/208 OK**.
+    - Compilación estática (`py_compile`): **120/120** archivos `.py` OK; `git diff --check` limpio; arranque liviano CLI sin módulos pesados de voz.
+    - Integridad de `data/` intacta (`file_editor_audit.jsonl` y `memory_store.json` sin alteraciones; sin `data/experiences.db`, `data/goals/` ni `data/backups/`).
+- **Limitación pendiente documentada:** la ruta `--voice` fue validada mediante mocks/dobles de prueba y requiere validación manual con micrófono y altavoces físicos reales.
+- **Publicación Git:** se registra este cierre documental en `main` tras crear `v5.5.0` sobre `ed6f025f5e0c1ed215d42fff83b8b15554cdfe15` y publicar commit y tag en `origin`.
